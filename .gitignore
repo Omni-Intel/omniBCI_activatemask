@@ -11,10 +11,17 @@ build/
 *.elf
 *.hex
 *.map
+.arduino/
+.local_tools/
 
 # Python cache
+.venv/
 __pycache__/
 *.pyc
+
+# Packaged app output
+dist/
+*.spec
 
 # Editor / OS noise
 .idea/

@@ -1,12 +1,15 @@
-$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\common.ps1"
 
-$Cli = "D:\arduino_IDE\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
-$Config = Join-Path $env:USERPROFILE ".arduinoIDE\arduino-cli.yaml"
-$Project = Split-Path -Parent $PSScriptRoot
-$Sketch = Join-Path $Project "firmware\ESP32C3_ADS1299_active_mask"
-$Fqbn = "esp32:esp32:esp32c3:CDCOnBoot=cdc,UploadSpeed=921600"
-$Build = "D:\arduino_IDE\ArduinoBuild\ESP32C3_ADS1299_active_mask"
-$Port = if ($args.Count -gt 0) { $args[0] } else { "COM3" }
+$Cli = Ensure-ArduinoCli
+$Config = Ensure-ArduinoConfig
+$Port = if ($args.Count -gt 0) { $args[0] } else { Get-DefaultSerialPort }
 
-New-Item -ItemType Directory -Force -Path $Build | Out-Null
-& $Cli --config-file $Config compile --upload -p $Port --build-path $Build --fqbn $Fqbn $Sketch
+if (-not $Port) {
+    throw "No serial port found. Plug in the ESP32-C3 or pass a port, for example: .\tools\upload_firmware.ps1 COM4"
+}
+
+Ensure-Dir $FirmwareBuildPath
+
+Write-Host "Using Arduino CLI: $Cli"
+Write-Host "Upload port: $Port"
+& $Cli --config-file $Config compile --upload -p $Port --build-path $FirmwareBuildPath --fqbn $Fqbn $SketchPath

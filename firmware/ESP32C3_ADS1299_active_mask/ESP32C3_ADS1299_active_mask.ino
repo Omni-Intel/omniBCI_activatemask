@@ -81,6 +81,8 @@
 #define MISC1_SRB1_ON        0x20
 #define MISC1_SRB1_OFF       0x00
 
+#define LOFF_CHECK_CONFIG    0x03
+
 // ADS1299 commands
 #define ADS_WAKEUP  0x02
 #define ADS_STANDBY 0x04
@@ -160,8 +162,10 @@ void hardwareResetAds();
 void configureFrontend(FrontendMode mode);
 void configureFrontendLocked(FrontendMode mode);
 void applyActiveMask(uint8_t mask, bool acknowledge);
+void autoMaskFromLeadOff();
 void setChannelEnabled(uint8_t channelIndex, bool enabled);
 void printActiveMaskAck(bool wasStreaming);
+void printLeadOffResult(uint8_t statP, uint8_t statN, uint8_t goodMask, bool wasStreaming);
 bool isHexDigit(char value);
 uint8_t hexValue(char value);
 
@@ -247,7 +251,7 @@ void setup() {
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
   Serial.println("ESP32C3 ADS1299 SRB1 DIAG STREAM READY");
-  Serial.println("Commands: b/s/MHH/1-8/!@#$%^&*/e/p/o/q/t/r/?");
+  Serial.println("Commands: b/s/MHH/1-8/!@#$%^&*/e/p/o/q/t/i/r/?");
 }
 
 void loop() {
@@ -455,6 +459,11 @@ void handleCommand(char command) {
       configureFrontend(MODE_INTERNAL_TEST);
       return;
 
+    case 'i':
+    case 'I':
+      autoMaskFromLeadOff();
+      return;
+
     case 'r':
     case 'R':
       clearDiagnostics();
@@ -490,6 +499,34 @@ void applyActiveMask(uint8_t mask, bool acknowledge) {
   }
 }
 
+void autoMaskFromLeadOff() {
+  const bool wasStreaming = streamingEnabled;
+  streamingEnabled = false;
+  if (frameQueue) xQueueReset(frameQueue);
+
+  xSemaphoreTake(adsBusMutex, portMAX_DELAY);
+  sendAdsCommand(ADS_SDATAC);
+  delay(2);
+
+  writeAdsRegister(0x0F, activeMask);       // LOFF_SENSP: check enabled P electrodes.
+  writeAdsRegister(0x10, 0x00);             // LOFF_SENSN: SRB1/P-only hardware, keep N out.
+  writeAdsRegister(0x11, 0x00);             // LOFF_FLIP
+  writeAdsRegister(0x04, LOFF_CHECK_CONFIG);
+  delay(120);
+
+  const uint8_t statP = readAdsRegister(0x12);
+  const uint8_t statN = readAdsRegister(0x13);
+  const uint8_t goodMask = static_cast<uint8_t>(activeMask & ~statP);
+
+  activeMask = goodMask;
+  configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
+  xSemaphoreGive(adsBusMutex);
+
+  currentMode = MODE_EEG_BIAS_P_ONLY;
+  discardFramesAfterReconfigure = 8;
+  printLeadOffResult(statP, statN, goodMask, wasStreaming);
+}
+
 void setChannelEnabled(uint8_t channelIndex, bool enabled) {
   if (channelIndex >= 8) {
     return;
@@ -508,6 +545,17 @@ void setChannelEnabled(uint8_t channelIndex, bool enabled) {
 void printActiveMaskAck(bool wasStreaming) {
   Serial.printf(
     "#ACK activeMask=0x%02X streaming=0 wasStreaming=%u\n",
+    activeMask,
+    wasStreaming ? 1u : 0u
+  );
+}
+
+void printLeadOffResult(uint8_t statP, uint8_t statN, uint8_t goodMask, bool wasStreaming) {
+  Serial.printf(
+    "#IMP statP=0x%02X statN=0x%02X goodMask=0x%02X activeMask=0x%02X streaming=0 wasStreaming=%u\n",
+    statP,
+    statN,
+    goodMask,
     activeMask,
     wasStreaming ? 1u : 0u
   );
@@ -925,6 +973,6 @@ void printHelpAndDiagnostics() {
                 (unsigned long)badStatusCount,
                 (unsigned long)queueDropCount,
                 (unsigned long)maxReadTimeUs);
-  Serial.println("commands: b s MHH 1..8 !@#$%^&* e p o q t r ?");
+  Serial.println("commands: b s MHH 1..8 !@#$%^&* e p o q t i r ?");
   Serial.println("===============================");
 }

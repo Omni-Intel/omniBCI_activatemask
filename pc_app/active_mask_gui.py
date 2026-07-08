@@ -139,7 +139,7 @@ class ActiveMaskApp:
         self.root = root
         self.root.title("Gaobo ADS1299 activeMask Control")
 
-        self.port_var = StringVar(value="COM3")
+        self.port_var = StringVar(value="")
         self.baud_var = StringVar(value=str(BAUD_DEFAULT))
         self.status_var = StringVar(value="Disconnected")
         self.record_var = StringVar(value="Not recording")
@@ -202,7 +202,10 @@ class ActiveMaskApp:
         ttk.Button(actions, text="Short q", command=lambda: self.send_command("q")).grid(row=0, column=3, padx=(0, 4))
         ttk.Button(actions, text="Test t", command=lambda: self.send_command("t")).grid(row=0, column=4, padx=(0, 4))
         ttk.Button(actions, text="Bias Off o", command=lambda: self.send_command("o")).grid(row=0, column=5, padx=(0, 4))
-        ttk.Button(actions, text="Record Bin", command=self.toggle_recording).grid(row=0, column=6, padx=(8, 4))
+        ttk.Button(actions, text="Impedance Mask", command=self.impedance_auto_mask).grid(
+            row=0, column=6, padx=(8, 4)
+        )
+        ttk.Button(actions, text="Record Bin", command=self.toggle_recording).grid(row=0, column=7, padx=(8, 4))
 
         status = ttk.LabelFrame(main, text="Status")
         status.grid(row=3, column=0, sticky="ew", pady=(10, 0))
@@ -227,9 +230,10 @@ class ActiveMaskApp:
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
         self.port_combo["values"] = ports
-        if "COM3" in ports:
-            self.port_var.set("COM3")
-        elif ports and not self.port_var.get():
+        current = self.port_var.get()
+        if current in ports:
+            return
+        if ports:
             self.port_var.set(ports[0])
 
     def connect(self) -> None:
@@ -304,6 +308,18 @@ class ActiveMaskApp:
             self.log("Sent stop + query")
         except Exception as exc:
             self.log(f"Query failed: {exc}")
+
+    def impedance_auto_mask(self) -> None:
+        if not self.ser or not self.ser.is_open:
+            self.log("Not connected")
+            return
+        try:
+            self.resume_after_mask_ack = self.stream_requested
+            self.stream_requested = False
+            self.ser.write(b"i")
+            self.log("Sent impedance/lead-off auto mask")
+        except Exception as exc:
+            self.log(f"Impedance auto mask failed: {exc}")
 
     def set_all(self, value: bool) -> None:
         for var in self.mask_vars:
@@ -394,6 +410,11 @@ class ActiveMaskApp:
             self.start_recording()
 
     def start_recording(self) -> None:
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Not connected", "Connect to the serial port before recording.")
+            self.log("Recording not started: serial port is not connected")
+            return
+
         default = f"ads1299_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
         path_text = filedialog.asksaveasfilename(
             title="Save binary stream",
@@ -404,7 +425,15 @@ class ActiveMaskApp:
         if not path_text:
             return
         path = Path(path_text)
-        handle = path.open("wb")
+        try:
+            handle = path.open("wb")
+        except OSError as exc:
+            messagebox.showerror("Record error", str(exc))
+            self.log(f"Recording open failed: {exc}")
+            return
+
+        with self.stats_lock:
+            self.stats = FrameStats()
         with self.record_lock:
             self.recording = RecordingState(
                 path=path,
@@ -422,8 +451,12 @@ class ActiveMaskApp:
             )
         self.record_var.set(f"Recording: {path}")
         self.log(f"Recording to {path}")
+        self.start_stream()
 
     def close_recording(self) -> None:
+        if self.ser and self.ser.is_open:
+            self.stop_stream()
+
         with self.record_lock:
             if not self.recording.handle:
                 return
@@ -451,6 +484,8 @@ class ActiveMaskApp:
                 encoding="utf-8",
             )
             self.log(f"Recording closed: {path}")
+            if metadata["stats"]["bytes_saved"] == 0:
+                self.log("Warning: recording saved 0 bytes; check stream/start, firmware, and serial port")
         self.record_var.set("Not recording")
 
     def poll_events(self) -> None:

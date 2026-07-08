@@ -1,13 +1,12 @@
-$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\common.ps1"
 
-$Cli = "D:\arduino_IDE\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
-$Config = Join-Path $env:USERPROFILE ".arduinoIDE\arduino-cli.yaml"
-$Data = "D:\arduino_IDE\Arduino15_data"
-$Url = "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+$Cli = Ensure-ArduinoCli
+$Config = Ensure-ArduinoConfig
 
-New-Item -ItemType Directory -Force -Path $Data | Out-Null
-& $Cli --config-file $Config config set directories.data $Data
-& $Cli --config-file $Config config add board_manager.additional_urls $Url
+Write-Host "Using Arduino CLI: $Cli"
+Write-Host "Using Arduino config: $Config"
+Write-Host "Installing ESP32 Arduino core into: $ArduinoData"
+
 & $Cli --config-file $Config core update-index
 & $Cli --config-file $Config core install esp32:esp32
 & $Cli --config-file $Config core list
