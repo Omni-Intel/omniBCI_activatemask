@@ -1,10 +1,24 @@
+# Local captures and generated acquisition files
+captures/
+*.bin
+*.csv
+*.fif
+*.png
+*.svg
+
+# Arduino build output
+build/
+*.elf
+*.hex
+*.map
+
+# Python cache
 __pycache__/
-*.py[cod]
-*.log
-.pytest_cache/
-.mypy_cache/
-ui_preview_*.png
+*.pyc
+
+# Editor / OS noise
 .idea/
 .vscode/
-recordings/nme/
-recordings/fif/
+Thumbs.db
+Desktop.ini
+.DS_Store
