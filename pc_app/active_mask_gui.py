@@ -143,6 +143,8 @@ class ActiveMaskApp:
         self.baud_var = StringVar(value=str(BAUD_DEFAULT))
         self.status_var = StringVar(value="Disconnected")
         self.record_var = StringVar(value="Not recording")
+        self.auto_impedance_var = BooleanVar(value=False)
+        self.auto_impedance_interval_var = StringVar(value="10")
         self.mask_vars = [BooleanVar(value=True) for _ in range(8)]
 
         self.ser: serial.Serial | None = None
@@ -158,10 +160,13 @@ class ActiveMaskApp:
         self.active_mask = 0xFF
         self.stream_requested = False
         self.resume_after_mask_ack = False
+        self.auto_impedance_after_id: str | None = None
+        self.auto_impedance_inflight = False
 
         self.build_ui()
         self.refresh_ports()
         self.root.after(100, self.poll_events)
+        self.schedule_auto_impedance()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_ui(self) -> None:
@@ -207,14 +212,27 @@ class ActiveMaskApp:
         )
         ttk.Button(actions, text="Record Bin", command=self.toggle_recording).grid(row=0, column=7, padx=(8, 4))
 
+        auto = ttk.Frame(main)
+        auto.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(
+            auto,
+            text="Auto Impedance Mask",
+            variable=self.auto_impedance_var,
+            command=self.on_auto_impedance_changed,
+        ).grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(auto, text="Interval s").grid(row=0, column=1, padx=(0, 4))
+        ttk.Entry(auto, textvariable=self.auto_impedance_interval_var, width=6).grid(
+            row=0, column=2, padx=(0, 8)
+        )
+
         status = ttk.LabelFrame(main, text="Status")
-        status.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(status, textvariable=self.status_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(status, textvariable=self.record_var).grid(row=1, column=0, sticky="w", padx=6, pady=4)
 
         log_frame = ttk.LabelFrame(main, text="Log")
-        log_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
-        main.rowconfigure(4, weight=1)
+        log_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
+        main.rowconfigure(5, weight=1)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = self._make_text(log_frame)
@@ -260,6 +278,7 @@ class ActiveMaskApp:
         self.close_recording()
         self.stream_requested = False
         self.resume_after_mask_ack = False
+        self.auto_impedance_inflight = False
         self.status_var.set("Disconnected")
 
     def send_command(self, command: str) -> None:
@@ -310,16 +329,63 @@ class ActiveMaskApp:
             self.log(f"Query failed: {exc}")
 
     def impedance_auto_mask(self) -> None:
+        self.send_impedance_auto_mask(manual=True)
+
+    def send_impedance_auto_mask(self, manual: bool = False) -> bool:
         if not self.ser or not self.ser.is_open:
-            self.log("Not connected")
-            return
+            if manual:
+                self.log("Not connected")
+            return False
+        if self.auto_impedance_inflight:
+            if manual:
+                self.log("Impedance auto mask already in progress")
+            return False
         try:
             self.resume_after_mask_ack = self.stream_requested
             self.stream_requested = False
+            self.auto_impedance_inflight = True
             self.ser.write(b"i")
+            self.root.after(3000, self.clear_auto_impedance_timeout)
             self.log("Sent impedance/lead-off auto mask")
+            return True
         except Exception as exc:
+            self.auto_impedance_inflight = False
             self.log(f"Impedance auto mask failed: {exc}")
+            return False
+
+    def clear_auto_impedance_timeout(self) -> None:
+        if self.auto_impedance_inflight:
+            self.auto_impedance_inflight = False
+            self.log("Impedance auto mask timed out")
+
+    def on_auto_impedance_changed(self) -> None:
+        state = "enabled" if self.auto_impedance_var.get() else "disabled"
+        self.log(f"Auto impedance mask {state}")
+        self.schedule_auto_impedance(reset=True)
+
+    def auto_impedance_interval_ms(self) -> int:
+        try:
+            seconds = float(self.auto_impedance_interval_var.get())
+        except ValueError:
+            seconds = 10.0
+        seconds = min(max(seconds, 2.0), 3600.0)
+        return int(seconds * 1000)
+
+    def schedule_auto_impedance(self, reset: bool = False) -> None:
+        if reset and self.auto_impedance_after_id:
+            try:
+                self.root.after_cancel(self.auto_impedance_after_id)
+            except Exception:
+                pass
+            self.auto_impedance_after_id = None
+        delay_ms = self.auto_impedance_interval_ms()
+        self.auto_impedance_after_id = self.root.after(delay_ms, self.run_auto_impedance_tick)
+
+    def run_auto_impedance_tick(self) -> None:
+        self.auto_impedance_after_id = None
+        if self.auto_impedance_var.get():
+            self.send_impedance_auto_mask(manual=False)
+        self.schedule_auto_impedance()
 
     def set_all(self, value: bool) -> None:
         for var in self.mask_vars:
@@ -505,6 +571,7 @@ class ActiveMaskApp:
         self.root.after(250, self.poll_events)
 
     def apply_ack_mask(self, mask: int, was_streaming: bool) -> None:
+        self.auto_impedance_inflight = False
         self.active_mask = mask
         for index, var in enumerate(self.mask_vars):
             var.set(bool(mask & (1 << index)))
@@ -542,6 +609,11 @@ class ActiveMaskApp:
         self.log_text.configure(state="disabled")
 
     def on_close(self) -> None:
+        if self.auto_impedance_after_id:
+            try:
+                self.root.after_cancel(self.auto_impedance_after_id)
+            except Exception:
+                pass
         self.disconnect()
         self.root.destroy()
 
