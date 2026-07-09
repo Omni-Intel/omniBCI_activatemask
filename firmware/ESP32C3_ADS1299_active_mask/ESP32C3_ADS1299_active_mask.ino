@@ -120,8 +120,20 @@ constexpr uint8_t SYNC_1 = 0xA5;
 constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
-constexpr int32_t SATURATION_THRESHOLD = 0x7E0000;
-constexpr uint8_t SATURATED_FRAMES_TO_REMOVE = 25;
+constexpr uint8_t BIAS_CHANNEL_COUNT = 5;
+constexpr uint8_t VALID_BIAS_MASK = 0x1F;
+constexpr uint16_t QUALITY_WINDOW_SAMPLES = 500;  // 2 seconds at 250 SPS.
+constexpr int32_t ADC_FULL_SCALE = 0x7FFFFF;
+constexpr int32_t SATURATION_THRESHOLD = static_cast<int32_t>(ADC_FULL_SCALE * 0.7f);
+constexpr uint16_t QUALITY_DISCARD_FRAMES = 375;
+constexpr uint8_t BAD_WINDOWS_TO_REMOVE = 3;
+constexpr uint8_t GOOD_WINDOWS_TO_RESTORE = 5;
+constexpr float COUNTS_PER_UV = 44.74f;  // ADS1299 gain=24, Vref ~= 4.5 V.
+constexpr float BAD_LINE_RATIO = 0.3f;
+constexpr float BAD_NOISY_UV = 300.0f;
+constexpr float BAD_FLAT_RMS_UV = 0.2f;
+constexpr float BAD_FLAT_P2P_UV = 1.0f;
+constexpr int32_t BAD_DRIFT_THRESHOLD = static_cast<int32_t>(ADC_FULL_SCALE * 0.05f);
 
 struct StreamFrame {
   uint8_t bytes[STREAM_FRAME_BYTES];
@@ -143,7 +155,7 @@ static SemaphoreHandle_t adsBusMutex = nullptr;
 // ============================ State / diagnostics ============================
 volatile bool streamingEnabled = false;
 volatile FrontendMode currentMode = MODE_EEG_BIAS_P_ONLY;
-volatile uint8_t activeMask = 0xFF;
+volatile uint8_t activeMask = VALID_BIAS_MASK;
 volatile uint32_t acquisitionSequence = 0;
 volatile uint32_t drdyCount = 0;
 volatile uint32_t missedDrdyCount = 0;
@@ -153,10 +165,18 @@ volatile uint32_t badStatusCount = 0;
 volatile uint32_t queueDropCount = 0;
 volatile uint32_t validReadCount = 0;
 volatile uint32_t maxReadTimeUs = 0;
-volatile uint8_t discardFramesAfterReconfigure = 0;
-uint8_t saturatedFrameCount[8] = {};
+volatile uint16_t discardFramesAfterReconfigure = 0;
 volatile uint32_t saturationBiasRemoveCount = 0;
 volatile uint8_t lastSaturationRemoveMask = 0x00;
+volatile uint32_t qualityWindowCount = 0;
+volatile uint8_t lastQualityBadMask = 0x00;
+volatile uint8_t lastQualityGoodMask = VALID_BIAS_MASK;
+int32_t qualitySamples[BIAS_CHANNEL_COUNT][QUALITY_WINDOW_SAMPLES] = {};
+uint16_t qualitySampleCount = 0;
+uint8_t badWindowCount[BIAS_CHANNEL_COUNT] = {};
+uint8_t goodWindowCount[BIAS_CHANNEL_COUNT] = {};
+int32_t previousMedian[BIAS_CHANNEL_COUNT] = {};
+bool hasPreviousMedian = false;
 
 // ============================ Declarations ============================
 void IRAM_ATTR onDrdyFalling();
@@ -169,13 +189,16 @@ void configureFrontendLocked(FrontendMode mode);
 void writeBiasMaskLocked(uint8_t mask);
 void applyActiveMask(uint8_t mask, bool acknowledge);
 void initialMaskFromLeadOff(bool acknowledge);
-void updateBiasMaskFromSaturation(const uint8_t *adsRaw);
+void collectQualitySample(const uint8_t *adsRaw);
+void analyzeQualityWindow();
 void setChannelEnabled(uint8_t channelIndex, bool enabled);
 void printActiveMaskAck(bool wasStreaming);
 void printLeadOffResult(uint8_t statP, uint8_t statN, uint8_t goodMask, bool wasStreaming);
 bool isHexDigit(char value);
 uint8_t hexValue(char value);
 int32_t readSigned24MsbFirst(const uint8_t *data);
+int compareInt32(const void *left, const void *right);
+float goertzelPower(const int32_t *values, uint16_t count, float binHz, float dc);
 
 uint8_t softSpiTransfer(uint8_t tx);
 void deselectAllSpi();
@@ -260,7 +283,7 @@ void setup() {
   Serial.println();
   Serial.println("ESP32C3 ADS1299 SRB1 DIAG STREAM READY");
   Serial.println("Commands: b/s/MHH/1-8/!@#$%^&*/e/p/o/q/t/i/r/?");
-  Serial.println("b runs one lead-off check before streaming; saturation later only removes channels from BIAS.");
+  Serial.println("b runs one lead-off check before streaming; 2s quality windows adjust BIAS_SENSP.");
 }
 
 void loop() {
@@ -329,7 +352,7 @@ void adsAcquireTask(void *argument) {
       continue;
     }
 
-    updateBiasMaskFromSaturation(raw);
+    collectQualitySample(raw);
 
     if (!streamingEnabled) {
       continue;
@@ -498,7 +521,10 @@ void applyActiveMask(uint8_t mask, bool acknowledge) {
   streamingEnabled = false;
   if (frameQueue) xQueueReset(frameQueue);
 
-  activeMask = mask;
+  activeMask = static_cast<uint8_t>(mask & VALID_BIAS_MASK);
+  if (activeMask == 0) {
+    activeMask = VALID_BIAS_MASK;
+  }
   xSemaphoreTake(adsBusMutex, portMAX_DELAY);
   configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
   xSemaphoreGive(adsBusMutex);
@@ -520,7 +546,7 @@ void initialMaskFromLeadOff(bool acknowledge) {
   sendAdsCommand(ADS_SDATAC);
   delay(2);
 
-  writeAdsRegister(0x0F, activeMask);       // LOFF_SENSP: check enabled P electrodes.
+  writeAdsRegister(0x0F, VALID_BIAS_MASK);  // LOFF_SENSP: check CH1-CH5 P electrodes.
   writeAdsRegister(0x10, 0x00);             // LOFF_SENSN: SRB1/P-only hardware, keep N out.
   writeAdsRegister(0x11, 0x00);             // LOFF_FLIP
   writeAdsRegister(0x04, LOFF_CHECK_CONFIG);
@@ -528,7 +554,10 @@ void initialMaskFromLeadOff(bool acknowledge) {
 
   const uint8_t statP = readAdsRegister(0x12);
   const uint8_t statN = readAdsRegister(0x13);
-  const uint8_t goodMask = static_cast<uint8_t>(activeMask & ~statP);
+  uint8_t goodMask = static_cast<uint8_t>(VALID_BIAS_MASK & ~statP);
+  if (goodMask == 0) {
+    goodMask = activeMask & VALID_BIAS_MASK;
+  }
 
   activeMask = goodMask;
   configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
@@ -541,36 +570,152 @@ void initialMaskFromLeadOff(bool acknowledge) {
   }
 }
 
-void updateBiasMaskFromSaturation(const uint8_t *adsRaw) {
-  uint8_t removeMask = 0;
-
-  for (uint8_t channel = 0; channel < 8; channel++) {
-    const uint8_t bit = static_cast<uint8_t>(1u << channel);
-    if ((activeMask & bit) == 0) {
-      saturatedFrameCount[channel] = 0;
-      continue;
-    }
-
-    const int32_t value = readSigned24MsbFirst(&adsRaw[3 + channel * 3]);
-    const bool saturated = value >= SATURATION_THRESHOLD || value <= -SATURATION_THRESHOLD;
-    if (saturated) {
-      if (saturatedFrameCount[channel] < 255) {
-        saturatedFrameCount[channel]++;
-      }
-      if (saturatedFrameCount[channel] >= SATURATED_FRAMES_TO_REMOVE) {
-        removeMask = static_cast<uint8_t>(removeMask | bit);
-      }
-    } else {
-      saturatedFrameCount[channel] = 0;
-    }
-  }
-
-  if (removeMask == 0) {
+void collectQualitySample(const uint8_t *adsRaw) {
+  if (currentMode != MODE_EEG_BIAS_P_ONLY && currentMode != MODE_EEG_BIAS_PN) {
     return;
   }
 
-  const uint8_t nextMask = static_cast<uint8_t>(activeMask & ~removeMask);
-  if (nextMask == activeMask) {
+  if (qualitySampleCount >= QUALITY_WINDOW_SAMPLES) {
+    return;
+  }
+
+  for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
+    qualitySamples[channel][qualitySampleCount] = readSigned24MsbFirst(&adsRaw[3 + channel * 3]);
+  }
+  qualitySampleCount++;
+
+  if (qualitySampleCount >= QUALITY_WINDOW_SAMPLES) {
+    analyzeQualityWindow();
+    qualitySampleCount = 0;
+  }
+}
+
+void analyzeQualityWindow() {
+  int32_t medianValues[BIAS_CHANNEL_COUNT] = {};
+  float rmsValues[BIAS_CHANNEL_COUNT] = {};
+  bool badFlags[BIAS_CHANNEL_COUNT] = {};
+  uint8_t statP = 0;
+
+  if (xSemaphoreTake(adsBusMutex, 0) == pdTRUE) {
+    sendAdsCommand(ADS_SDATAC);
+    delay(2);
+    statP = static_cast<uint8_t>(readAdsRegister(0x12) & VALID_BIAS_MASK);
+    sendAdsCommand(ADS_RDATAC);
+    xSemaphoreGive(adsBusMutex);
+  }
+
+  for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
+    int32_t sorted[QUALITY_WINDOW_SAMPLES];
+    uint16_t saturatedCount = 0;
+    int32_t minValue = qualitySamples[channel][0];
+    int32_t maxValue = qualitySamples[channel][0];
+
+    for (uint16_t index = 0; index < QUALITY_WINDOW_SAMPLES; index++) {
+      const int32_t value = qualitySamples[channel][index];
+      sorted[index] = value;
+      if (value >= SATURATION_THRESHOLD || value <= -SATURATION_THRESHOLD) {
+        saturatedCount++;
+      }
+      if (value < minValue) minValue = value;
+      if (value > maxValue) maxValue = value;
+    }
+
+    qsort(sorted, QUALITY_WINDOW_SAMPLES, sizeof(int32_t), compareInt32);
+    const int32_t median = sorted[QUALITY_WINDOW_SAMPLES / 2];
+    medianValues[channel] = median;
+
+    float bandPower1_40 = 0.0f;
+    for (uint8_t hz = 1; hz <= 40; hz++) {
+      bandPower1_40 += goertzelPower(
+        qualitySamples[channel],
+        QUALITY_WINDOW_SAMPLES,
+        static_cast<float>(hz),
+        static_cast<float>(median)
+      );
+    }
+
+    float linePower48_52 = 0.0f;
+    for (uint8_t hz = 48; hz <= 52; hz++) {
+      linePower48_52 += goertzelPower(
+        qualitySamples[channel],
+        QUALITY_WINDOW_SAMPLES,
+        static_cast<float>(hz),
+        static_cast<float>(median)
+      );
+    }
+
+    if (bandPower1_40 < 1.0f) {
+      bandPower1_40 = 1.0f;
+    }
+    const float rms1_40 = sqrt(bandPower1_40);
+    rmsValues[channel] = rms1_40;
+
+    const float satRatio = static_cast<float>(saturatedCount) / QUALITY_WINDOW_SAMPLES;
+    const bool badSaturation = abs(median) > SATURATION_THRESHOLD || satRatio > 0.001f;
+    const bool badLine = (linePower48_52 / bandPower1_40) > BAD_LINE_RATIO;
+    const bool badFlat = rms1_40 < (BAD_FLAT_RMS_UV * COUNTS_PER_UV) ||
+                          (maxValue - minValue) < (BAD_FLAT_P2P_UV * COUNTS_PER_UV);
+    const bool badDrift = hasPreviousMedian &&
+                          abs(median - previousMedian[channel]) > BAD_DRIFT_THRESHOLD;
+    const bool badLeadOff = (statP & (1u << channel)) != 0;
+
+    badFlags[channel] = badSaturation || badLine || badFlat || badDrift || badLeadOff;
+  }
+
+  float sortedRms[BIAS_CHANNEL_COUNT];
+  for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
+    sortedRms[channel] = rmsValues[channel];
+  }
+  for (uint8_t i = 1; i < BIAS_CHANNEL_COUNT; i++) {
+    const float value = sortedRms[i];
+    int8_t j = static_cast<int8_t>(i) - 1;
+    while (j >= 0 && sortedRms[j] > value) {
+      sortedRms[j + 1] = sortedRms[j];
+      j--;
+    }
+    sortedRms[j + 1] = value;
+  }
+  const float channelMedianRms = sortedRms[BIAS_CHANNEL_COUNT / 2];
+
+  uint8_t badMask = 0;
+  uint8_t goodMask = 0;
+  for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
+    const bool badNoisy = rmsValues[channel] > (8.0f * channelMedianRms) &&
+                          rmsValues[channel] > (BAD_NOISY_UV * COUNTS_PER_UV);
+    const bool isBad = badFlags[channel] || badNoisy;
+    const uint8_t bit = static_cast<uint8_t>(1u << channel);
+    if (isBad) {
+      badMask = static_cast<uint8_t>(badMask | bit);
+      if (badWindowCount[channel] < 255) badWindowCount[channel]++;
+      goodWindowCount[channel] = 0;
+    } else {
+      goodMask = static_cast<uint8_t>(goodMask | bit);
+      if (goodWindowCount[channel] < 255) goodWindowCount[channel]++;
+      badWindowCount[channel] = 0;
+    }
+    previousMedian[channel] = medianValues[channel];
+  }
+  hasPreviousMedian = true;
+
+  uint8_t nextMask = activeMask & VALID_BIAS_MASK;
+  for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
+    const uint8_t bit = static_cast<uint8_t>(1u << channel);
+    if (badWindowCount[channel] >= BAD_WINDOWS_TO_REMOVE) {
+      nextMask = static_cast<uint8_t>(nextMask & ~bit);
+    } else if (goodWindowCount[channel] >= GOOD_WINDOWS_TO_RESTORE) {
+      nextMask = static_cast<uint8_t>(nextMask | bit);
+    }
+  }
+
+  if ((nextMask & VALID_BIAS_MASK) == 0) {
+    nextMask = activeMask & VALID_BIAS_MASK;
+  }
+
+  lastQualityBadMask = badMask;
+  lastQualityGoodMask = goodMask;
+  qualityWindowCount++;
+
+  if (nextMask == (activeMask & VALID_BIAS_MASK)) {
     return;
   }
 
@@ -581,18 +726,13 @@ void updateBiasMaskFromSaturation(const uint8_t *adsRaw) {
   writeBiasMaskLocked(activeMask);
   xSemaphoreGive(adsBusMutex);
 
-  lastSaturationRemoveMask = removeMask;
+  lastSaturationRemoveMask = badMask;
   saturationBiasRemoveCount++;
-  discardFramesAfterReconfigure = 8;
-  for (uint8_t channel = 0; channel < 8; channel++) {
-    if (removeMask & (1u << channel)) {
-      saturatedFrameCount[channel] = 0;
-    }
-  }
+  discardFramesAfterReconfigure = QUALITY_DISCARD_FRAMES;
 }
 
 void setChannelEnabled(uint8_t channelIndex, bool enabled) {
-  if (channelIndex >= 8) {
+  if (channelIndex >= BIAS_CHANNEL_COUNT) {
     return;
   }
 
@@ -656,10 +796,16 @@ void configureFrontend(FrontendMode mode) {
 }
 
 void writeBiasMaskLocked(uint8_t mask) {
+  mask = static_cast<uint8_t>(mask & VALID_BIAS_MASK);
+  if (mask == 0) {
+    mask = activeMask == 0 ? VALID_BIAS_MASK : static_cast<uint8_t>(activeMask & VALID_BIAS_MASK);
+  }
   sendAdsCommand(ADS_SDATAC);
   delay(2);
   writeAdsRegister(0x0D, mask);
   writeAdsRegister(0x0E, 0x00);
+  writeAdsRegister(0x0F, VALID_BIAS_MASK);
+  writeAdsRegister(0x10, 0x00);
   sendAdsCommand(ADS_RDATAC);
   delay(2);
 }
@@ -678,7 +824,7 @@ void configureFrontendLocked(FrontendMode mode) {
 
   uint8_t config2 = CONFIG2_NORMAL;
   uint8_t channelSetting = CH_NORMAL_GAIN24;
-  uint8_t biasP = 0xFF;
+  uint8_t biasP = activeMask & VALID_BIAS_MASK;
   uint8_t biasN = 0x00;
   bool useActiveMaskForChannels = false;
 
@@ -686,14 +832,14 @@ void configureFrontendLocked(FrontendMode mode) {
     case MODE_EEG_BIAS_PN:
       config2 = CONFIG2_NORMAL;
       channelSetting = CH_NORMAL_GAIN24;
-      biasP = activeMask;
+      biasP = activeMask & VALID_BIAS_MASK;
       biasN = 0x00;
       break;
 
     case MODE_EEG_BIAS_P_ONLY:
       config2 = CONFIG2_NORMAL;
       channelSetting = CH_NORMAL_GAIN24;
-      biasP = activeMask;
+      biasP = activeMask & VALID_BIAS_MASK;
       biasN = 0x00;
       useActiveMaskForChannels = true;
       break;
@@ -729,9 +875,15 @@ void configureFrontendLocked(FrontendMode mode) {
     writeAdsRegister(static_cast<uint8_t>(0x05 + channel), setting);
   }
 
+  if (biasP == 0 && mode != MODE_EEG_BIAS_OFF) {
+    biasP = VALID_BIAS_MASK;
+    activeMask = VALID_BIAS_MASK;
+  }
   writeAdsRegister(0x0D, biasP);
   writeAdsRegister(0x0E, 0x00);
-  writeAdsRegister(0x0F, 0x00);  // LOFF_FLIP
+  writeAdsRegister(0x0F, VALID_BIAS_MASK);  // LOFF_SENSP
+  writeAdsRegister(0x10, 0x00);             // LOFF_SENSN
+  writeAdsRegister(0x11, 0x00);             // LOFF_FLIP
   writeAdsRegister(0x15, MISC1_SRB1_ON);
 
   gpio_set_level(static_cast<gpio_num_t>(PIN_START), 1);
@@ -804,6 +956,31 @@ int32_t readSigned24MsbFirst(const uint8_t *data) {
     value |= 0xFF000000;
   }
   return value;
+}
+
+int compareInt32(const void *left, const void *right) {
+  const int32_t a = *static_cast<const int32_t *>(left);
+  const int32_t b = *static_cast<const int32_t *>(right);
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+float goertzelPower(const int32_t *values, uint16_t count, float binHz, float dc) {
+  const float normalized = binHz / 250.0f;
+  const float coeff = 2.0f * cosf(2.0f * PI * normalized);
+  float q0 = 0.0f;
+  float q1 = 0.0f;
+  float q2 = 0.0f;
+
+  for (uint16_t index = 0; index < count; index++) {
+    q0 = static_cast<float>(values[index]) - dc + coeff * q1 - q2;
+    q2 = q1;
+    q1 = q0;
+  }
+
+  const float power = q1 * q1 + q2 * q2 - coeff * q1 * q2;
+  return power / (static_cast<float>(count) * static_cast<float>(count));
 }
 
 uint16_t crc16CcittFalse(const uint8_t *data, size_t length) {
@@ -1054,8 +1231,11 @@ void printHelpAndDiagnostics() {
                 (unsigned long)badStatusCount,
                 (unsigned long)queueDropCount,
                 (unsigned long)maxReadTimeUs);
-  Serial.printf("saturationBiasRemove=%lu lastRemoveMask=0x%02X\n",
+  Serial.printf("qualityWindows=%lu biasUpdates=%lu lastBadMask=0x%02X lastGoodMask=0x%02X lastUpdateMask=0x%02X\n",
+                (unsigned long)qualityWindowCount,
                 (unsigned long)saturationBiasRemoveCount,
+                lastQualityBadMask,
+                lastQualityGoodMask,
                 lastSaturationRemoveMask);
   Serial.println("commands: b s MHH 1..8 !@#$%^&* e p o q t i r ?");
   Serial.println("===============================");

@@ -23,6 +23,7 @@ SYNC = b"\xA5\x5A"
 PROTOCOL_VERSION = 1
 FRAME_TYPE_DATA = 1
 ENABLE_COMMANDS = "!@#$%^&*"
+VALID_BIAS_MASK = 0x1F
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -143,7 +144,7 @@ class ActiveMaskApp:
         self.baud_var = StringVar(value=str(BAUD_DEFAULT))
         self.status_var = StringVar(value="Disconnected")
         self.record_var = StringVar(value="Not recording")
-        self.mask_vars = [BooleanVar(value=True) for _ in range(8)]
+        self.mask_vars = [BooleanVar(value=index < 5) for index in range(8)]
 
         self.ser: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
@@ -155,7 +156,7 @@ class ActiveMaskApp:
         self.recording = RecordingState()
         self.record_lock = threading.Lock()
         self.mask_history: list[dict[str, object]] = []
-        self.active_mask = 0xFF
+        self.active_mask = VALID_BIAS_MASK
         self.stream_requested = False
         self.resume_after_mask_ack = False
         self.auto_impedance_inflight = False
@@ -183,7 +184,7 @@ class ActiveMaskApp:
         ttk.Button(conn, text="Connect", command=self.connect).grid(row=0, column=5, padx=(0, 4))
         ttk.Button(conn, text="Disconnect", command=self.disconnect).grid(row=0, column=6)
 
-        channels = ttk.LabelFrame(main, text="activeMask")
+        channels = ttk.LabelFrame(main, text="BIAS_SENSP mask (CH1-CH5; CH6-CH8 still recorded)")
         channels.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         for index, var in enumerate(self.mask_vars):
             ttk.Checkbutton(channels, text=f"CH{index + 1}", variable=var).grid(
@@ -342,15 +343,15 @@ class ActiveMaskApp:
             self.log("Impedance auto mask timed out")
 
     def set_all(self, value: bool) -> None:
-        for var in self.mask_vars:
-            var.set(value)
+        for index, var in enumerate(self.mask_vars):
+            var.set(value if index < 5 else False)
 
     def mask_from_checks(self) -> int:
         mask = 0
         for index, var in enumerate(self.mask_vars):
-            if var.get():
+            if index < 5 and var.get():
                 mask |= 1 << index
-        return mask
+        return mask & VALID_BIAS_MASK
 
     def reader_loop(self) -> None:
         buffer = bytearray()
@@ -526,9 +527,10 @@ class ActiveMaskApp:
 
     def apply_ack_mask(self, mask: int, was_streaming: bool) -> None:
         self.auto_impedance_inflight = False
-        self.active_mask = mask
+        self.active_mask = mask & VALID_BIAS_MASK
         for index, var in enumerate(self.mask_vars):
-            var.set(bool(mask & (1 << index)))
+            if index < 5:
+                var.set(bool(self.active_mask & (1 << index)))
         should_resume = self.resume_after_mask_ack or was_streaming
         self.resume_after_mask_ack = False
         if should_resume and self.ser and self.ser.is_open:
