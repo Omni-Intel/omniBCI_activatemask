@@ -120,6 +120,8 @@ constexpr uint8_t SYNC_1 = 0xA5;
 constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
+constexpr int32_t SATURATION_THRESHOLD = 0x7E0000;
+constexpr uint8_t SATURATED_FRAMES_TO_REMOVE = 25;
 
 struct StreamFrame {
   uint8_t bytes[STREAM_FRAME_BYTES];
@@ -152,6 +154,9 @@ volatile uint32_t queueDropCount = 0;
 volatile uint32_t validReadCount = 0;
 volatile uint32_t maxReadTimeUs = 0;
 volatile uint8_t discardFramesAfterReconfigure = 0;
+uint8_t saturatedFrameCount[8] = {};
+volatile uint32_t saturationBiasRemoveCount = 0;
+volatile uint8_t lastSaturationRemoveMask = 0x00;
 
 // ============================ Declarations ============================
 void IRAM_ATTR onDrdyFalling();
@@ -161,13 +166,16 @@ void startNscClock();
 void hardwareResetAds();
 void configureFrontend(FrontendMode mode);
 void configureFrontendLocked(FrontendMode mode);
+void writeBiasMaskLocked(uint8_t mask);
 void applyActiveMask(uint8_t mask, bool acknowledge);
-void autoMaskFromLeadOff();
+void initialMaskFromLeadOff(bool acknowledge);
+void updateBiasMaskFromSaturation(const uint8_t *adsRaw);
 void setChannelEnabled(uint8_t channelIndex, bool enabled);
 void printActiveMaskAck(bool wasStreaming);
 void printLeadOffResult(uint8_t statP, uint8_t statN, uint8_t goodMask, bool wasStreaming);
 bool isHexDigit(char value);
 uint8_t hexValue(char value);
+int32_t readSigned24MsbFirst(const uint8_t *data);
 
 uint8_t softSpiTransfer(uint8_t tx);
 void deselectAllSpi();
@@ -252,6 +260,7 @@ void setup() {
   Serial.println();
   Serial.println("ESP32C3 ADS1299 SRB1 DIAG STREAM READY");
   Serial.println("Commands: b/s/MHH/1-8/!@#$%^&*/e/p/o/q/t/i/r/?");
+  Serial.println("b runs one lead-off check before streaming; saturation later only removes channels from BIAS.");
 }
 
 void loop() {
@@ -319,6 +328,8 @@ void adsAcquireTask(void *argument) {
       discardFramesAfterReconfigure--;
       continue;
     }
+
+    updateBiasMaskFromSaturation(raw);
 
     if (!streamingEnabled) {
       continue;
@@ -425,6 +436,7 @@ void handleCommand(char command) {
     case 'b':
     case 'B':
       if (frameQueue) xQueueReset(frameQueue);
+      initialMaskFromLeadOff(true);
       streamingEnabled = true;
       return;
 
@@ -461,7 +473,7 @@ void handleCommand(char command) {
 
     case 'i':
     case 'I':
-      autoMaskFromLeadOff();
+      initialMaskFromLeadOff(true);
       return;
 
     case 'r':
@@ -499,7 +511,7 @@ void applyActiveMask(uint8_t mask, bool acknowledge) {
   }
 }
 
-void autoMaskFromLeadOff() {
+void initialMaskFromLeadOff(bool acknowledge) {
   const bool wasStreaming = streamingEnabled;
   streamingEnabled = false;
   if (frameQueue) xQueueReset(frameQueue);
@@ -524,7 +536,59 @@ void autoMaskFromLeadOff() {
 
   currentMode = MODE_EEG_BIAS_P_ONLY;
   discardFramesAfterReconfigure = 8;
-  printLeadOffResult(statP, statN, goodMask, wasStreaming);
+  if (acknowledge) {
+    printLeadOffResult(statP, statN, goodMask, wasStreaming);
+  }
+}
+
+void updateBiasMaskFromSaturation(const uint8_t *adsRaw) {
+  uint8_t removeMask = 0;
+
+  for (uint8_t channel = 0; channel < 8; channel++) {
+    const uint8_t bit = static_cast<uint8_t>(1u << channel);
+    if ((activeMask & bit) == 0) {
+      saturatedFrameCount[channel] = 0;
+      continue;
+    }
+
+    const int32_t value = readSigned24MsbFirst(&adsRaw[3 + channel * 3]);
+    const bool saturated = value >= SATURATION_THRESHOLD || value <= -SATURATION_THRESHOLD;
+    if (saturated) {
+      if (saturatedFrameCount[channel] < 255) {
+        saturatedFrameCount[channel]++;
+      }
+      if (saturatedFrameCount[channel] >= SATURATED_FRAMES_TO_REMOVE) {
+        removeMask = static_cast<uint8_t>(removeMask | bit);
+      }
+    } else {
+      saturatedFrameCount[channel] = 0;
+    }
+  }
+
+  if (removeMask == 0) {
+    return;
+  }
+
+  const uint8_t nextMask = static_cast<uint8_t>(activeMask & ~removeMask);
+  if (nextMask == activeMask) {
+    return;
+  }
+
+  if (xSemaphoreTake(adsBusMutex, 0) != pdTRUE) {
+    return;
+  }
+  activeMask = nextMask;
+  writeBiasMaskLocked(activeMask);
+  xSemaphoreGive(adsBusMutex);
+
+  lastSaturationRemoveMask = removeMask;
+  saturationBiasRemoveCount++;
+  discardFramesAfterReconfigure = 8;
+  for (uint8_t channel = 0; channel < 8; channel++) {
+    if (removeMask & (1u << channel)) {
+      saturatedFrameCount[channel] = 0;
+    }
+  }
 }
 
 void setChannelEnabled(uint8_t channelIndex, bool enabled) {
@@ -591,6 +655,15 @@ void configureFrontend(FrontendMode mode) {
   streamingEnabled = shouldResumeStreaming;
 }
 
+void writeBiasMaskLocked(uint8_t mask) {
+  sendAdsCommand(ADS_SDATAC);
+  delay(2);
+  writeAdsRegister(0x0D, mask);
+  writeAdsRegister(0x0E, 0x00);
+  sendAdsCommand(ADS_RDATAC);
+  delay(2);
+}
+
 void configureFrontendLocked(FrontendMode mode) {
   gpio_set_level(static_cast<gpio_num_t>(PIN_START), 0);
   delay(5);
@@ -613,8 +686,8 @@ void configureFrontendLocked(FrontendMode mode) {
     case MODE_EEG_BIAS_PN:
       config2 = CONFIG2_NORMAL;
       channelSetting = CH_NORMAL_GAIN24;
-      biasP = 0xFF;
-      biasN = 0xFF;
+      biasP = activeMask;
+      biasN = 0x00;
       break;
 
     case MODE_EEG_BIAS_P_ONLY:
@@ -652,14 +725,12 @@ void configureFrontendLocked(FrontendMode mode) {
 
   for (uint8_t channel = 0; channel < 8; channel++) {
     uint8_t setting = channelSetting;
-    if (useActiveMaskForChannels && ((activeMask & (1u << channel)) == 0)) {
-      setting = CH_POWERDOWN_SHORTED;
-    }
+    (void)useActiveMaskForChannels;
     writeAdsRegister(static_cast<uint8_t>(0x05 + channel), setting);
   }
 
   writeAdsRegister(0x0D, biasP);
-  writeAdsRegister(0x0E, biasN);
+  writeAdsRegister(0x0E, 0x00);
   writeAdsRegister(0x0F, 0x00);  // LOFF_FLIP
   writeAdsRegister(0x15, MISC1_SRB1_ON);
 
@@ -723,6 +794,16 @@ void buildStreamFrame(
 
   const uint16_t crc = crc16CcittFalse(p, 46);
   writeU16LE(&p[46], crc);
+}
+
+int32_t readSigned24MsbFirst(const uint8_t *data) {
+  int32_t value = (static_cast<int32_t>(data[0]) << 16) |
+                  (static_cast<int32_t>(data[1]) << 8) |
+                  static_cast<int32_t>(data[2]);
+  if (value & 0x800000) {
+    value |= 0xFF000000;
+  }
+  return value;
 }
 
 uint16_t crc16CcittFalse(const uint8_t *data, size_t length) {
@@ -973,6 +1054,9 @@ void printHelpAndDiagnostics() {
                 (unsigned long)badStatusCount,
                 (unsigned long)queueDropCount,
                 (unsigned long)maxReadTimeUs);
+  Serial.printf("saturationBiasRemove=%lu lastRemoveMask=0x%02X\n",
+                (unsigned long)saturationBiasRemoveCount,
+                lastSaturationRemoveMask);
   Serial.println("commands: b s MHH 1..8 !@#$%^&* e p o q t i r ?");
   Serial.println("===============================");
 }

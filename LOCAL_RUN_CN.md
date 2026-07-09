@@ -69,3 +69,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\upload_firmware.ps1 
 ## 串口
 
 GUI 现在不再默认写死 COM3，会自动选择系统当前列出的第一个串口。你这台电脑当前识别到的是 `COM4 USB Serial Device`。
+
+## 当前 BIAS / 阻抗策略
+
+当前版本不再周期性轮询 lead-off 阻抗检测，避免检测电流持续影响电极端信号。
+
+采集策略：
+
+```text
+Start Stream / Record Bin 开始时，固件做一次 lead-off 初检
+初检后正常采集
+采集中如果某通道连续接近满量程/饱和，自动从 BIAS_SENSP 移除
+被移除的通道不会被 disabled，仍然继续采集和保存
+CH6-CH8 不再强制 disabled
+BIAS_SENSN 固定 0x00
+```
+
+`Initial Impedance Mask` 按钮只做一次手动初检；没有自动轮询。
