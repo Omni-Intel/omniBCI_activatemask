@@ -1,21 +1,24 @@
 # ONMI BCI activeMask / ADS1299 Bias Control
 
-ESP32-C3 + ADS1299 8 通道脑电采集固件和 Python 上位机。
+ESP32-C3 + ADS1299 8-channel EEG firmware and a Python PC control app.
 
-这个项目的目标是让上位机维护 `activeMask`，像 OpenBCI 一样控制哪些通道启用、哪些通道加入 ADS1299 的 Bias/RLD 共模反馈计算，避免未贴电极或未使用通道污染右腿偏置环路。
+This fork focuses on SRB1 reference acquisition and automatic `BIAS_SENSP`
+maintenance. Channels can keep recording even when they are removed from the
+BIAS calculation.
 
-## 当前状态
+## Current Behavior
 
-已实机验收：
+- ADS1299 uses SRB1 as the common reference.
+- `BIAS_SENSN` is always `0x00`.
+- `BIAS_SENSP` is maintained for CH1-CH5 only.
+- CH6-CH8 are not forced disabled; they still use normal gain and remain in the
+  binary stream.
+- Starting a stream runs one lead-off check first.
+- During acquisition, every 2 seconds the firmware analyzes CH1-CH5 raw data and
+  updates `BIAS_SENSP` slowly.
+- The 48-byte binary frame format is unchanged.
 
-- Arduino CLI 编译通过。
-- ESP32-C3 / COM3 烧录通过。
-- 上位机可连接 `COM3 @ 921600`。
-- `M01` 单通道配置通过：`BIAS_SENSP=0x01`，CH1 正常，CH2-CH8 关闭。
-- `MFF` 全通道恢复通过：`BIAS_SENSP=0xFF`，CH1-CH8 全部正常。
-- 固件 48 字节二进制数据帧格式保持不变。
-
-## 目录结构
+## Directory Layout
 
 ```text
 firmware/
@@ -24,195 +27,181 @@ firmware/
 
 pc_app/
   active_mask_gui.py
-  run_gui_D_env.cmd
+  run_gui.cmd
   self_check.py
   requirements.txt
-  environment.yml
 
 tools/
+  common.ps1
+  setup_pc_env.ps1
+  run_gui.ps1
+  package_gui.ps1
   install_esp32_core.ps1
   compile_firmware.ps1
   upload_firmware.ps1
   launch_arduino_ide_ascii_cache.ps1
-
-test_sketches/
-  c3_serial_blink/
-
-docs/
-  openbci_cyton_reference_notes.md
 ```
 
-## activeMask 定义
+## BIAS Mask Rules
 
-`activeMask` 是 8 bit 掩码：
+`activeMask` now means the P-side mask used for `BIAS_SENSP`.
 
-| bit | 通道 | 接口 |
-| --- | --- | --- |
-| bit0 | CH1 | H1-9 |
-| bit1 | CH2 | H1-8 |
-| bit2 | CH3 | H1-7 |
-| bit3 | CH4 | H1-6 |
-| bit4 | CH5 | H1-5 |
-| bit5 | CH6 | H1-4 |
-| bit6 | CH7 | H1-3 |
-| bit7 | CH8 | H1-2 |
+```text
+bit0 = CH1
+bit1 = CH2
+bit2 = CH3
+bit3 = CH4
+bit4 = CH5
+```
 
-规则：
+CH6-CH8 are still sampled, but they are not part of the automatic BIAS quality
+decision.
 
-- bit = 1：通道启用，`CHnSET=0x60`，加入 `BIAS_SENSP`。
-- bit = 0：通道关闭，`CHnSET=0xE1`，不加入 `BIAS_SENSP`。
-- 当前硬件使用 SRB1 共参考，Bias 采用 P-only：`BIAS_SENSP=activeMask`，`BIAS_SENSN=0x00`，`MISC1=0x20`。
+```text
+BIAS_SENSP = activeMask & 0x1F
+BIAS_SENSN = 0x00
+```
 
-## 串口命令
+The automatic algorithm never writes a zero BIAS mask. If all CH1-CH5 look bad,
+the last valid mask is kept.
 
-波特率：`921600`
+## Automatic Quality Masking
 
-| 命令 | 作用 |
+Every 500 samples, about 2 seconds at 250 SPS, the firmware analyzes CH1-CH5.
+A channel is considered bad when any of these conditions are true:
+
+```text
+bad_saturation: abs(median(raw)) > 0.7FS or sat_ratio > 0.1%
+bad_line:       48-52Hz power / 1-40Hz power > 0.3
+bad_noisy:      rms_1_40 > 8x channel-median RMS and > 300 uV
+bad_flat:       rms_1_40 < 0.2 uV or p2p < 1 uV
+bad_drift:      adjacent-window DC jump > 0.05FS
+bad_leadoff:    ADS1299 LOFF_STATP reports lead-off
+```
+
+Debounce:
+
+```text
+3 consecutive bad windows  -> remove channel from BIAS_SENSP
+5 consecutive good windows -> restore channel to BIAS_SENSP
+```
+
+After a BIAS register update, the firmware discards about 1.5 seconds of frames
+to avoid transient data.
+
+## Serial Commands
+
+Baud rate:
+
+```text
+921600
+```
+
+| Command | Meaning |
 | --- | --- |
-| `MHH\n` | 设置 activeMask，`HH` 为两位十六进制，例如 `M01`、`MFF` |
-| `1..8` | 关闭 CH1..CH8 |
-| `! @ # $ % ^ & *` | 打开 CH1..CH8 |
-| `b` | 开始 48 字节二进制数据流 |
-| `s` | 停止数据流 |
-| `?` | 停止数据流并打印诊断信息 |
-| `q` | 内部短路测试 |
-| `t` | 内部测试信号 |
+| `b` | Run one lead-off check, then start binary stream |
+| `s` | Stop stream |
+| `MHH\n` | Set `BIAS_SENSP` mask, for example `M1F` |
+| `1..8` | Remove CH1..CH8 from the mask command path |
+| `! @ # $ % ^ & *` | Add CH1..CH8 through the mask command path |
+| `i` | Run one manual initial impedance/lead-off mask check |
+| `?` | Stop stream and print diagnostics |
+| `q` | Internal shorted-input test |
+| `t` | Internal test signal |
 | `o` | Bias off |
-| `e` / `p` | 正常 activeMask + P-only Bias 模式 |
+| `e` / `p` | Normal SRB1 + P-only BIAS mode |
 
-上位机发送 activeMask 时会先停流，再发 `MHH\n`，收到 `#ACK activeMask=0xHH` 后按需恢复采集，避免文本 ACK 混入二进制数据流。
-
-## 固件编译和烧录
-
-Arduino CLI 路径按当前 Windows 机器配置：
-
-```powershell
-D:\arduino_IDE\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe
-```
-
-先安装 ESP32 Arduino core：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\install_esp32_core.ps1
-```
-
-编译：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\compile_firmware.ps1
-```
-
-烧录到 COM3：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\upload_firmware.ps1 COM3
-```
-
-如果使用 Arduino IDE GUI，不要直接双击原始 Arduino IDE 图标。请使用：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\launch_arduino_ide_ascii_cache.ps1
-```
-
-原因是当前 Windows 用户路径包含中文和括号，ESP32 RISC-V linker 在 IDE 默认临时目录下可能报 `ld.exe cannot open output file`。项目脚本会强制使用 D 盘 ASCII 构建路径。
-
-## 上位机启动
-
-推荐在当前 Windows 机器上直接运行：
-
-```powershell
-cd /d D:\高博_采集板优化\active_mask_bias_control\pc_app
-.\run_gui_D_env.cmd
-```
-
-该脚本直接调用：
+Typical diagnostics include:
 
 ```text
-D:\conda_envs\gaobo_bci_active_mask\python.exe
+activeMask=0x1F
+BIAS_SENSP=0x1F BIAS_SENSN=0x00
+qualityWindows=...
+biasUpdates=...
+lastBadMask=0x..
+lastGoodMask=0x..
 ```
 
-这样可以绕开 `conda activate` 在中文 Windows 用户路径下触发的 OpenSSL activation script 路径问题。
+## PC App
 
-通用环境创建方式：
+Run the GUI from the project root:
 
 ```powershell
-conda create -p D:\conda_envs\gaobo_bci_active_mask --override-channels -c conda-forge python=3.11 pip -y
-D:\conda_envs\gaobo_bci_active_mask\python.exe -m pip install -r .\pc_app\requirements.txt
+.\run_all.cmd
 ```
 
-自检：
+Or:
 
 ```powershell
-D:\conda_envs\gaobo_bci_active_mask\python.exe .\pc_app\self_check.py
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\run_gui.ps1
 ```
 
-期望输出：
+The launcher creates a project-local `.venv` and installs `pc_app\requirements.txt`.
+
+Package the GUI as an executable:
+
+```powershell
+.\package_gui.cmd
+```
+
+Output:
 
 ```text
-self_check ok
+dist\ActiveMaskGUI\ActiveMaskGUI.exe
 ```
 
-## 上位机验收流程
+## Firmware Build and Upload
 
-1. 连接 `COM3 @ 921600`。
-2. 点击 `Query ?`，确认当前寄存器。
-3. 只勾选 CH1，点击 `Apply Mask`，再点击 `Query ?`。
+The scripts are project-local. They no longer depend on the original author's
+hard-coded `D:\arduino_IDE` or conda paths.
 
-期望：
+Install ESP32 Arduino core into the project-local Arduino data folder:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install_esp32_core.ps1
+```
+
+Compile:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\compile_firmware.ps1
+```
+
+Upload, automatically selecting a serial port:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\upload_firmware.ps1
+```
+
+Upload to a specific port:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\upload_firmware.ps1 COM4
+```
+
+## Binary Frame
+
+The firmware keeps the original 48-byte binary frame:
 
 ```text
-activeMask=0x01
-BIAS_SENSP=0x01
-BIAS_SENSN=0x00
-CH1SET=0x60
-CH2SET=0xE1 CH3SET=0xE1 CH4SET=0xE1
-CH5SET=0xE1 CH6SET=0xE1 CH7SET=0xE1 CH8SET=0xE1
+[0..1]   sync header 0xA5 0x5A
+[2]      protocol version
+[3]      frame type
+[4..7]   sample sequence
+[8..11]  micros()
+[12..14] ADS1299 STATUS
+[15]     flags
+[16..39] 8 x 24-bit ADS1299 raw channel data, MSB-first
+[40..45] diagnostics
+[46..47] CRC16-CCITT-FALSE
 ```
 
-4. 点击 `All On`，`Apply Mask`，再 `Query ?`。
+The current BIAS mask is not embedded into the 48-byte frame. The PC app records
+mask history in the JSON sidecar when saving `.bin` data.
 
-期望：
+## Notes
 
-```text
-activeMask=0xFF
-BIAS_SENSP=0xFF
-BIAS_SENSN=0x00
-CH1SET=0x60 ... CH8SET=0x60
-```
-
-5. 点击 `Record Bin` 选择保存路径，点击 `Start Stream` 采集 10-30 秒。
-6. 状态栏应接近 `rate=250Hz`，`crc=0`，`gaps=0/0`。
-7. 点击 `Stop Stream`，再次点击 `Record Bin` 关闭文件。
-
-保存时会生成：
-
-```text
-xxx.bin
-xxx.json
-```
-
-JSON sidecar 会记录 activeMask、通道开关历史、串口参数、固件版本和采集时间。
-
-## 数据帧
-
-固件保持原 48 字节二进制帧格式：
-
-- `[0..1]`：同步头 `0xA5 0x5A`
-- `[2]`：协议版本
-- `[3]`：帧类型
-- `[4..7]`：sample sequence
-- `[8..11]`：`micros()`
-- `[12..14]`：ADS1299 STATUS
-- `[15]`：flags
-- `[16..39]`：8 路 24-bit 原始数据，MSB-first
-- `[40..45]`：采样诊断字段
-- `[46..47]`：CRC16-CCITT-FALSE
-
-`activeMask` 不写入 48 字节帧，避免破坏现有解析脚本；上位机用 sidecar JSON 记录 mask 历史。
-
-## 注意事项
-
-- 同一时间只能有一个程序占用 COM3。使用上位机时不要同时打开 XCOM 或 Arduino Serial Monitor。
-- 未使用通道建议关闭，不要让悬空输入参与 `BIAS_SENSP`。
-- 当前版本不做实时波形显示；离线画图继续使用项目外的 bin-to-CSV/MNE 脚本。
-- `docs/openbci_cyton_reference_notes.md` 是参考 OpenBCI 固件后的取舍说明。OpenBCI 的 SRB2/P-N Bias 默认配置不能直接套到本硬件，本项目以 `gaoboV2.net` 的 SRB1 + P-only Bias 为准。
+- Only one program can use the serial port at a time. Close Arduino Serial
+  Monitor, XCOM, and other serial tools before connecting with the GUI.
+- CH6-CH8 can be left recording while excluded from `BIAS_SENSP`.
+- The GUI saves raw `.bin` plus `.json` metadata. It does not plot live EEG.
