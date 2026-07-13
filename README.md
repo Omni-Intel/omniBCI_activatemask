@@ -24,6 +24,8 @@ BIAS calculation.
 firmware/
   ESP32C3_ADS1299_active_mask/
     ESP32C3_ADS1299_active_mask.ino
+  ESP32C3_ADS1299_active_mask_8ch_bias/
+    ESP32C3_ADS1299_active_mask_8ch_bias.ino
 
 pc_app/
   active_mask_gui.py
@@ -64,6 +66,30 @@ BIAS_SENSN = 0x00
 
 The automatic algorithm never writes a zero BIAS mask. If all CH1-CH5 look bad,
 the last valid mask is kept.
+
+## 8-Channel BIAS Variant
+
+An alternate firmware is provided for experiments where all 8 channels may
+participate in `BIAS_SENSP`:
+
+```text
+firmware/ESP32C3_ADS1299_active_mask_8ch_bias/
+```
+
+Differences from the default firmware:
+
+```text
+BIAS_CHANNEL_COUNT = 8
+VALID_BIAS_MASK = 0xFF
+CH1-CH8 are all analyzed every 2 seconds
+Good channels can be added to BIAS_SENSP
+Bad channels can be removed from BIAS_SENSP
+BIAS_SENSN remains 0x00
+The mask still cannot become 0
+```
+
+This variant is useful when CH6-CH8 may also be real electrodes instead of
+always-unused inputs.
 
 ## Automatic Quality Masking
 
@@ -167,6 +193,12 @@ Compile:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\compile_firmware.ps1
 ```
 
+Compile the 8-channel BIAS variant:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\compile_firmware.ps1 ESP32C3_ADS1299_active_mask_8ch_bias
+```
+
 Upload, automatically selecting a serial port:
 
 ```powershell
@@ -177,6 +209,12 @@ Upload to a specific port:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\upload_firmware.ps1 COM4
+```
+
+Upload the 8-channel BIAS variant:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\upload_firmware.ps1 COM4 ESP32C3_ADS1299_active_mask_8ch_bias
 ```
 
 ## Binary Frame

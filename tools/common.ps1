@@ -15,6 +15,27 @@ $FirmwareBuildPath = Join-Path $BuildRoot "ESP32C3_ADS1299_active_mask"
 $Fqbn = "esp32:esp32:esp32c3:CDCOnBoot=cdc,UploadSpeed=921600"
 $Esp32PackageUrl = "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
 
+function Resolve-SketchPath {
+    param([string]$SketchName)
+
+    if (-not $SketchName) {
+        return $SketchPath
+    }
+
+    if ([System.IO.Path]::IsPathRooted($SketchName)) {
+        return $SketchName
+    }
+
+    return Join-Path (Join-Path $ProjectRoot "firmware") $SketchName
+}
+
+function Resolve-BuildPath {
+    param([string]$Sketch)
+
+    $name = Split-Path -Leaf $Sketch
+    return Join-Path $BuildRoot $name
+}
+
 function Ensure-Dir {
     param([Parameter(Mandatory=$true)][string]$Path)
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
