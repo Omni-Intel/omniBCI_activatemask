@@ -71,11 +71,16 @@ def parse_frame(frame: bytes) -> dict[str, int] | None:
 
 
 def parse_active_mask_ack(text: str) -> tuple[int, bool] | None:
-    match = re.search(r"activeMask=0x([0-9A-Fa-f]{2})(?:.*?\bwasStreaming=([01]))?", text)
-    if not match:
+    if not text.startswith("#ACK"):
         return None
-    was_streaming = match.group(2) == "1"
-    return int(match.group(1), 16), was_streaming
+    allowed_match = re.search(r"allowedMask=0x([0-9A-Fa-f]{2})", text)
+    active_match = re.search(r"activeMask=0x([0-9A-Fa-f]{2})", text)
+    if not active_match:
+        return None
+    mask_text = allowed_match.group(1) if allowed_match else active_match.group(1)
+    streaming_match = re.search(r"\bwasStreaming=([01])", text)
+    was_streaming = bool(streaming_match and streaming_match.group(1) == "1")
+    return int(mask_text, 16), was_streaming
 
 
 @dataclass
@@ -144,7 +149,7 @@ class ActiveMaskApp:
         self.baud_var = StringVar(value=str(BAUD_DEFAULT))
         self.status_var = StringVar(value="Disconnected")
         self.record_var = StringVar(value="Not recording")
-        self.mask_vars = [BooleanVar(value=True) for _ in range(8)]
+        self.mask_vars = [BooleanVar(value=index == 0) for index in range(8)]
 
         self.ser: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
@@ -156,7 +161,7 @@ class ActiveMaskApp:
         self.recording = RecordingState()
         self.record_lock = threading.Lock()
         self.mask_history: list[dict[str, object]] = []
-        self.active_mask = BIAS_MASK_ALL
+        self.active_mask = 0x01
         self.stream_requested = False
         self.resume_after_mask_ack = False
         self.auto_impedance_inflight = False
@@ -273,6 +278,10 @@ class ActiveMaskApp:
 
     def apply_mask(self) -> None:
         mask = self.mask_from_checks()
+        if mask == 0:
+            messagebox.showwarning("Empty mask", "Select at least one channel for BIAS_SENSP.")
+            self.log("Mask not applied: no channel selected")
+            return
         self.active_mask = mask
         self.mask_history.append({"time": self.now_iso(), "activeMask": f"0x{mask:02X}"})
         if not self.ser or not self.ser.is_open:
@@ -288,10 +297,24 @@ class ActiveMaskApp:
             self.log(f"Set activeMask failed: {exc}")
 
     def start_stream(self) -> None:
-        self.send_command("b")
-        if self.ser and self.ser.is_open:
+        if not self.ser or not self.ser.is_open:
+            self.log("Not connected")
+            return
+        mask = self.mask_from_checks()
+        if mask == 0:
+            messagebox.showwarning("Empty mask", "Select at least one channel before starting stream.")
+            self.log("Start stream blocked: no BIAS_SENSP channel selected")
+            return
+        try:
+            self.active_mask = mask
+            self.mask_history.append({"time": self.now_iso(), "activeMask": f"0x{mask:02X}"})
+            self.ser.write(b"s")
+            self.ser.write(f"M{mask:02X}\n".encode("ascii"))
+            self.ser.write(b"b")
             self.stream_requested = True
-        self.log("Sent start stream")
+            self.log(f"Applied activeMask=0x{mask:02X}; sent start stream")
+        except Exception as exc:
+            self.log(f"Start stream failed: {exc}")
 
     def stop_stream(self) -> None:
         self.send_command("s")

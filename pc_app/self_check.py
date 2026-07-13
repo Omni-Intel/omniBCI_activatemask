@@ -53,7 +53,8 @@ def main() -> None:
     assert parse_frame(bytes(damaged)) is None
 
     assert parse_active_mask_ack("#ACK activeMask=0x01 streaming=0 wasStreaming=1") == (0x01, True)
-    assert parse_active_mask_ack("activeMask=0xFF") == (0xFF, False)
+    assert parse_active_mask_ack("#ACK activeMask=0xFF allowedMask=0x41") == (0x41, False)
+    assert parse_active_mask_ack("activeMask=0xFF") is None
     assert parse_active_mask_ack("#ACK no mask") is None
     print("self_check ok")
 
