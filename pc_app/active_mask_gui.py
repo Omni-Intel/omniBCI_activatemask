@@ -23,8 +23,7 @@ SYNC = b"\xA5\x5A"
 PROTOCOL_VERSION = 1
 FRAME_TYPE_DATA = 1
 ENABLE_COMMANDS = "!@#$%^&*"
-BIAS_MASK_5CH = 0x1F
-BIAS_MASK_8CH = 0xFF
+BIAS_MASK_ALL = 0xFF
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -145,8 +144,7 @@ class ActiveMaskApp:
         self.baud_var = StringVar(value=str(BAUD_DEFAULT))
         self.status_var = StringVar(value="Disconnected")
         self.record_var = StringVar(value="Not recording")
-        self.bias_mode_var = StringVar(value="CH1-CH5")
-        self.mask_vars = [BooleanVar(value=index < 5) for index in range(8)]
+        self.mask_vars = [BooleanVar(value=True) for _ in range(8)]
 
         self.ser: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
@@ -158,7 +156,7 @@ class ActiveMaskApp:
         self.recording = RecordingState()
         self.record_lock = threading.Lock()
         self.mask_history: list[dict[str, object]] = []
-        self.active_mask = BIAS_MASK_5CH
+        self.active_mask = BIAS_MASK_ALL
         self.stream_requested = False
         self.resume_after_mask_ack = False
         self.auto_impedance_inflight = False
@@ -186,27 +184,17 @@ class ActiveMaskApp:
         ttk.Button(conn, text="Connect", command=self.connect).grid(row=0, column=5, padx=(0, 4))
         ttk.Button(conn, text="Disconnect", command=self.disconnect).grid(row=0, column=6)
 
-        channels = ttk.LabelFrame(main, text="BIAS_SENSP mask")
+        channels = ttk.LabelFrame(main, text="BIAS_SENSP mask (checked channels are allowed)")
         channels.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(channels, text="Mode").grid(row=0, column=0, padx=(4, 2), pady=6)
-        self.bias_mode_combo = ttk.Combobox(
-            channels,
-            textvariable=self.bias_mode_var,
-            width=10,
-            state="readonly",
-            values=("CH1-CH5", "CH1-CH8"),
-        )
-        self.bias_mode_combo.grid(row=0, column=1, padx=(0, 8), pady=6)
-        self.bias_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_bias_mode_changed())
         for index, var in enumerate(self.mask_vars):
             ttk.Checkbutton(channels, text=f"CH{index + 1}", variable=var).grid(
-                row=0, column=index + 2, padx=4, pady=6
+                row=0, column=index, padx=4, pady=6
             )
         ttk.Button(channels, text="Apply Mask", command=self.apply_mask).grid(
-            row=0, column=10, padx=(12, 4)
+            row=0, column=8, padx=(12, 4)
         )
-        ttk.Button(channels, text="All On", command=lambda: self.set_all(True)).grid(row=0, column=11, padx=4)
-        ttk.Button(channels, text="All Off", command=lambda: self.set_all(False)).grid(row=0, column=12, padx=4)
+        ttk.Button(channels, text="All On", command=lambda: self.set_all(True)).grid(row=0, column=9, padx=4)
+        ttk.Button(channels, text="All Off", command=lambda: self.set_all(False)).grid(row=0, column=10, padx=4)
 
         actions = ttk.Frame(main)
         actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -216,10 +204,7 @@ class ActiveMaskApp:
         ttk.Button(actions, text="Short q", command=lambda: self.send_command("q")).grid(row=0, column=3, padx=(0, 4))
         ttk.Button(actions, text="Test t", command=lambda: self.send_command("t")).grid(row=0, column=4, padx=(0, 4))
         ttk.Button(actions, text="Bias Off o", command=lambda: self.send_command("o")).grid(row=0, column=5, padx=(0, 4))
-        ttk.Button(actions, text="Initial Impedance Mask", command=self.impedance_auto_mask).grid(
-            row=0, column=6, padx=(8, 4)
-        )
-        ttk.Button(actions, text="Record Bin", command=self.toggle_recording).grid(row=0, column=7, padx=(8, 4))
+        ttk.Button(actions, text="Record Bin", command=self.toggle_recording).grid(row=0, column=6, padx=(8, 4))
 
         status = ttk.LabelFrame(main, text="Status")
         status.grid(row=3, column=0, sticky="ew", pady=(10, 0))
@@ -355,32 +340,15 @@ class ActiveMaskApp:
             self.log("Impedance auto mask timed out")
 
     def set_all(self, value: bool) -> None:
-        for index, var in enumerate(self.mask_vars):
-            var.set(value if self.channel_allowed_in_bias(index) else False)
+        for var in self.mask_vars:
+            var.set(value)
 
     def mask_from_checks(self) -> int:
         mask = 0
         for index, var in enumerate(self.mask_vars):
-            if self.channel_allowed_in_bias(index) and var.get():
+            if var.get():
                 mask |= 1 << index
-        return mask & self.current_bias_mask_limit()
-
-    def current_bias_mask_limit(self) -> int:
-        return BIAS_MASK_8CH if self.bias_mode_var.get() == "CH1-CH8" else BIAS_MASK_5CH
-
-    def channel_allowed_in_bias(self, index: int) -> bool:
-        return index < 8 if self.bias_mode_var.get() == "CH1-CH8" else index < 5
-
-    def on_bias_mode_changed(self) -> None:
-        limit = self.current_bias_mask_limit()
-        self.active_mask &= limit
-        if self.active_mask == 0:
-            self.active_mask = limit
-        for index, var in enumerate(self.mask_vars):
-            var.set(self.channel_allowed_in_bias(index) and bool(self.active_mask & (1 << index)))
-        self.log(f"BIAS mode set to {self.bias_mode_var.get()} mask_limit=0x{limit:02X}")
-        if limit == BIAS_MASK_8CH:
-            self.log("Use the 8ch-bias firmware variant for CH1-CH8 BIAS_SENSP control")
+        return mask & BIAS_MASK_ALL
 
     def reader_loop(self) -> None:
         buffer = bytearray()
@@ -556,9 +524,9 @@ class ActiveMaskApp:
 
     def apply_ack_mask(self, mask: int, was_streaming: bool) -> None:
         self.auto_impedance_inflight = False
-        self.active_mask = mask & self.current_bias_mask_limit()
+        self.active_mask = mask & BIAS_MASK_ALL
         for index, var in enumerate(self.mask_vars):
-            var.set(self.channel_allowed_in_bias(index) and bool(self.active_mask & (1 << index)))
+            var.set(bool(self.active_mask & (1 << index)))
         should_resume = self.resume_after_mask_ack or was_streaming
         self.resume_after_mask_ack = False
         if should_resume and self.ser and self.ser.is_open:

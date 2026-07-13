@@ -156,6 +156,7 @@ static SemaphoreHandle_t adsBusMutex = nullptr;
 volatile bool streamingEnabled = false;
 volatile FrontendMode currentMode = MODE_EEG_BIAS_P_ONLY;
 volatile uint8_t activeMask = VALID_BIAS_MASK;
+volatile uint8_t allowedBiasMask = VALID_BIAS_MASK;
 volatile uint32_t acquisitionSequence = 0;
 volatile uint32_t drdyCount = 0;
 volatile uint32_t missedDrdyCount = 0;
@@ -188,7 +189,7 @@ void configureFrontend(FrontendMode mode);
 void configureFrontendLocked(FrontendMode mode);
 void writeBiasMaskLocked(uint8_t mask);
 void applyActiveMask(uint8_t mask, bool acknowledge);
-void initialMaskFromLeadOff(bool acknowledge);
+void printMaskAck(bool wasStreaming);
 void collectQualitySample(const uint8_t *adsRaw);
 void analyzeQualityWindow();
 void setChannelEnabled(uint8_t channelIndex, bool enabled);
@@ -282,8 +283,8 @@ void setup() {
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
   Serial.println("ESP32C3 ADS1299 SRB1 DIAG STREAM READY (8CH BIAS AUTO)");
-  Serial.println("Commands: b/s/MHH/1-8/!@#$%^&*/e/p/o/q/t/i/r/?");
-  Serial.println("b runs one lead-off check before streaming; 2s CH1-CH8 quality windows adjust BIAS_SENSP.");
+  Serial.println("Commands: b/s/MHH/1-8/!@#$%^&*/e/p/o/q/t/r/?");
+  Serial.println("MHH sets user-allowed BIAS channels; 2s CH1-CH8 quality windows adjust BIAS_SENSP inside that mask.");
 }
 
 void loop() {
@@ -459,7 +460,6 @@ void handleCommand(char command) {
     case 'b':
     case 'B':
       if (frameQueue) xQueueReset(frameQueue);
-      initialMaskFromLeadOff(true);
       streamingEnabled = true;
       return;
 
@@ -494,11 +494,6 @@ void handleCommand(char command) {
       configureFrontend(MODE_INTERNAL_TEST);
       return;
 
-    case 'i':
-    case 'I':
-      initialMaskFromLeadOff(true);
-      return;
-
     case 'r':
     case 'R':
       clearDiagnostics();
@@ -521,52 +516,24 @@ void applyActiveMask(uint8_t mask, bool acknowledge) {
   streamingEnabled = false;
   if (frameQueue) xQueueReset(frameQueue);
 
-  activeMask = static_cast<uint8_t>(mask & VALID_BIAS_MASK);
-  if (activeMask == 0) {
-    activeMask = VALID_BIAS_MASK;
+  allowedBiasMask = static_cast<uint8_t>(mask & VALID_BIAS_MASK);
+  if (allowedBiasMask == 0) {
+    allowedBiasMask = activeMask == 0 ? VALID_BIAS_MASK : activeMask;
+  }
+  activeMask = allowedBiasMask;
+  for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
+    badWindowCount[channel] = 0;
+    goodWindowCount[channel] = 0;
   }
   xSemaphoreTake(adsBusMutex, portMAX_DELAY);
-  configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
+  writeBiasMaskLocked(activeMask);
   xSemaphoreGive(adsBusMutex);
 
   currentMode = MODE_EEG_BIAS_P_ONLY;
-  discardFramesAfterReconfigure = 4;
+  discardFramesAfterReconfigure = QUALITY_DISCARD_FRAMES;
 
   if (acknowledge) {
-    printActiveMaskAck(wasStreaming);
-  }
-}
-
-void initialMaskFromLeadOff(bool acknowledge) {
-  const bool wasStreaming = streamingEnabled;
-  streamingEnabled = false;
-  if (frameQueue) xQueueReset(frameQueue);
-
-  xSemaphoreTake(adsBusMutex, portMAX_DELAY);
-  sendAdsCommand(ADS_SDATAC);
-  delay(2);
-
-  writeAdsRegister(0x0F, VALID_BIAS_MASK);  // LOFF_SENSP: check CH1-CH8 P electrodes.
-  writeAdsRegister(0x10, 0x00);             // LOFF_SENSN: SRB1/P-only hardware, keep N out.
-  writeAdsRegister(0x11, 0x00);             // LOFF_FLIP
-  writeAdsRegister(0x04, LOFF_CHECK_CONFIG);
-  delay(120);
-
-  const uint8_t statP = readAdsRegister(0x12);
-  const uint8_t statN = readAdsRegister(0x13);
-  uint8_t goodMask = static_cast<uint8_t>(VALID_BIAS_MASK & ~statP);
-  if (goodMask == 0) {
-    goodMask = activeMask & VALID_BIAS_MASK;
-  }
-
-  activeMask = goodMask;
-  configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
-  xSemaphoreGive(adsBusMutex);
-
-  currentMode = MODE_EEG_BIAS_P_ONLY;
-  discardFramesAfterReconfigure = 8;
-  if (acknowledge) {
-    printLeadOffResult(statP, statN, goodMask, wasStreaming);
+    printMaskAck(wasStreaming);
   }
 }
 
@@ -594,15 +561,6 @@ void analyzeQualityWindow() {
   int32_t medianValues[BIAS_CHANNEL_COUNT] = {};
   float rmsValues[BIAS_CHANNEL_COUNT] = {};
   bool badFlags[BIAS_CHANNEL_COUNT] = {};
-  uint8_t statP = 0;
-
-  if (xSemaphoreTake(adsBusMutex, 0) == pdTRUE) {
-    sendAdsCommand(ADS_SDATAC);
-    delay(2);
-    statP = static_cast<uint8_t>(readAdsRegister(0x12) & VALID_BIAS_MASK);
-    sendAdsCommand(ADS_RDATAC);
-    xSemaphoreGive(adsBusMutex);
-  }
 
   for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
     int32_t sorted[QUALITY_WINDOW_SAMPLES];
@@ -657,9 +615,7 @@ void analyzeQualityWindow() {
                           (maxValue - minValue) < (BAD_FLAT_P2P_UV * COUNTS_PER_UV);
     const bool badDrift = hasPreviousMedian &&
                           abs(median - previousMedian[channel]) > BAD_DRIFT_THRESHOLD;
-    const bool badLeadOff = (statP & (1u << channel)) != 0;
-
-    badFlags[channel] = badSaturation || badLine || badFlat || badDrift || badLeadOff;
+    badFlags[channel] = badSaturation || badLine || badFlat || badDrift;
   }
 
   float sortedRms[BIAS_CHANNEL_COUNT];
@@ -697,9 +653,13 @@ void analyzeQualityWindow() {
   }
   hasPreviousMedian = true;
 
-  uint8_t nextMask = activeMask & VALID_BIAS_MASK;
+  uint8_t nextMask = activeMask & allowedBiasMask & VALID_BIAS_MASK;
   for (uint8_t channel = 0; channel < BIAS_CHANNEL_COUNT; channel++) {
     const uint8_t bit = static_cast<uint8_t>(1u << channel);
+    if ((allowedBiasMask & bit) == 0) {
+      nextMask = static_cast<uint8_t>(nextMask & ~bit);
+      continue;
+    }
     if (badWindowCount[channel] >= BAD_WINDOWS_TO_REMOVE) {
       nextMask = static_cast<uint8_t>(nextMask & ~bit);
     } else if (goodWindowCount[channel] >= GOOD_WINDOWS_TO_RESTORE) {
@@ -707,8 +667,11 @@ void analyzeQualityWindow() {
     }
   }
 
-  if ((nextMask & VALID_BIAS_MASK) == 0) {
-    nextMask = activeMask & VALID_BIAS_MASK;
+  if ((nextMask & allowedBiasMask & VALID_BIAS_MASK) == 0) {
+    nextMask = activeMask & allowedBiasMask & VALID_BIAS_MASK;
+  }
+  if (nextMask == 0) {
+    nextMask = allowedBiasMask & VALID_BIAS_MASK;
   }
 
   lastQualityBadMask = badMask;
@@ -748,10 +711,15 @@ void setChannelEnabled(uint8_t channelIndex, bool enabled) {
 
 void printActiveMaskAck(bool wasStreaming) {
   Serial.printf(
-    "#ACK activeMask=0x%02X streaming=0 wasStreaming=%u\n",
+    "#ACK activeMask=0x%02X allowedMask=0x%02X streaming=0 wasStreaming=%u\n",
     activeMask,
+    allowedBiasMask,
     wasStreaming ? 1u : 0u
   );
+}
+
+void printMaskAck(bool wasStreaming) {
+  printActiveMaskAck(wasStreaming);
 }
 
 void printLeadOffResult(uint8_t statP, uint8_t statN, uint8_t goodMask, bool wasStreaming) {
@@ -1212,6 +1180,7 @@ void printHelpAndDiagnostics() {
   Serial.println("=== ADS1299 SRB1 diagnostic ===");
   Serial.printf("mode=%u streaming=%u\n", (unsigned)currentMode, streamingEnabled ? 1u : 0u);
   Serial.printf("activeMask=0x%02X\n", activeMask);
+  Serial.printf("allowedMask=0x%02X\n", allowedBiasMask);
   Serial.printf("CONFIG1=0x%02X CONFIG2=0x%02X CONFIG3=0x%02X MISC1=0x%02X\n",
                 config1, config2, config3, misc1);
   Serial.printf("BIAS_SENSP=0x%02X BIAS_SENSN=0x%02X\n", biasSensp, biasSensn);
