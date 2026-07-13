@@ -149,6 +149,8 @@ class ActiveMaskApp:
         self.baud_var = StringVar(value=str(BAUD_DEFAULT))
         self.status_var = StringVar(value="Disconnected")
         self.record_var = StringVar(value="Not recording")
+        self.manual_command_var = StringVar(value="")
+        self.manual_newline_var = BooleanVar(value=False)
         self.mask_vars = [BooleanVar(value=index == 0) for index in range(8)]
 
         self.ser: serial.Serial | None = None
@@ -211,14 +213,27 @@ class ActiveMaskApp:
         ttk.Button(actions, text="Bias Off o", command=lambda: self.send_command("o")).grid(row=0, column=5, padx=(0, 4))
         ttk.Button(actions, text="Record Bin", command=self.toggle_recording).grid(row=0, column=6, padx=(8, 4))
 
+        manual = ttk.LabelFrame(main, text="Manual Serial Command")
+        manual.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        manual.columnconfigure(0, weight=1)
+        self.manual_command_entry = ttk.Entry(manual, textvariable=self.manual_command_var)
+        self.manual_command_entry.grid(row=0, column=0, sticky="ew", padx=(6, 4), pady=6)
+        self.manual_command_entry.bind("<Return>", lambda _event: self.send_manual_command())
+        ttk.Checkbutton(manual, text="append \\n", variable=self.manual_newline_var).grid(
+            row=0, column=1, padx=(0, 4), pady=6
+        )
+        ttk.Button(manual, text="Send", command=self.send_manual_command).grid(
+            row=0, column=2, padx=(0, 6), pady=6
+        )
+
         status = ttk.LabelFrame(main, text="Status")
-        status.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(status, textvariable=self.status_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(status, textvariable=self.record_var).grid(row=1, column=0, sticky="w", padx=6, pady=4)
 
         log_frame = ttk.LabelFrame(main, text="Log")
-        log_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
-        main.rowconfigure(4, weight=1)
+        log_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
+        main.rowconfigure(5, weight=1)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = self._make_text(log_frame)
@@ -275,6 +290,25 @@ class ActiveMaskApp:
             self.ser.write(command.encode("ascii"))
         except Exception as exc:
             self.log(f"Serial write failed: {exc}")
+
+    def send_manual_command(self) -> None:
+        if not self.ser or not self.ser.is_open:
+            self.log("Not connected")
+            return
+        command = self.manual_command_var.get()
+        if not command:
+            return
+        command = command.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
+        if self.manual_newline_var.get() and not command.endswith(("\n", "\r")):
+            command += "\n"
+        try:
+            self.ser.write(command.encode("ascii"))
+            shown = command.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+            self.log(f"Manual sent: {shown}")
+        except UnicodeEncodeError:
+            self.log("Manual send failed: command must be ASCII")
+        except Exception as exc:
+            self.log(f"Manual send failed: {exc}")
 
     def apply_mask(self) -> None:
         mask = self.mask_from_checks()
