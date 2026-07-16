@@ -154,6 +154,12 @@ enum FrontendMode : uint8_t {
   MODE_INTERNAL_TEST   = 4
 };
 
+enum RunPhase : uint8_t {
+  PHASE_CONFIG = 0,
+  PHASE_STREAMING = 1,
+  PHASE_STOPPED = 2
+};
+
 // ============================ RTOS objects ============================
 static QueueHandle_t frameQueue = nullptr;
 static TaskHandle_t adsTaskHandle = nullptr;
@@ -161,6 +167,9 @@ static SemaphoreHandle_t adsBusMutex = nullptr;
 
 // ============================ State / diagnostics ============================
 volatile bool streamingEnabled = false;
+volatile bool adsConversionsRunning = false;
+volatile bool configurationVerified = false;
+volatile RunPhase runPhase = PHASE_CONFIG;
 volatile FrontendMode currentMode = MODE_EEG_BIAS_P_ONLY;
 volatile uint32_t acquisitionSequence = 0;
 volatile uint32_t drdyCount = 0;
@@ -199,6 +208,11 @@ void startNscClock();
 void hardwareResetAds();
 void configureFrontend(FrontendMode mode);
 void configureFrontendLocked(FrontendMode mode);
+bool verifyFrontendLocked(FrontendMode mode);
+void startStreaming();
+void stopStreamingGracefully();
+void startAdsConversionsLocked();
+void stopAdsConversionsLocked();
 
 uint8_t softSpiTransfer(uint8_t tx);
 void deselectAllSpi();
@@ -286,6 +300,8 @@ void setup() {
   drdyCount = 0;
   attachInterrupt(digitalPinToInterrupt(PIN_DRDY), onDrdyFalling, FALLING);
 
+  runPhase = PHASE_STOPPED;
+
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
   Serial.println("ESP32C3 ADS1299 SRB1 DIAG STREAM READY - DEFAULT P-ONLY CH1-5");
@@ -358,7 +374,7 @@ void adsAcquireTask(void *argument) {
       continue;
     }
 
-    if (!streamingEnabled) {
+    if (!streamingEnabled || runPhase != PHASE_STREAMING) {
       continue;
     }
 
@@ -398,7 +414,7 @@ void serialStreamTask(void *argument) {
     }
 
     if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(2)) == pdTRUE) {
-      if (streamingEnabled) {
+      if (runPhase == PHASE_STREAMING) {
         Serial.write(frame.bytes, STREAM_FRAME_BYTES);
       }
     } else {
@@ -475,14 +491,12 @@ void handleCommand(char command) {
   switch (command) {
     case 'b':
     case 'B':
-      if (frameQueue) xQueueReset(frameQueue);
-      streamingEnabled = true;
+      startStreaming();
       return;
 
     case 's':
     case 'S':
-      streamingEnabled = false;
-      if (frameQueue) xQueueReset(frameQueue);
+      stopStreamingGracefully();
       return;
 
     case 'e':
@@ -557,6 +571,8 @@ uint8_t makePoweredDownChannelSetting(uint8_t gainCode) {
 }
 
 void setGainByValue(uint8_t gain) {
+  if (runPhase == PHASE_STREAMING) return;
+
   uint8_t code = 0;
   if (!gainToCode(gain, code)) {
     if (!streamingEnabled) {
@@ -579,38 +595,27 @@ void setGainByValue(uint8_t gain) {
 void setBiasSensPMask(uint8_t mask) {
   // 这个函数专门给 GUI 的八个通道勾选框用：
   // 只写 ADS1299 BIAS_SENSP(0x0D)，绝不写 BIAS_SENSN(0x0E)。
-  const bool shouldResumeStreaming = streamingEnabled;
+  if (runPhase == PHASE_STREAMING) return;
   streamingEnabled = false;
   if (frameQueue) xQueueReset(frameQueue);
 
   xSemaphoreTake(adsBusMutex, portMAX_DELAY);
 
-  gpio_set_level(static_cast<gpio_num_t>(PIN_START), 0);
-  delay(5);
-  sendAdsCommand(ADS_SDATAC);
-  delay(2);
-  sendAdsCommand(ADS_STOP);
-  delay(2);
+  stopAdsConversionsLocked();
 
   writeAdsRegister(0x0D, mask);
 
-  gpio_set_level(static_cast<gpio_num_t>(PIN_START), 1);
-  delay(5);
-  sendAdsCommand(ADS_RDATAC);
-  delay(2);
-  sendAdsCommand(ADS_START);
-  delay(5);
-
+  currentBiasSensPMask = mask;
+  configurationVerified = verifyFrontendLocked(static_cast<FrontendMode>(currentMode));
   xSemaphoreGive(adsBusMutex);
 
-  currentBiasSensPMask = mask;
   discardFramesAfterReconfigure = 4;
-  streamingEnabled = shouldResumeStreaming;
+  runPhase = PHASE_STOPPED;
 }
 
 // ============================ Frontend modes ============================
 void configureFrontend(FrontendMode mode) {
-  const bool shouldResumeStreaming = streamingEnabled;
+  if (runPhase == PHASE_STREAMING) return;
   streamingEnabled = false;
   if (frameQueue) xQueueReset(frameQueue);
 
@@ -620,17 +625,13 @@ void configureFrontend(FrontendMode mode) {
 
   currentMode = mode;
   discardFramesAfterReconfigure = 4;
-  streamingEnabled = shouldResumeStreaming;
+  runPhase = PHASE_STOPPED;
 }
 
 void configureFrontendLocked(FrontendMode mode) {
-  gpio_set_level(static_cast<gpio_num_t>(PIN_START), 0);
-  delay(5);
-
-  sendAdsCommand(ADS_SDATAC);
-  delay(2);
-  sendAdsCommand(ADS_STOP);
-  delay(2);
+  runPhase = PHASE_CONFIG;
+  configurationVerified = false;
+  stopAdsConversionsLocked();
 
   writeAdsRegister(0x01, CONFIG1_250SPS);
   writeAdsRegister(0x03, CONFIG3_INTERNAL_REF);
@@ -692,14 +693,93 @@ void configureFrontendLocked(FrontendMode mode) {
   writeAdsRegister(0x0F, 0x00);  // LOFF_FLIP
   writeAdsRegister(0x15, MISC1_SRB1_ON);
 
+  currentMode = mode;
+  configurationVerified = verifyFrontendLocked(mode);
+}
+
+bool verifyFrontendLocked(FrontendMode mode) {
+  uint8_t expectedConfig2 = (mode == MODE_INTERNAL_TEST) ? CONFIG2_TEST_SLOW : CONFIG2_NORMAL;
+  uint8_t expectedMux = CH_MUX_NORMAL;
+  uint8_t expectedBiasP = currentBiasSensPMask;
+  uint8_t expectedBiasN = 0x00;
+
+  if (mode == MODE_INPUT_SHORTED) expectedMux = CH_MUX_SHORTED;
+  if (mode == MODE_INTERNAL_TEST) expectedMux = CH_MUX_TEST;
+  if (mode == MODE_EEG_BIAS_PN) expectedBiasN = ADS_ACTIVE_CH_MASK;
+  if (mode == MODE_EEG_BIAS_OFF || mode == MODE_INPUT_SHORTED || mode == MODE_INTERNAL_TEST) {
+    expectedBiasP = 0x00;
+    expectedBiasN = 0x00;
+  }
+
+  const uint8_t expectedActive = makeChannelSetting(currentGainCode, expectedMux);
+  const uint8_t expectedDisabled = makePoweredDownChannelSetting(currentGainCode);
+  bool ok = true;
+  ok &= readAdsRegister(0x01) == CONFIG1_250SPS;
+  ok &= readAdsRegister(0x02) == expectedConfig2;
+  ok &= readAdsRegister(0x03) == CONFIG3_INTERNAL_REF;
+  for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
+    ok &= readAdsRegister(address) == (address <= ADS_LAST_ACTIVE_REG ? expectedActive : expectedDisabled);
+  }
+  ok &= readAdsRegister(0x0D) == expectedBiasP;
+  ok &= readAdsRegister(0x0E) == expectedBiasN;
+  ok &= readAdsRegister(0x0F) == 0x00;
+  ok &= readAdsRegister(0x15) == MISC1_SRB1_ON;
+  return ok;
+}
+
+void startAdsConversionsLocked() {
+  if (adsConversionsRunning) return;
   gpio_set_level(static_cast<gpio_num_t>(PIN_START), 1);
   delay(10);
   sendAdsCommand(ADS_RDATAC);
   delay(2);
   sendAdsCommand(ADS_START);
   delay(10);
+  adsConversionsRunning = true;
+}
 
-  currentMode = mode;
+void stopAdsConversionsLocked() {
+  gpio_set_level(static_cast<gpio_num_t>(PIN_START), 0);
+  delay(5);
+  sendAdsCommand(ADS_SDATAC);
+  delay(2);
+  sendAdsCommand(ADS_STOP);
+  delay(2);
+  adsConversionsRunning = false;
+}
+
+void startStreaming() {
+  if (runPhase == PHASE_STREAMING || !configurationVerified) return;
+  if (frameQueue) xQueueReset(frameQueue);
+  xTaskNotifyStateClear(adsTaskHandle);
+  acquisitionSequence = 0;
+  discardFramesAfterReconfigure = 4;
+  xSemaphoreTake(adsBusMutex, portMAX_DELAY);
+  startAdsConversionsLocked();
+  xSemaphoreGive(adsBusMutex);
+  runPhase = PHASE_STREAMING;
+  streamingEnabled = true;
+}
+
+void stopStreamingGracefully() {
+  if (runPhase != PHASE_STREAMING) return;
+
+  // Close the producer first, then stop DRDY. Taking the ADS mutex waits for
+  // any read already in progress to finish and enqueue its last complete frame.
+  streamingEnabled = false;
+  runPhase = PHASE_STOPPED;
+  xSemaphoreTake(adsBusMutex, portMAX_DELAY);
+  stopAdsConversionsLocked();
+  xSemaphoreGive(adsBusMutex);
+
+  // This serial task remains the sole TX owner and drains every complete frame
+  // accepted before the converter stopped.
+  StreamFrame tail = {};
+  while (frameQueue && xQueueReceive(frameQueue, &tail, 0) == pdTRUE) {
+    Serial.write(tail.bytes, STREAM_FRAME_BYTES);
+  }
+  Serial.flush();
+  if (frameQueue) xQueueReset(frameQueue);
 }
 
 // ============================ Packet builder ============================
@@ -959,7 +1039,11 @@ void clearDiagnostics() {
 void printHelpAndDiagnostics() {
   Serial.println();
   Serial.println("=== ADS1299 SRB1 diagnostic ===");
-  Serial.printf("mode=%u streaming=%u\n", (unsigned)currentMode, streamingEnabled ? 1u : 0u);
+  Serial.printf("phase=%u mode=%u streaming=%u configVerified=%u\n",
+                (unsigned)runPhase,
+                (unsigned)currentMode,
+                streamingEnabled ? 1u : 0u,
+                configurationVerified ? 1u : 0u);
   Serial.printf("seq=%lu drdy=%lu validRead=%lu\n",
                 (unsigned long)acquisitionSequence,
                 (unsigned long)drdyCount,
@@ -996,10 +1080,6 @@ void printRegisterReadback() {
   const uint8_t biasN = readAdsRegister(0x0E);
   const uint8_t misc1 = readAdsRegister(0x15);
 
-  sendAdsCommand(ADS_RDATAC);
-  delay(2);
-  sendAdsCommand(ADS_START);
-  delay(2);
   xSemaphoreGive(adsBusMutex);
 
   Serial.printf("CONFIG1=0x%02X CONFIG2=0x%02X CONFIG3=0x%02X\n", config1, config2, config3);
