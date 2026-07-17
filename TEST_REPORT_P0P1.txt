@@ -1,0 +1,16 @@
+P0+P1 validation report
+=======================
+
+Checks completed before packaging:
+1. Python syntax compilation: PASS
+2. Full AST parse and duplicate-method scan: PASS
+3. Synthetic 10 Hz Alpha + 50 Hz line test: Alpha peak detected at ~10.01 Hz
+4. Motion-artifact test: contaminated 4 s segments rejected; clean segments retained
+5. Sequence-gap test: overlapping segments containing the gap rejected
+6. Stateful live filter test: output sample count matches input sample count
+7. Invalid-frame test: invalid mask is preserved after filter-state continuity filling
+8. Real bundled BIN parser test: CRC parsing completed successfully on selected recordings
+
+Runtime note:
+The build environment did not contain PySide6, so the complete GUI window could not be launched here.
+The included requirements.txt and install_and_run.bat install the required GUI dependencies on Windows.
