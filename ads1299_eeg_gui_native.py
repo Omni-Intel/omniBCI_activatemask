@@ -82,6 +82,8 @@ MODE_NAMES = {
     3: "SHORTED",
     4: "TEST",
 }
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "omni_logo_cnen.png"
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "omni_logo_mark.png"
 
 
 @dataclass
@@ -282,6 +284,7 @@ class PsdWorker(QtCore.QRunnable):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setWindowTitle("ADS1299 Native Python EEG GUI - P0+P1 filtering")
         self.resize(1500, 920)
 
@@ -350,6 +353,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_processing_state()
 
         self._build_clinical_ui()
+        self.setWindowTitle("Omni-Intelligence | ADS1299 EEG Viewer")
         self.refresh_ports()
 
         self.serial_timer = QtCore.QTimer(self)
@@ -539,26 +543,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_clinical_ui(self):
         """Compact clinical-review layout; acquisition diagnostics remain available."""
-        pg.setConfigOptions(antialias=True, background="w", foreground="#4a5562")
+        pg.setConfigOptions(antialias=True, background="#050505", foreground="#c9c9c9")
         self.setWindowTitle("ADS1299 EEG 查看器")
         self.setMinimumSize(1050, 680)
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#eef0f2; color:#202830; font-size:12px; }
-            QMenuBar { background:#f4f5f6; border-bottom:1px solid #b9bec4; }
-            QToolBar { background:#075180; color:white; border-bottom:3px solid #45b6d2; spacing:5px; padding:7px; }
-            QToolBar QLabel, QToolBar QCheckBox { color:#ffffff; background:transparent; font-size:14px; font-weight:600; }
-            QToolBar QToolButton { color:white; background:transparent; border:0; font-weight:600; padding:4px 8px; }
+            QMainWindow, QWidget { background:#f4f5f7; color:#2d2521; font-size:12px; }
+            QMenuBar { background:#ffffff; border-bottom:1px solid #d8dde3; }
+            QToolBar { background:#ffffff; color:#2d2521; border-bottom:3px solid #ff5a01; spacing:5px; padding:5px 7px; min-height:42px; }
+            QToolBar QLabel, QToolBar QCheckBox { color:#2d2521; background:transparent; font-size:14px; font-weight:600; }
+            QToolBar QToolButton { color:#2d2521; background:transparent; border:0; font-weight:600; padding:4px 8px; }
             QToolBar QDoubleSpinBox, QToolBar QSpinBox, QToolBar QComboBox, QToolBar QPushButton {
-                color:#202830; background:#ffffff; border:1px solid #aeb4ba; min-height:22px;
+                color:#2d2521; background:#ffffff; border:1px solid #d8dde3; min-height:22px;
             }
-            QToolBar QComboBox QAbstractItemView { color:#202830; background:#ffffff; }
+            QToolBar QComboBox QAbstractItemView { color:#2d2521; background:#ffffff; }
             QToolButton, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox {
-                color:#202830; background:#fafafa; border:1px solid #aeb4ba; padding:2px 5px; min-height:20px;
+                color:#2d2521; background:#ffffff; border:1px solid #d8dde3; padding:2px 5px; min-height:20px;
             }
-            QGroupBox { color:#155378; font-weight:600; border:1px solid #aeb4ba; border-radius:3px; margin-top:7px; padding-top:6px; }
-            QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; background:#eef0f2; }
-            QToolButton:pressed, QPushButton:pressed { background:#dce4ec; }
-            QStatusBar { background:#e7eaed; border-top:1px solid #b8bdc3; }
+            QToolButton:hover, QPushButton:hover { background:#fff4ed; border-color:#ff8b50; }
+            QGroupBox { background:#ffffff; color:#ff5a01; font-weight:600; border:1px solid #d8dde3; border-radius:3px; margin-top:7px; padding-top:6px; }
+            QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; background:#ffffff; }
+            QTabBar::tab { background:#ffffff; border:1px solid #d8dde3; border-bottom:0; padding:5px 12px; }
+            QTabBar::tab:selected { background:#fff0e6; color:#b83c00; border-color:#ff8b50; }
+            QToolButton:pressed, QPushButton:pressed { background:#ffd8c2; }
+            QStatusBar { background:#ffffff; border-top:1px solid #d8dde3; }
+            QDockWidget::title { background:#ffffff; color:#ff5a01; padding:5px; }
         """)
 
         # File and view menus retain the existing acquisition functionality.
@@ -583,6 +591,18 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self.logo_label = QtWidgets.QLabel()
+        self.logo_label.setToolTip("Omni-Intelligence")
+        self.logo_label.setFixedSize(260, 68)
+        self.logo_label.setAlignment(QtCore.Qt.AlignCenter)
+        logo = QtGui.QPixmap(str(LOGO_PATH))
+        if logo.isNull():
+            self.logo_label.setText("OMNI")
+        else:
+            self.logo_label.setPixmap(logo.scaled(252, 64, QtCore.Qt.KeepAspectRatio,
+                                                   QtCore.Qt.SmoothTransformation))
+        toolbar.addWidget(self.logo_label)
+        toolbar.addSeparator()
         toolbar.addAction(open_action)
         toolbar.addAction(export_action)
         toolbar.addSeparator()
@@ -689,16 +709,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav_plot.hideAxis("left")
         self.nav_plot.setMouseEnabled(x=True, y=False)
         self.nav_plot.getPlotItem().setMenuEnabled(False)
-        self.nav_curve = self.nav_plot.plot(pen=pg.mkPen("#7d8995", width=1))
+        self.nav_plot.setBackground("#050505")
+        self.nav_curve = self.nav_plot.plot(pen=pg.mkPen("#c9c9c9", width=1))
         self.nav_region = pg.LinearRegionItem(values=(0, 10), movable=True,
-            brush=pg.mkBrush(64, 113, 151, 45), pen=pg.mkPen("#356b95", width=1.5))
+            brush=pg.mkBrush(255, 90, 1, 45), pen=pg.mkPen("#e84f00", width=1.5))
         self.nav_region.sigRegionChanged.connect(self._nav_region_changed)
         self.nav_plot.addItem(self.nav_region)
         wave_page_layout.addWidget(self.nav_plot)
 
         self.event_label = QtWidgets.QLabel("  ━  滤波显示副本（不修改原始数据）")
         self.event_label.setFixedHeight(21)
-        self.event_label.setStyleSheet("background:#f7f8f8;color:#27764a;border:1px solid #c5c9cc;")
+        self.event_label.setStyleSheet("background:#fff0e6;color:#b83c00;border:1px solid #f3c2a5;")
         wave_page_layout.addWidget(self.event_label)
 
         wave_row = QtWidgets.QWidget()
@@ -707,14 +728,14 @@ class MainWindow(QtWidgets.QMainWindow):
         wave_layout.setSpacing(0)
         channel_panel = QtWidgets.QFrame()
         channel_panel.setFixedWidth(178)
-        channel_panel.setStyleSheet("background:#b8e1f2;border-right:1px solid #5d9bb8;")
+        channel_panel.setStyleSheet("background:#ffffff;border-right:1px solid #d8dde3;")
         channel_layout = QtWidgets.QVBoxLayout(channel_panel)
         channel_layout.setContentsMargins(0, 0, 0, 31)
         channel_layout.setSpacing(0)
         channel_header = QtWidgets.QLabel("通道 / 幅值")
         channel_header.setAlignment(QtCore.Qt.AlignCenter)
         channel_header.setFixedHeight(27)
-        channel_header.setStyleSheet("background:#075180;color:white;font-size:15px;font-weight:bold;")
+        channel_header.setStyleSheet("background:#ffffff;color:#ff5a01;border-bottom:3px solid #ff5a01;font-size:15px;font-weight:bold;")
         channel_layout.addWidget(channel_header)
         self.channel_buttons = []
         self.channel_scales = []
@@ -732,8 +753,8 @@ class MainWindow(QtWidgets.QMainWindow):
             button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
             button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
             button.setStyleSheet(
-                "QToolButton{background:#b8e1f2;color:#155378;border:0;"
-                "border-bottom:1px solid #a4d3e6;text-align:left;padding-left:10px;font-size:13px;}"
+                "QToolButton{background:#ffffff;color:#2d2521;border:0;"
+                "border-bottom:1px solid #e2e6eb;text-align:left;padding-left:10px;font-size:13px;}"
             )
             button.clicked.connect(lambda _checked=False, index=ch: self._select_channel(index))
             row_layout.addWidget(button, 1)
@@ -754,7 +775,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Each channel gets its own PlotItem and y-range.  This removes the
         # artificial lane offsets and lets every channel use its own amplitude.
         self.wave_widget = pg.GraphicsLayoutWidget()
-        self.wave_widget.setBackground("w")
+        self.wave_widget.setBackground("#050505")
         self.channel_plots = []
         self.stack_curves = []
         for ch in range(CHANNELS):
@@ -767,7 +788,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.hideAxis("bottom")
             else:
                 plot.setLabel("bottom", "时间", units="s")
-            curve = plot.plot(pen=pg.mkPen("#075f96" if ch == 0 else "#202020", width=1.0),
+            curve = plot.plot(pen=pg.mkPen("#ff5a01" if ch == 0 else "#d7d7d7", width=1.0),
                               connect="finite")
             self.channel_plots.append(plot)
             self.stack_curves.append(curve)
@@ -802,14 +823,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_btn = QtWidgets.QPushButton(); self.closed_btn = QtWidgets.QPushButton()
         self.time_plot = pg.PlotWidget(); self.time_curve = self.time_plot.plot()
         self.psd_plot = pg.PlotWidget()
-        self.psd_plot.setBackground("w")
+        self.psd_plot.setBackground("#050505")
         self.psd_plot.showGrid(x=True, y=True, alpha=0.22)
         self.psd_plot.setLabel("bottom", "频率", units="Hz")
         self.psd_plot.setLabel("left", "PSD", units="dB µV²/Hz")
         self.psd_plot.setTitle("Welch PSD | 等待数据")
-        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen("#075f96", width=1.6))
-        self.psd_plot.addLine(x=8, pen=pg.mkPen("#d26a00", style=QtCore.Qt.DashLine))
-        self.psd_plot.addLine(x=13, pen=pg.mkPen("#d26a00", style=QtCore.Qt.DashLine))
+        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen("#ff5a01", width=1.6))
+        self.psd_plot.addLine(x=8, pen=pg.mkPen("#ff9a5c", style=QtCore.Qt.DashLine))
+        self.psd_plot.addLine(x=13, pen=pg.mkPen("#ff9a5c", style=QtCore.Qt.DashLine))
         psd_page = QtWidgets.QWidget()
         psd_layout = QtWidgets.QVBoxLayout(psd_page)
         psd_layout.setContentsMargins(6, 6, 6, 6)
@@ -925,13 +946,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_channel(self, ch):
         self.channel_combo.setCurrentIndex(ch)
         for i, curve in enumerate(self.stack_curves):
-            curve.setPen(pg.mkPen("#075f96" if i == ch else "#202020",
+            curve.setPen(pg.mkPen("#ff5a01" if i == ch else "#d7d7d7",
                                   width=1.7 if i == ch else 1.0))
         for i, button in enumerate(self.channel_buttons):
             button.setStyleSheet(
                 "QToolButton{"
-                f"background:{'#82cce9' if i == ch else '#b8e1f2'};"
-                "color:#155378;border:0;border-bottom:1px solid #a4d3e6;"
+                f"background:{'#fff0e6' if i == ch else '#ffffff'};"
+                "color:#2d2521;border:0;border-bottom:1px solid #e2e6eb;"
                 "text-align:left;padding-left:10px;font-size:13px;"
                 f"font-weight:{'bold' if i == ch else 'normal'};"
                 "}"
@@ -1980,7 +2001,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("ADS1299 Native EEG GUI")
+    app.setApplicationName("Omni-Intelligence ADS1299 EEG Viewer")
+    app.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

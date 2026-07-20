@@ -3,5 +3,6 @@ __pycache__/
 *.log
 .pytest_cache/
 .mypy_cache/
+ui_preview_*.png
 .idea/
 .vscode/
