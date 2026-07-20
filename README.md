@@ -1,4 +1,4 @@
-# ADS1299 8 通道脑电采集与回放 GUI
+# Omni-Intelligence ADS1299 EEG Viewer
 
 这是一个面向 ADS1299 + ESP32-C3 的原生 Python 脑电采集、BIN 录制和离线回放工具。界面采用紧凑的临床脑电走纸布局，保留真实微伏标定、原始数据诊断、滤波显示副本和 MNE 联动能力。
 
@@ -16,9 +16,10 @@
 
 ## GUI 布局
 
-- 深蓝色紧凑参数栏。
+- 白色/浅灰临床监测界面，橙色用于标题、选中项和关键曲线。
+- 主工具栏左侧显示 Omni-Intelligence 横版 Logo；标题栏和任务栏使用方形 OI 图标。
 - 左侧固定 `CH1`–`CH8` 通道栏和通道状态标识。
-- 中央白色 EEG 走纸区，黑色细波形、秒级主网格和 0.2 秒次网格。
+- 中央黑色 EEG 走纸区，浅灰波形、秒级主网格和 0.2 秒次网格。
 - 底部采用 `HH:MM:SS` 时间刻度。
 - 顶部全程时间导航条显示当前窗口位置。
 - 右下角显示真实幅值和 1 秒校准标尺。
@@ -105,6 +106,9 @@ requirements.txt           Python 依赖
 install_and_run.bat         安装依赖并启动
 run.bat                     直接启动
 firmware/                   ESP32-C3 + ADS1299 固件
+assets/                     Omni-Intelligence Logo 资源
+  omni_logo_cnen.png        工具栏横版 Logo
+  omni_logo_mark.png        窗口和任务栏图标
 recordings/                 测试 BIN、CSV 和分析结果
 TEST_REPORT_P0P1.txt        测试记录
 CHANGELOG_P0P1.md           变更记录
