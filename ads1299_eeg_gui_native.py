@@ -91,6 +91,16 @@ OMNI_BLACK = "#080808"
 OMNI_PAPER = "#f6f7f9"
 
 
+def make_simulated_eeg_uv(sample_indices: np.ndarray, rng) -> np.ndarray:
+    """Return eight display-only EEG-like traces in input-referred uV."""
+    t = np.asarray(sample_indices, dtype=float).reshape(1, -1) / FS
+    ch = np.arange(CHANNELS, dtype=float).reshape(-1, 1)
+    alpha = (12.0 + 1.8 * ch) * np.sin(2 * np.pi * (8.5 + 0.25 * ch) * t + 0.45 * ch)
+    theta = (4.0 + 0.35 * ch) * np.sin(2 * np.pi * (4.0 + 0.10 * ch) * t + 0.70 * ch)
+    drift = 5.0 * np.sin(2 * np.pi * (0.18 + 0.015 * ch) * t + 0.25 * ch)
+    return (alpha + theta + drift + rng.normal(0.0, 1.8, size=(CHANNELS, t.shape[1]))).astype(np.float32)
+
+
 @dataclass
 class Frame:
     sequence: int
@@ -303,6 +313,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.parser = AdsFrameParser(self.channel_lsb_uv)
         self.ser: Optional[serial.Serial] = None
         self.streaming = False
+        self.simulation_enabled = False
+        self.simulation_started_at = 0.0
+        self.simulation_sample_index = 0
+        self.simulation_rng = np.random.default_rng(1299)
         self.raw_file = None
         self.raw_path = ""
         self.raw_bytes = 0
@@ -366,6 +380,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_timer = QtCore.QTimer(self)
         self.serial_timer.timeout.connect(self.poll_serial)
         self.serial_timer.start(10)
+
+        self.simulation_timer = QtCore.QTimer(self)
+        self.simulation_timer.timeout.connect(self.poll_simulated_eeg)
+        self.simulation_timer.start(20)
 
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.update_fast_plots)
@@ -674,6 +692,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self.start_stream)
         self.stop_btn = QtWidgets.QPushButton("停止")
         self.stop_btn.clicked.connect(self.stop_stream)
+        self.simulation_check = QtWidgets.QCheckBox("模拟 8 通道 EEG")
+        self.simulation_check.setToolTip("仅生成 GUI 显示数据，不写入串口或 BIN 文件")
+        self.simulation_check.toggled.connect(self.toggle_simulated_eeg)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -690,6 +711,7 @@ class MainWindow(QtWidgets.QMainWindow):
         serial_layout.addWidget(self.connect_btn)
         serial_layout.addWidget(self.start_btn)
         serial_layout.addWidget(self.stop_btn)
+        serial_layout.addWidget(self.simulation_check)
         serial_hint = QtWidgets.QLabel("扫描 → 选择设备 → 打开串口 → 开始采集")
         serial_hint.setStyleSheet("color:#6c625d;")
         serial_layout.addWidget(serial_hint)
@@ -1471,6 +1493,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- serial/actions ----------------
     def start_stream(self):
+        if self.simulation_enabled:
+            self.set_status("模拟 8 通道 EEG 已启用")
+            return
         if not self.require_serial():
             return
         try:
@@ -1508,6 +1533,53 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self.raw_file = None
+
+    def toggle_simulated_eeg(self, enabled: bool):
+        if enabled:
+            self.stop_stream()
+            self.offline_uv = None
+            self.offline_valid = None
+            self.offline_seq = None
+            self.offline_mode = None
+            self.offline_end = 0
+            self.offline_slider.setEnabled(False)
+            self.offline_label.setText("模拟实时")
+            self.clear_stats()
+            self.current_mode = 1
+            self.simulation_rng = np.random.default_rng(1299)
+            self.simulation_sample_index = 0
+            self.simulation_started_at = time.monotonic()
+            self.simulation_enabled = True
+            self.start_btn.setEnabled(False)
+            self.set_status("模拟 8 通道 EEG 运行中")
+            return
+
+        self.simulation_enabled = False
+        self.start_btn.setEnabled(True)
+        self.set_status("模拟 8 通道 EEG 已关闭")
+
+    def poll_simulated_eeg(self):
+        if not self.simulation_enabled:
+            return
+        target = int((time.monotonic() - self.simulation_started_at) * FS)
+        count = min(max(0, target - self.simulation_sample_index), FS)
+        if count == 0:
+            return
+
+        indices = np.arange(self.simulation_sample_index, self.simulation_sample_index + count)
+        values = make_simulated_eeg_uv(indices, self.simulation_rng)
+        lsb = self.channel_lsb_uv()
+        frames = []
+        for i, sequence in enumerate(indices):
+            uv = values[:, i]
+            frames.append(Frame(
+                sequence=int(sequence), uv=uv, valid=True, mode=1,
+                status=b"\xC0\x00\x00", flags=0xA3, read_us=0,
+                pending=0, queue_depth=0, queue_drop_low=0,
+                raw_counts=np.rint(uv / lsb).astype(np.int32),
+            ))
+        self.simulation_sample_index += count
+        self.process_frames(frames, live=True)
 
     def apply_mode(self):
         if not self.require_serial():
@@ -1565,6 +1637,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_status(f"仅修改本地解码 PGA={new_gain}，LSB={self.lsb_uv:.6g} uV/code。")
 
     def poll_serial(self):
+        if self.simulation_enabled:
+            return
         if not self.ser or not self.ser.is_open:
             return
         try:
@@ -1654,6 +1728,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
+            if self.simulation_check.isChecked():
+                self.simulation_check.setChecked(False)
             self.stop_stream()
             raw = Path(path).read_bytes()
             parser = AdsFrameParser(self.channel_lsb_uv)
@@ -2134,6 +2210,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    if "--self-check" in sys.argv:
+        samples = make_simulated_eeg_uv(np.arange(FS * 2), np.random.default_rng(1299))
+        assert samples.shape == (CHANNELS, FS * 2)
+        assert np.isfinite(samples).all() and np.all(np.std(samples, axis=1) > 5.0)
+        print("simulated EEG generator ok")
+        return
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("全域智能 ADS1299 EEG 工作站")
     if APP_ICON_PATH.exists():
