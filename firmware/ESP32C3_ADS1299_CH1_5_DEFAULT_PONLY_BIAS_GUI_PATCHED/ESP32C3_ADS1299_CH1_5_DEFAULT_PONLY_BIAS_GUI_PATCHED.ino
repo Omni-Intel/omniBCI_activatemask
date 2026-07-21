@@ -193,7 +193,19 @@ volatile uint8_t currentBiasSensPMask = ADS_ACTIVE_CH_MASK;
 // 二进制控制协议：0xA6 <register> <value>
 // Python/MATLAB GUI 用 0xA6 0x0D mask 来运行时修改 BIAS_SENSP。
 static uint8_t binaryControlState = 0;
+volatile uint8_t currentEnabledMask = ADS_ACTIVE_CH_MASK;
+volatile uint8_t currentSrb2Mask = 0x00;
+volatile uint8_t channelGain[8] = {24, 24, 24, 24, 24, 24, 24, 24};
+volatile uint8_t channelGainCode[8] = {
+  CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24,
+  CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24
+};
+
+// Binary controls: A6 0D mask, or A7 channel gain flags.
+// A7 channel is 0..7; flags: bit0 enabled, bit1 BIAS_P, bit2 SRB2.
 static uint8_t binaryControlRegister = 0;
+static uint8_t binaryControlChannel = 0;
+static uint8_t binaryControlGain = 24;
 
 // 串口数字命令缓冲：支持发送 1/2/4/6/8/12/24 修改 PGA 增益。
 static char numericCommandBuffer[4] = {0};
@@ -229,8 +241,9 @@ void flushNumericCommand();
 void handleCommand(char command);
 void setGainByValue(uint8_t gain);
 void setBiasSensPMask(uint8_t mask);
+void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags);
 bool gainToCode(uint8_t gain, uint8_t &code);
-uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux);
+uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2 = false);
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode);
 void printHelpAndDiagnostics();
 void clearDiagnostics();
@@ -443,9 +456,33 @@ void processSerialByte(char c) {
     return;
   }
 
+  if (binaryControlState == 10) {
+    binaryControlChannel = byteValue;
+    binaryControlState = 11;
+    return;
+  }
+
+  if (binaryControlState == 11) {
+    binaryControlGain = byteValue;
+    binaryControlState = 12;
+    return;
+  }
+
+  if (binaryControlState == 12) {
+    setChannelConfig(binaryControlChannel, binaryControlGain, byteValue);
+    binaryControlState = 0;
+    return;
+  }
+
   if (byteValue == 0xA6) {
     flushNumericCommand();
     binaryControlState = 1;
+    return;
+  }
+
+  if (byteValue == 0xA7) {
+    flushNumericCommand();
+    binaryControlState = 10;
     return;
   }
 
@@ -561,8 +598,8 @@ bool gainToCode(uint8_t gain, uint8_t &code) {
   }
 }
 
-uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux) {
-  return static_cast<uint8_t>(((gainCode & 0x07u) << 4) | (mux & 0x07u));
+uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2) {
+  return static_cast<uint8_t>(((gainCode & 0x07u) << 4) | (srb2 ? 0x08u : 0x00u) | (mux & 0x07u));
 }
 
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode) {
@@ -583,6 +620,10 @@ void setGainByValue(uint8_t gain) {
 
   currentGain = gain;
   currentGainCode = code;
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    channelGain[ch] = gain;
+    channelGainCode[ch] = code;
+  }
 
   // 按当前模式重新写 CHnSET。configureFrontend 会自动暂停/恢复 streaming。
   configureFrontend(static_cast<FrontendMode>(currentMode));
@@ -611,6 +652,28 @@ void setBiasSensPMask(uint8_t mask) {
 
   discardFramesAfterReconfigure = 4;
   runPhase = PHASE_STOPPED;
+}
+
+void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags) {
+  if (runPhase == PHASE_STREAMING || channel >= 8) return;
+  uint8_t gainCode = 0;
+  if (!gainToCode(gain, gainCode)) return;
+
+  const uint8_t bit = static_cast<uint8_t>(1u << channel);
+  channelGain[channel] = gain;
+  channelGainCode[channel] = gainCode;
+  if (flags & 0x01u) currentEnabledMask |= bit; else currentEnabledMask &= static_cast<uint8_t>(~bit);
+  if ((flags & 0x02u) && (flags & 0x01u)) currentBiasSensPMask |= bit;
+  else currentBiasSensPMask &= static_cast<uint8_t>(~bit);
+  if ((flags & 0x04u) && (flags & 0x01u)) currentSrb2Mask |= bit;
+  else currentSrb2Mask &= static_cast<uint8_t>(~bit);
+
+  configureFrontend(static_cast<FrontendMode>(currentMode));
+  if (!streamingEnabled) {
+    Serial.printf("CH%u config: %s PGA=%ux BIAS=%u SRB2=%u\n",
+      (unsigned)(channel + 1), (flags & 0x01u) ? "ON" : "OFF", (unsigned)gain,
+      (unsigned)((flags >> 1) & 1u), (unsigned)((flags >> 2) & 1u));
+  }
 }
 
 // ============================ Frontend modes ============================
@@ -642,14 +705,14 @@ void configureFrontendLocked(FrontendMode mode) {
   uint8_t channelSetting = makeChannelSetting(gainCode, CH_MUX_NORMAL);
   const uint8_t disabledChannelSetting = makePoweredDownChannelSetting(gainCode);
   uint8_t biasP = currentBiasSensPMask;
-  uint8_t biasN = ADS_ACTIVE_CH_MASK;
+  uint8_t biasN = currentEnabledMask;
 
   switch (mode) {
     case MODE_EEG_BIAS_PN:
       config2 = CONFIG2_NORMAL;
       channelSetting = makeChannelSetting(gainCode, CH_MUX_NORMAL);
       biasP = currentBiasSensPMask;
-      biasN = ADS_ACTIVE_CH_MASK;
+      biasN = currentBiasSensPMask;
       break;
 
     case MODE_EEG_BIAS_P_ONLY:
@@ -683,9 +746,18 @@ void configureFrontendLocked(FrontendMode mode) {
 
   writeAdsRegister(0x02, config2);
 
+  uint8_t selectedMux = CH_MUX_NORMAL;
+  if (mode == MODE_INPUT_SHORTED) selectedMux = CH_MUX_SHORTED;
+  if (mode == MODE_INTERNAL_TEST) selectedMux = CH_MUX_TEST;
+  biasP &= currentEnabledMask;
+  biasN &= currentEnabledMask;
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
-    const bool channelIsActive = (address <= ADS_LAST_ACTIVE_REG);
-    writeAdsRegister(address, channelIsActive ? channelSetting : disabledChannelSetting);
+    const uint8_t ch = static_cast<uint8_t>(address - ADS_FIRST_CH_REG);
+    const bool channelIsActive = (currentEnabledMask & (1u << ch)) != 0;
+    const bool useSrb2 = channelIsActive && selectedMux == CH_MUX_NORMAL && ((currentSrb2Mask & (1u << ch)) != 0);
+    const uint8_t activeSetting = makeChannelSetting(channelGainCode[ch], selectedMux, useSrb2);
+    const uint8_t poweredDownSetting = makePoweredDownChannelSetting(channelGainCode[ch]);
+    writeAdsRegister(address, channelIsActive ? activeSetting : poweredDownSetting);
   }
 
   writeAdsRegister(0x0D, biasP);
@@ -705,20 +777,25 @@ bool verifyFrontendLocked(FrontendMode mode) {
 
   if (mode == MODE_INPUT_SHORTED) expectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) expectedMux = CH_MUX_TEST;
-  if (mode == MODE_EEG_BIAS_PN) expectedBiasN = ADS_ACTIVE_CH_MASK;
+  if (mode == MODE_EEG_BIAS_PN) expectedBiasN = currentBiasSensPMask;
   if (mode == MODE_EEG_BIAS_OFF || mode == MODE_INPUT_SHORTED || mode == MODE_INTERNAL_TEST) {
     expectedBiasP = 0x00;
     expectedBiasN = 0x00;
   }
 
-  const uint8_t expectedActive = makeChannelSetting(currentGainCode, expectedMux);
-  const uint8_t expectedDisabled = makePoweredDownChannelSetting(currentGainCode);
   bool ok = true;
   ok &= readAdsRegister(0x01) == CONFIG1_250SPS;
   ok &= readAdsRegister(0x02) == expectedConfig2;
   ok &= readAdsRegister(0x03) == CONFIG3_INTERNAL_REF;
+  expectedBiasP &= currentEnabledMask;
+  expectedBiasN &= currentEnabledMask;
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
-    ok &= readAdsRegister(address) == (address <= ADS_LAST_ACTIVE_REG ? expectedActive : expectedDisabled);
+    const uint8_t ch = static_cast<uint8_t>(address - ADS_FIRST_CH_REG);
+    const bool enabled = (currentEnabledMask & (1u << ch)) != 0;
+    const bool useSrb2 = enabled && expectedMux == CH_MUX_NORMAL && ((currentSrb2Mask & (1u << ch)) != 0);
+    const uint8_t expectedActive = makeChannelSetting(channelGainCode[ch], expectedMux, useSrb2);
+    const uint8_t expectedDisabled = makePoweredDownChannelSetting(channelGainCode[ch]);
+    ok &= readAdsRegister(address) == (enabled ? expectedActive : expectedDisabled);
   }
   ok &= readAdsRegister(0x0D) == expectedBiasP;
   ok &= readAdsRegister(0x0E) == expectedBiasN;
@@ -1057,6 +1134,15 @@ void printHelpAndDiagnostics() {
                 (unsigned long)queueDropCount,
                 (unsigned long)maxReadTimeUs);
   Serial.printf("gain=%ux gainCode=%u\n", (unsigned)currentGain, (unsigned)currentGainCode);
+  Serial.printf("enabledMask=0x%02X biasPMask=0x%02X srb2Mask=0x%02X\n",
+                currentEnabledMask, currentBiasSensPMask, currentSrb2Mask);
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    Serial.printf("CH%u: %s PGA=%ux BIAS=%u SRB2=%u\n",
+      (unsigned)(ch + 1), (currentEnabledMask & (1u << ch)) ? "ON" : "OFF",
+      (unsigned)channelGain[ch],
+      (unsigned)((currentBiasSensPMask >> ch) & 1u),
+      (unsigned)((currentSrb2Mask >> ch) & 1u));
+  }
   Serial.println("commands: b s e/p/m/* n o q t 1/2/4/6/8/12/24 r ?");
   printRegisterReadback();
   Serial.println("===============================");

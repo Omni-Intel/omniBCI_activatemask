@@ -1,6 +1,6 @@
-# Omni-Intelligence ADS1299 EEG Viewer
+# 全域智能 Omni-Intelligence ADS1299 EEG 工作站
 
-这是一个面向 ADS1299 + ESP32-C3 的原生 Python 脑电采集、BIN 录制和离线回放工具。界面采用紧凑的临床脑电走纸布局，保留真实微伏标定、原始数据诊断、滤波显示副本和 MNE 联动能力。
+这是一个面向 ADS1299 + ESP32-C3 的原生 Python 脑电采集、BIN 录制和离线回放工具。界面使用全域智能 Omni-Intelligence 白/黑/橙品牌视觉与紧凑的临床脑电走纸布局，保留真实微伏标定、原始数据诊断、滤波显示副本和 MNE 联动能力。
 
 ## 主要功能
 
@@ -10,16 +10,18 @@
 - 打开历史 BIN，使用全程导航条、拖动、滚轮和方向键回放。
 - 将原始微伏数据导出为 CSV。
 - 一键构造 MNE `RawArray` 并打开 MNE 浏览器。
-- 支持 PGA 1/2/4/6/8/12/24，与固件实际增益同步标定。
-- 支持 BIAS_SENSP 通道掩码控制。
+- 每个通道可独立设置 PGA 1/2/4/6/8/12/24，并按通道增益分别换算真实微伏。
+- 点击左侧通道可修改通道启用状态、BIAS_SENSP 参与状态和 SRB2 开关。
+- 通道栏持续显示 `ON/OFF、PGA、BIAS、SRB2`，无需重新打开对话框。
 - 提供原始 RMS、峰峰值、50 Hz 占比、丢帧、CRC 和 Alpha 质量诊断。
 
 ## GUI 布局
 
-- 白色/浅灰临床监测界面，橙色用于标题、选中项和关键曲线。
-- 主工具栏左侧显示 Omni-Intelligence 横版 Logo；标题栏和任务栏使用方形 OI 图标。
-- 左侧固定 `CH1`–`CH8` 通道栏和通道状态标识。
-- 中央黑色 EEG 走纸区，浅灰波形、秒级主网格和 0.2 秒次网格。
+- 全域智能中英文 Logo 和应用图标。
+- 白色紧凑参数栏，使用全域橙色作为交互强调色。
+- 黑色专业信号画布，选中通道和导航窗口使用橙色高亮。
+- 左侧固定 `CH1`–`CH8` 通道栏，点击即可修改对应的硬件参数。
+- 中央黑色 EEG 走纸区，浅灰细波形、橙色选中波形、秒级主网格和 0.2 秒次网格。
 - 底部采用 `HH:MM:SS` 时间刻度。
 - 顶部全程时间导航条显示当前窗口位置。
 - 右下角显示真实幅值和 1 秒校准标尺。
@@ -98,6 +100,22 @@ A6 0D XX
 
 `XX` 的 bit0–bit7 分别对应 CH1–CH8。该命令只修改 `BIAS_SENSP (0x0D)`，不修改 `BIAS_SENSN`。固件必须实现此命令后 GUI 控制才会生效。
 
+## 逐通道硬件设置
+
+GUI 使用固定四字节命令更新一个通道：
+
+```text
+A7 CH GAIN FLAGS
+```
+
+- `CH`：0–7，对应 CH1–CH8。
+- `GAIN`：1/2/4/6/8/12/24。
+- `FLAGS bit0`：通道启用。
+- `FLAGS bit1`：该通道加入 `BIAS_SENSP`。
+- `FLAGS bit2`：该通道 CHnSET 的 `SRB2` 开关。
+
+SRB2 是逐通道开关；SRB1 位于 `MISC1` 寄存器，对整颗 ADS1299 全局生效，因此 GUI 不会将 SRB1 伪装成独立通道参数。
+
 ## 目录
 
 ```text
@@ -106,9 +124,7 @@ requirements.txt           Python 依赖
 install_and_run.bat         安装依赖并启动
 run.bat                     直接启动
 firmware/                   ESP32-C3 + ADS1299 固件
-assets/                     Omni-Intelligence Logo 资源
-  omni_logo_cnen.png        工具栏横版 Logo
-  omni_logo_mark.png        窗口和任务栏图标
+assets/                     全域智能 Logo 与应用图标
 recordings/                 测试 BIN、CSV 和分析结果
 TEST_REPORT_P0P1.txt        测试记录
 CHANGELOG_P0P1.md           变更记录
