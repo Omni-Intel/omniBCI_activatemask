@@ -82,8 +82,13 @@ MODE_NAMES = {
     3: "SHORTED",
     4: "TEST",
 }
-LOGO_PATH = Path(__file__).resolve().parent / "assets" / "omni_logo_cnen.png"
-APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "omni_logo_mark.png"
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+LOGO_PATH = ASSET_DIR / "omni_logo_cnen.png"
+APP_ICON_PATH = ASSET_DIR / "omni_logo_mark.png"
+OMNI_ORANGE = "#ff5a01"
+OMNI_ORANGE_DARK = "#c94700"
+OMNI_BLACK = "#080808"
+OMNI_PAPER = "#f6f7f9"
 
 
 @dataclass
@@ -284,15 +289,18 @@ class PsdWorker(QtCore.QRunnable):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setWindowTitle("ADS1299 Native Python EEG GUI - P0+P1 filtering")
         self.resize(1500, 920)
 
-        self.gain = 24
+        self.gain = 24  # legacy/global command value
+        self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
+        self.channel_enabled = np.array([True] * 5 + [False] * 3, dtype=bool)
+        self.channel_bias = np.array([True] * 5 + [False] * 3, dtype=bool)
+        self.channel_srb2 = np.zeros(CHANNELS, dtype=bool)
         self.lsb_uv = self.calc_lsb_uv()
         self.ring = RingBuffer(CHANNELS, FS * 90)            # untouched input-referred uV
         self.filtered_ring = RingBuffer(CHANNELS, FS * 90)   # continuous causal display chain
-        self.parser = AdsFrameParser(lambda: self.lsb_uv)
+        self.parser = AdsFrameParser(self.channel_lsb_uv)
         self.ser: Optional[serial.Serial] = None
         self.streaming = False
         self.raw_file = None
@@ -353,7 +361,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_processing_state()
 
         self._build_clinical_ui()
-        self.setWindowTitle("Omni-Intelligence | ADS1299 EEG Viewer")
         self.refresh_ports()
 
         self.serial_timer = QtCore.QTimer(self)
@@ -543,14 +550,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_clinical_ui(self):
         """Compact clinical-review layout; acquisition diagnostics remain available."""
-        pg.setConfigOptions(antialias=True, background="#050505", foreground="#c9c9c9")
-        self.setWindowTitle("ADS1299 EEG 查看器")
+        pg.setConfigOptions(antialias=True, background=OMNI_BLACK, foreground="#d7d7d7")
+        self.setWindowTitle("全域智能 Omni-Intelligence | ADS1299 EEG 工作站")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)
         self.setStyleSheet("""
             QMainWindow, QWidget { background:#f4f5f7; color:#2d2521; font-size:12px; }
-            QMenuBar { background:#ffffff; border-bottom:1px solid #d8dde3; }
-            QToolBar { background:#ffffff; color:#2d2521; border-bottom:3px solid #ff5a01; spacing:5px; padding:5px 7px; min-height:42px; }
-            QToolBar QLabel, QToolBar QCheckBox { color:#2d2521; background:transparent; font-size:14px; font-weight:600; }
+            QMenuBar { background:#ffffff; border-bottom:1px solid #d8dde3; padding:2px; }
+            QMenuBar::item:selected, QMenu::item:selected { background:#fff0e6; color:#b83c00; }
+            QToolBar { background:#ffffff; color:#2d2521; border-bottom:3px solid #ff5a01; spacing:5px; padding:5px 7px; min-height:48px; }
+            QToolBar QLabel, QToolBar QCheckBox { color:#2d2521; background:transparent; font-size:13px; font-weight:600; }
             QToolBar QToolButton { color:#2d2521; background:transparent; border:0; font-weight:600; padding:4px 8px; }
             QToolBar QDoubleSpinBox, QToolBar QSpinBox, QToolBar QComboBox, QToolBar QPushButton {
                 color:#2d2521; background:#ffffff; border:1px solid #d8dde3; min-height:22px;
@@ -560,13 +570,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 color:#2d2521; background:#ffffff; border:1px solid #d8dde3; padding:2px 5px; min-height:20px;
             }
             QToolButton:hover, QPushButton:hover { background:#fff4ed; border-color:#ff8b50; }
+            QToolButton:pressed, QPushButton:pressed { background:#ffd8c2; }
             QGroupBox { background:#ffffff; color:#ff5a01; font-weight:600; border:1px solid #d8dde3; border-radius:3px; margin-top:7px; padding-top:6px; }
             QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; background:#ffffff; }
-            QTabBar::tab { background:#ffffff; border:1px solid #d8dde3; border-bottom:0; padding:5px 12px; }
+            QTabWidget::pane { border:1px solid #d8dde3; background:#ffffff; }
+            QTabBar::tab { background:#ffffff; border:1px solid #d8dde3; border-bottom:0; padding:5px 14px; }
             QTabBar::tab:selected { background:#fff0e6; color:#b83c00; border-color:#ff8b50; }
-            QToolButton:pressed, QPushButton:pressed { background:#ffd8c2; }
             QStatusBar { background:#ffffff; border-top:1px solid #d8dde3; }
-            QDockWidget::title { background:#ffffff; color:#ff5a01; padding:5px; }
+            QDockWidget::title { background:#ffffff; color:#ff5a01; padding:5px; font-weight:600; }
+            QDialog { background:#f4f5f7; }
+            QDialog QLabel { color:#2d2521; }
         """)
 
         # File and view menus retain the existing acquisition functionality.
@@ -592,15 +605,17 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self.logo_label = QtWidgets.QLabel()
-        self.logo_label.setToolTip("Omni-Intelligence")
-        self.logo_label.setFixedSize(260, 68)
+        self.logo_label.setToolTip("全域智能 Omni-Intelligence")
+        self.logo_label.setFixedSize(220, 54)
         self.logo_label.setAlignment(QtCore.Qt.AlignCenter)
         logo = QtGui.QPixmap(str(LOGO_PATH))
         if logo.isNull():
-            self.logo_label.setText("OMNI")
+            self.logo_label.setText("全域智能 | OMNI")
+            self.logo_label.setStyleSheet("color:#ff5a01;font-size:18px;font-weight:800;")
         else:
-            self.logo_label.setPixmap(logo.scaled(252, 64, QtCore.Qt.KeepAspectRatio,
-                                                   QtCore.Qt.SmoothTransformation))
+            self.logo_label.setPixmap(logo.scaled(
+                212, 50, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+            ))
         toolbar.addWidget(self.logo_label)
         toolbar.addSeparator()
         toolbar.addAction(open_action)
@@ -676,10 +691,10 @@ class MainWindow(QtWidgets.QMainWindow):
         serial_layout.addWidget(self.start_btn)
         serial_layout.addWidget(self.stop_btn)
         serial_hint = QtWidgets.QLabel("扫描 → 选择设备 → 打开串口 → 开始采集")
-        serial_hint.setStyleSheet("color:#4a5562;")
+        serial_hint.setStyleSheet("color:#6c625d;")
         serial_layout.addWidget(serial_hint)
         self.status_label = QtWidgets.QLabel("未扫描")
-        self.status_label.setStyleSheet("color:#155378; font-weight:600;")
+        self.status_label.setStyleSheet("color:#c94700; font-weight:600;")
         serial_layout.addWidget(self.status_label, 1)
         layout.addWidget(serial_box)
 
@@ -709,10 +724,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav_plot.hideAxis("left")
         self.nav_plot.setMouseEnabled(x=True, y=False)
         self.nav_plot.getPlotItem().setMenuEnabled(False)
-        self.nav_plot.setBackground("#050505")
+        self.nav_plot.setBackground(OMNI_BLACK)
         self.nav_curve = self.nav_plot.plot(pen=pg.mkPen("#c9c9c9", width=1))
         self.nav_region = pg.LinearRegionItem(values=(0, 10), movable=True,
-            brush=pg.mkBrush(255, 90, 1, 45), pen=pg.mkPen("#e84f00", width=1.5))
+            brush=pg.mkBrush(255, 90, 1, 45), pen=pg.mkPen(OMNI_ORANGE, width=1.5))
         self.nav_region.sigRegionChanged.connect(self._nav_region_changed)
         self.nav_plot.addItem(self.nav_region)
         wave_page_layout.addWidget(self.nav_plot)
@@ -727,15 +742,15 @@ class MainWindow(QtWidgets.QMainWindow):
         wave_layout.setContentsMargins(0, 0, 0, 0)
         wave_layout.setSpacing(0)
         channel_panel = QtWidgets.QFrame()
-        channel_panel.setFixedWidth(178)
+        channel_panel.setFixedWidth(285)
         channel_panel.setStyleSheet("background:#ffffff;border-right:1px solid #d8dde3;")
         channel_layout = QtWidgets.QVBoxLayout(channel_panel)
         channel_layout.setContentsMargins(0, 0, 0, 31)
         channel_layout.setSpacing(0)
-        channel_header = QtWidgets.QLabel("通道 / 幅值")
+        channel_header = QtWidgets.QLabel("通道参数（点击通道修改） / 幅值")
         channel_header.setAlignment(QtCore.Qt.AlignCenter)
         channel_header.setFixedHeight(27)
-        channel_header.setStyleSheet("background:#ffffff;color:#ff5a01;border-bottom:3px solid #ff5a01;font-size:15px;font-weight:bold;")
+        channel_header.setStyleSheet("background:#ffffff;color:#ff5a01;border-bottom:3px solid #ff5a01;font-size:14px;font-weight:bold;")
         channel_layout.addWidget(channel_header)
         self.channel_buttons = []
         self.channel_scales = []
@@ -756,7 +771,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "QToolButton{background:#ffffff;color:#2d2521;border:0;"
                 "border-bottom:1px solid #e2e6eb;text-align:left;padding-left:10px;font-size:13px;}"
             )
-            button.clicked.connect(lambda _checked=False, index=ch: self._select_channel(index))
+            button.clicked.connect(lambda _checked=False, index=ch: self.open_channel_settings(index))
             row_layout.addWidget(button, 1)
             self.channel_buttons.append(button)
             scale = QtWidgets.QDoubleSpinBox()
@@ -770,12 +785,13 @@ class MainWindow(QtWidgets.QMainWindow):
             row_layout.addWidget(scale)
             self.channel_scales.append(scale)
             channel_layout.addWidget(row_widget, 1)
+        self.refresh_channel_parameter_labels()
         wave_layout.addWidget(channel_panel)
 
         # Each channel gets its own PlotItem and y-range.  This removes the
         # artificial lane offsets and lets every channel use its own amplitude.
         self.wave_widget = pg.GraphicsLayoutWidget()
-        self.wave_widget.setBackground("#050505")
+        self.wave_widget.setBackground(OMNI_BLACK)
         self.channel_plots = []
         self.stack_curves = []
         for ch in range(CHANNELS):
@@ -788,7 +804,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.hideAxis("bottom")
             else:
                 plot.setLabel("bottom", "时间", units="s")
-            curve = plot.plot(pen=pg.mkPen("#ff5a01" if ch == 0 else "#d7d7d7", width=1.0),
+            curve = plot.plot(pen=pg.mkPen(OMNI_ORANGE if ch == 0 else "#d7d7d7", width=1.0),
                               connect="finite")
             self.channel_plots.append(plot)
             self.stack_curves.append(curve)
@@ -823,12 +839,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_btn = QtWidgets.QPushButton(); self.closed_btn = QtWidgets.QPushButton()
         self.time_plot = pg.PlotWidget(); self.time_curve = self.time_plot.plot()
         self.psd_plot = pg.PlotWidget()
-        self.psd_plot.setBackground("#050505")
+        self.psd_plot.setBackground(OMNI_BLACK)
         self.psd_plot.showGrid(x=True, y=True, alpha=0.22)
         self.psd_plot.setLabel("bottom", "频率", units="Hz")
         self.psd_plot.setLabel("left", "PSD", units="dB µV²/Hz")
         self.psd_plot.setTitle("Welch PSD | 等待数据")
-        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen("#ff5a01", width=1.6))
+        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen(OMNI_ORANGE, width=1.6))
         self.psd_plot.addLine(x=8, pen=pg.mkPen("#ff9a5c", style=QtCore.Qt.DashLine))
         self.psd_plot.addLine(x=13, pen=pg.mkPen("#ff9a5c", style=QtCore.Qt.DashLine))
         psd_page = QtWidgets.QWidget()
@@ -946,7 +962,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_channel(self, ch):
         self.channel_combo.setCurrentIndex(ch)
         for i, curve in enumerate(self.stack_curves):
-            curve.setPen(pg.mkPen("#ff5a01" if i == ch else "#d7d7d7",
+            curve.setPen(pg.mkPen(OMNI_ORANGE if i == ch else "#d7d7d7",
                                   width=1.7 if i == ch else 1.0))
         for i, button in enumerate(self.channel_buttons):
             button.setStyleSheet(
@@ -957,6 +973,109 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"font-weight:{'bold' if i == ch else 'normal'};"
                 "}"
             )
+
+    def refresh_channel_parameter_labels(self):
+        """Keep the per-channel hardware state visible without opening a dialog."""
+        if not hasattr(self, "channel_buttons"):
+            return
+        for ch, button in enumerate(self.channel_buttons):
+            enabled = bool(self.channel_enabled[ch])
+            bias = "BIAS✓" if self.channel_bias[ch] else "BIAS—"
+            srb2 = "SRB2✓" if self.channel_srb2[ch] else "SRB2—"
+            power = "ON" if enabled else "OFF"
+            button.setText(f"CH{ch+1}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {srb2}")
+            icon = QtGui.QPixmap(11, 11)
+            icon.fill(QtGui.QColor("#56bd31" if enabled else "#8b969e"))
+            button.setIcon(QtGui.QIcon(icon))
+            button.setToolTip(
+                f"CH{ch+1}: {'启用' if enabled else '禁用'}, PGA ×{int(self.channel_gains[ch])}, "
+                f"{'参与' if self.channel_bias[ch] else '不参与'} BIAS 计算, "
+                f"SRB2 {'接入' if self.channel_srb2[ch] else '断开'}"
+            )
+
+    def open_channel_settings(self, ch):
+        self._select_channel(ch)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"CH{ch+1} 通道设置")
+        dialog.setModal(True)
+        form = QtWidgets.QFormLayout(dialog)
+        summary = QtWidgets.QLabel()
+        summary.setStyleSheet("background:#fff0e6;color:#b83c00;border:1px solid #ffb589;padding:8px;font-weight:bold;")
+        form.addRow(summary)
+        enabled = QtWidgets.QCheckBox("启用该通道")
+        enabled.setChecked(bool(self.channel_enabled[ch]))
+        form.addRow("通道电源", enabled)
+        gain = QtWidgets.QComboBox()
+        gain.addItems([str(value) for value in VALID_GAINS])
+        gain.setCurrentText(str(int(self.channel_gains[ch])))
+        form.addRow("PGA 增益", gain)
+        bias = QtWidgets.QCheckBox("加入 BIAS_SENSP 共模反馈计算")
+        bias.setChecked(bool(self.channel_bias[ch]))
+        form.addRow("BIAS", bias)
+        srb2 = QtWidgets.QCheckBox("将该通道 P 端接入 SRB2 公共参考")
+        srb2.setChecked(bool(self.channel_srb2[ch]))
+        form.addRow("SRB2", srb2)
+        note = QtWidgets.QLabel(
+            "注：SRB2 是 CHnSET 的逐通道开关；SRB1 是 ADS1299 MISC1 的全局开关，"
+            "不能真正按通道独立设置。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#5d6870;")
+        form.addRow(note)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
+        )
+        form.addRow(buttons)
+
+        def update_summary(*_args):
+            summary.setText(
+                f"CH{ch+1}  |  {'ON' if enabled.isChecked() else 'OFF'}  |  "
+                f"PGA ×{gain.currentText()}  |  BIAS {'YES' if bias.isChecked() else 'NO'}  |  "
+                f"SRB2 {'ON' if srb2.isChecked() else 'OFF'}"
+            )
+
+        enabled.toggled.connect(update_summary)
+        gain.currentTextChanged.connect(update_summary)
+        bias.toggled.connect(update_summary)
+        srb2.toggled.connect(update_summary)
+        update_summary()
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self.apply_channel_settings(
+            ch, enabled.isChecked(), int(gain.currentText()), bias.isChecked(), srb2.isChecked()
+        )
+
+    def apply_channel_settings(self, ch, enabled, gain, bias, srb2):
+        flags = (0x01 if enabled else 0) | (0x02 if bias else 0) | (0x04 if srb2 else 0)
+        was_streaming = bool(self.streaming)
+        try:
+            if self.ser and self.ser.is_open and self.offline_uv is None:
+                if was_streaming:
+                    self.ser.write(b"s")
+                    self.streaming = False
+                    time.sleep(0.08)
+                self.ser.reset_input_buffer()
+                self.ser.write(bytes([0xA7, ch & 0x07, gain & 0xFF, flags]))
+                time.sleep(0.12)
+                if was_streaming:
+                    self.ser.write(b"b")
+                    self.streaming = True
+            self.channel_enabled[ch] = bool(enabled)
+            self.channel_gains[ch] = int(gain)
+            self.channel_bias[ch] = bool(bias and enabled)
+            self.channel_srb2[ch] = bool(srb2 and enabled)
+            self.set_bias_checks(sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i]))
+            self.refresh_channel_parameter_labels()
+            self.ring.clear()
+            self.reset_processing_state()
+            self.set_status(
+                f"CH{ch+1}: {'ON' if enabled else 'OFF'}, PGA×{gain}, "
+                f"BIAS={'YES' if bias and enabled else 'NO'}, SRB2={'ON' if srb2 and enabled else 'OFF'}"
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "通道设置失败", str(exc))
 
     def _main_range_changed(self, _viewbox, x_range):
         if getattr(self, "_syncing_plot", False) or self.offline_uv is None:
@@ -995,8 +1114,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "MNE 浏览器", str(exc))
 
     # ---------------- helpers ----------------
-    def calc_lsb_uv(self) -> float:
-        return VREF / (self.gain * (2**23 - 1)) * 1e6
+    def calc_lsb_uv(self, gain: Optional[float] = None) -> float:
+        actual_gain = float(self.gain if gain is None else gain)
+        return VREF / (actual_gain * (2**23 - 1)) * 1e6
+
+    def channel_lsb_uv(self) -> np.ndarray:
+        return VREF / (self.channel_gains.astype(float) * (2**23 - 1)) * 1e6
 
     def set_status(self, text: str):
         self.status_label.setText(text)
@@ -1426,7 +1549,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if new_gain not in VALID_GAINS:
             return
         self.gain = new_gain
+        self.channel_gains[:] = new_gain
         self.lsb_uv = self.calc_lsb_uv()
+        self.refresh_channel_parameter_labels()
         if self.ser and self.ser.is_open and self.offline_uv is None:
             try:
                 self.ser.write(str(new_gain).encode("ascii"))
@@ -1483,7 +1608,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.packet_count > 1 and 0 < drop_delta < 128:
                 self.queue_drop_hints += drop_delta
             self.last_queue_drop_low = fr.queue_drop_low
-            self.saturation_samples += int(np.sum(np.abs(fr.raw_counts[:5]) > 0.95 * (2**23 - 1)))
+            enabled_counts = fr.raw_counts[self.channel_enabled]
+            self.saturation_samples += int(np.sum(np.abs(enabled_counts) > 0.95 * (2**23 - 1)))
             self.current_mode = fr.mode
             self.last_read_us = fr.read_us
             self.max_read_us = max(self.max_read_us, fr.read_us)
@@ -1530,7 +1656,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.stop_stream()
             raw = Path(path).read_bytes()
-            parser = AdsFrameParser(lambda: self.lsb_uv)
+            parser = AdsFrameParser(self.channel_lsb_uv)
             frames = parser.feed(raw)
             if not frames:
                 QtWidgets.QMessageBox.warning(self, "导入失败", "没有解析出有效 48-byte 帧。")
@@ -1875,6 +2001,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return float(np.median(values)), len(values), "ok"
 
     def update_info_text(self):
+        selected_ch = self.channel_combo.currentIndex()
+        selected_config = (
+            f"CH{selected_ch+1} {'ON' if self.channel_enabled[selected_ch] else 'OFF'}, "
+            f"PGA x{int(self.channel_gains[selected_ch])}, "
+            f"BIAS={'YES' if self.channel_bias[selected_ch] else 'NO'}, "
+            f"SRB2={'ON' if self.channel_srb2[selected_ch] else 'OFF'}"
+        )
         fs_text = f"{self.fs_est:.2f}" if np.isfinite(self.fs_est) else "---"
         alpha_peak = f"{self.latest_alpha_peak:.2f} Hz" if np.isfinite(self.latest_alpha_peak) else "---"
         alpha_rel = f"{100*self.latest_alpha_rel:.1f}%" if np.isfinite(self.latest_alpha_rel) else "---"
@@ -1898,7 +2031,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info_text.setPlainText(
             "\n".join([
                 f"Mode              : {mode}",
-                f"PGA / LSB         : {self.gain}x / {self.lsb_uv:.6g} uV/code",
+                f"Selected channel  : {selected_config}",
+                f"Selected LSB      : {self.channel_lsb_uv()[selected_ch]:.6g} uV/code",
                 f"Streaming         : {int(self.streaming)}",
                 f"Offline bin       : {offline}",
                 f"Raw bin           : {raw_path}",
@@ -2001,8 +2135,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("Omni-Intelligence ADS1299 EEG Viewer")
-    app.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
+    app.setApplicationName("全域智能 ADS1299 EEG 工作站")
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
