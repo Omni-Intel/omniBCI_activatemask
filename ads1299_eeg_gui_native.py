@@ -91,16 +91,6 @@ OMNI_BLACK = "#080808"
 OMNI_PAPER = "#f6f7f9"
 
 
-def make_simulated_eeg_uv(sample_indices: np.ndarray, rng) -> np.ndarray:
-    """Return eight display-only EEG-like traces in input-referred uV."""
-    t = np.asarray(sample_indices, dtype=float).reshape(1, -1) / FS
-    ch = np.arange(CHANNELS, dtype=float).reshape(-1, 1)
-    alpha = (12.0 + 1.8 * ch) * np.sin(2 * np.pi * (8.5 + 0.25 * ch) * t + 0.45 * ch)
-    theta = (4.0 + 0.35 * ch) * np.sin(2 * np.pi * (4.0 + 0.10 * ch) * t + 0.70 * ch)
-    drift = 5.0 * np.sin(2 * np.pi * (0.18 + 0.015 * ch) * t + 0.25 * ch)
-    return (alpha + theta + drift + rng.normal(0.0, 1.8, size=(CHANNELS, t.shape[1]))).astype(np.float32)
-
-
 @dataclass
 class Frame:
     sequence: int
@@ -316,7 +306,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.simulation_enabled = False
         self.simulation_started_at = 0.0
         self.simulation_sample_index = 0
-        self.simulation_rng = np.random.default_rng(1299)
+        self.simulation_source_path = ASSET_DIR / "zhayan.bin"
+        self.simulation_source_frames: List[Frame] = []
         self.raw_file = None
         self.raw_path = ""
         self.raw_bytes = 0
@@ -692,8 +683,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self.start_stream)
         self.stop_btn = QtWidgets.QPushButton("停止")
         self.stop_btn.clicked.connect(self.stop_stream)
-        self.simulation_check = QtWidgets.QCheckBox("模拟 8 通道 EEG")
-        self.simulation_check.setToolTip("仅生成 GUI 显示数据，不写入串口或 BIN 文件")
+        self.simulation_check = QtWidgets.QCheckBox("循环回放 8 通道 EEG")
+        self.simulation_check.setToolTip("循环显示内置 zhayan.bin，不写入串口或 BIN 文件")
         self.simulation_check.toggled.connect(self.toggle_simulated_eeg)
 
         central = QtWidgets.QWidget()
@@ -1536,6 +1527,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def toggle_simulated_eeg(self, enabled: bool):
         if enabled:
+            try:
+                parser = AdsFrameParser(self.channel_lsb_uv)
+                self.simulation_source_frames = parser.feed(self.simulation_source_path.read_bytes())
+                if not self.simulation_source_frames:
+                    raise ValueError("No valid 48-byte ADS1299 frames")
+            except Exception as exc:
+                self.simulation_check.blockSignals(True)
+                self.simulation_check.setChecked(False)
+                self.simulation_check.blockSignals(False)
+                QtWidgets.QMessageBox.warning(self, "EEG 回放", f"无法读取 {self.simulation_source_path}: {exc}")
+                return
             self.stop_stream()
             self.offline_uv = None
             self.offline_valid = None
@@ -1546,17 +1548,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.offline_label.setText("模拟实时")
             self.clear_stats()
             self.current_mode = 1
-            self.simulation_rng = np.random.default_rng(1299)
             self.simulation_sample_index = 0
             self.simulation_started_at = time.monotonic()
             self.simulation_enabled = True
             self.start_btn.setEnabled(False)
-            self.set_status("模拟 8 通道 EEG 运行中")
+            self.set_status(f"循环回放 {self.simulation_source_path.name}: {len(self.simulation_source_frames)} 帧")
             return
 
         self.simulation_enabled = False
         self.start_btn.setEnabled(True)
-        self.set_status("模拟 8 通道 EEG 已关闭")
+        self.set_status("8 通道 EEG 回放已关闭")
 
     def poll_simulated_eeg(self):
         if not self.simulation_enabled:
@@ -1566,17 +1567,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if count == 0:
             return
 
-        indices = np.arange(self.simulation_sample_index, self.simulation_sample_index + count)
-        values = make_simulated_eeg_uv(indices, self.simulation_rng)
-        lsb = self.channel_lsb_uv()
         frames = []
-        for i, sequence in enumerate(indices):
-            uv = values[:, i]
+        source_count = len(self.simulation_source_frames)
+        for sequence in range(self.simulation_sample_index, self.simulation_sample_index + count):
+            source = self.simulation_source_frames[sequence % source_count]
             frames.append(Frame(
-                sequence=int(sequence), uv=uv, valid=True, mode=1,
-                status=b"\xC0\x00\x00", flags=0xA3, read_us=0,
-                pending=0, queue_depth=0, queue_drop_low=0,
-                raw_counts=np.rint(uv / lsb).astype(np.int32),
+                sequence=sequence, uv=source.uv, valid=source.valid, mode=source.mode,
+                status=source.status, flags=source.flags, read_us=source.read_us,
+                pending=source.pending, queue_depth=source.queue_depth,
+                queue_drop_low=source.queue_drop_low, raw_counts=source.raw_counts,
             ))
         self.simulation_sample_index += count
         self.process_frames(frames, live=True)
@@ -2211,10 +2210,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     if "--self-check" in sys.argv:
-        samples = make_simulated_eeg_uv(np.arange(FS * 2), np.random.default_rng(1299))
-        assert samples.shape == (CHANNELS, FS * 2)
-        assert np.isfinite(samples).all() and np.all(np.std(samples, axis=1) > 5.0)
-        print("simulated EEG generator ok")
+        source = ASSET_DIR / "zhayan.bin"
+        parser = AdsFrameParser(lambda: np.full(CHANNELS, VREF / (24 * (2**23 - 1)) * 1e6))
+        frames = parser.feed(source.read_bytes())
+        assert len(frames) >= FS and all(frame.uv.shape == (CHANNELS,) for frame in frames)
+        print(f"zhayan replay source ok: {len(frames)} frames")
         return
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("全域智能 ADS1299 EEG 工作站")
