@@ -1,17 +1,25 @@
 /*
-  ESP32-C3 + ADS1299：SRB1 EEG 诊断数据流（软件 SPI，供自定义 MATLAB 窗口读取）
+  ESP32-C3 + ADS1299：OpenBCI 接线、SRB2 默认 EEG 固件
 
-  这版的目标不是伪装成 OpenBCI Cyton，而是把“采集链路是否可靠”说清楚：
-    1. 完全保留软件 SPI，不调用 SPI.begin()；
-    2. MCU 只发送 ADS1299 原始码，不在 MCU 上滤波；
+  本文件是完整独立固件，不依赖其他 .ino。
+
+  默认硬件与寄存器配置：
+    - EEG 测量电极接 IN1N～IN8N（OpenBCI N1P～N8P 排针）；
+    - 公共参考电极接 SRB2，BIAS 电极接 BIASOUT；
+    - CH1～CH5 开启、CH6～CH8 关闭、PGA=24、250 SPS；
+    - 有效通道 CHnSET.SRB2=1，MISC1.SRB1=0；
+    - OpenBCI 默认 BIAS P+N：BIAS_SENSP=0x1F、BIAS_SENSN=0x1F；
+    - ADS 原始极性是 SRB2-INxN，固件不翻转原始数据。
+
+  数据链路：
+    1. 使用软件 SPI，不调用 SPI.begin()；
+    2. MCU 发送 ADS1299 原始码，不在 MCU 内滤波；
     3. 每帧包含 32-bit 序号、ADS STATUS、读取耗时、模式和 CRC16；
-    4. 上位机可以分别统计：串口 CRC 错、序号丢失、ADS STATUS 错位；
-    5. 提供 OpenBCI 风格 SRB1 配置，以及短路噪声和内部方波诊断模式；
-    6. 数据流中绝不插入状态文字，避免周期 impulse 和解析错位。
-
-  默认上电配置：CH1-CH5 开启，CH6-CH8 禁用，SRB1 on，BIAS P-only：SENSP=0x1F, SENSN=0x00。
+    4. 短路和内部方波模式会同时断开 SRB1/SRB2；
+    5. SRB1/SRB2 仍可由配套 GUI 的 A8 命令切换。
 
   Arduino IDE：
+    Board = ESP32C3 Dev Module
     USB CDC On Boot = Enabled
     波特率 = 921600
 
@@ -22,19 +30,16 @@
     NSC_CLK=GPIO6
 
   串口命令：
-    b : 开始二进制数据流
+    b : 开始 48 字节二进制数据流
     s : 停止数据流
-    e : EEG 推荐模式，SRB1，BIAS 仅取 P 端（CH1-5，等同 p / m / *）
-    p : EEG 推荐模式别名，SRB1，BIAS 仅取 P 端（CH1-5）
-    m : EEG 推荐模式别名，SRB1，BIAS 仅取 P 端（CH1-5）
-    n : EEG P/N BIAS 模式，SRB1，BIAS 同时取 P/N（CH1-5）
-    o : EEG，SRB1，关闭 BIAS，用于判断 BIAS 环路是否引入问题
-    q : 所有通道输入内部短路，用于测板级底噪
-    t : 所有通道接 ADS1299 内部方波，用于验证 SPI/数字链路
-    * : 强制进入推荐 SRB1 BIAS 配置（P-only, N=0, SRB1 on，CH1-5）
-    1 / 2 / 4 / 6 / 8 / 12 / 24 : 修改 ADS1299 PGA 增益并重配当前模式
+    n : OpenBCI 默认 BIAS P+N
+    e / p / m / * : 仅把当前参考模式的信号侧加入 BIAS
+    o : 关闭 BIAS
+    q : ADS1299 内部短路
+    t : ADS1299 内部测试方波
+    1 / 2 / 4 / 6 / 8 / 12 / 24 : 修改全部通道 PGA
     r : 清零诊断计数
-    ? : 停止数据流后打印诊断信息和寄存器读回
+    ? : 停止流后打印诊断和寄存器读回
 
   固定 48 字节数据帧（小端字段）：
     [0]      0xA5
@@ -184,7 +189,7 @@ enum ReferenceMode : uint8_t {
 #endif
 
 #ifndef ADS_FIRMWARE_BANNER
-#define ADS_FIRMWARE_BANNER "ESP32C3 ADS1299 DUAL-REFERENCE READY"
+#define ADS_FIRMWARE_BANNER "ESP32C3 ADS1299 OPENBCI-SRB2 READY"
 #endif
 
 enum RunPhase : uint8_t {

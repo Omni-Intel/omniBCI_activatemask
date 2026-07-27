@@ -65,19 +65,18 @@
 #include <Arduino.h>
 
 /*
-  Dual-reference GUI firmware
+  SRB1-only reference variant
 
-  A8 00 selects SRB1:
-    signal electrodes -> INxP, common reference -> SRB1,
-    recommended BIAS side -> BIAS_SENSP.
+  Wiring:
+    EEG signal electrodes -> IN1P ... IN8P
+    common reference      -> SRB1
+    bias electrode        -> BIASOUT
 
-  A8 01 selects SRB2:
-    signal electrodes -> INxN, common reference -> SRB2,
-    recommended BIAS side -> BIAS_SENSN.
-
-  A7 bit2 controls the per-channel SRB2 switch. SRB1 and SRB2 are
-  mutually exclusive in normal EEG modes. Both are disabled for internal
-  short and test modes.
+  Enforced configuration:
+    - CHnSET.SRB2 is always 0, even if host command A7 sets flag bit2.
+    - MISC1.SRB1 is enabled only in normal EEG modes.
+    - SRB1 is disabled in input-short and internal-test modes.
+    - The default EEG mode uses BIAS_SENSP only; BIAS_SENSN is 0.
 */
 
 #include "driver/gpio.h"
@@ -170,23 +169,6 @@ enum FrontendMode : uint8_t {
   MODE_INTERNAL_TEST   = 4
 };
 
-enum ReferenceMode : uint8_t {
-  REFERENCE_SRB1 = 0,
-  REFERENCE_SRB2 = 1
-};
-
-#ifndef ADS_DEFAULT_REFERENCE_MODE
-#define ADS_DEFAULT_REFERENCE_MODE 1
-#endif
-
-#ifndef ADS_DEFAULT_FRONTEND_MODE
-#define ADS_DEFAULT_FRONTEND_MODE 0
-#endif
-
-#ifndef ADS_FIRMWARE_BANNER
-#define ADS_FIRMWARE_BANNER "ESP32C3 ADS1299 DUAL-REFERENCE READY"
-#endif
-
 enum RunPhase : uint8_t {
   PHASE_CONFIG = 0,
   PHASE_STREAMING = 1,
@@ -203,12 +185,7 @@ volatile bool streamingEnabled = false;
 volatile bool adsConversionsRunning = false;
 volatile bool configurationVerified = false;
 volatile RunPhase runPhase = PHASE_CONFIG;
-volatile FrontendMode currentMode =
-  static_cast<FrontendMode>(ADS_DEFAULT_FRONTEND_MODE);
-volatile ReferenceMode currentReferenceMode =
-  static_cast<ReferenceMode>(ADS_DEFAULT_REFERENCE_MODE);
-volatile bool hostCommandSeen = false;
-volatile uint32_t lastReadyBannerMs = 0;
+volatile FrontendMode currentMode = MODE_EEG_BIAS_P_ONLY;
 volatile uint32_t acquisitionSequence = 0;
 volatile uint32_t drdyCount = 0;
 volatile uint32_t missedDrdyCount = 0;
@@ -225,14 +202,13 @@ volatile uint8_t currentGain = 24;
 volatile uint8_t currentGainCode = CH_GAIN_CODE_24;
 
 // GUI 可动态修改的 BIAS_SENSP mask；默认 CH1-CH5。
-// 这是逻辑 BIAS mask；SRB1 路由到 SENSP，SRB2 路由到 SENSN。
+// 注意：这只控制 BIAS_SENSP(0x0D)，不会打开/关闭 CHnSET 通道。
 volatile uint8_t currentBiasSensPMask = ADS_ACTIVE_CH_MASK;
 
 // 二进制控制协议：0xA6 <register> <value>
-// Python/MATLAB GUI 用 0xA6 0x0D mask 运行时修改逻辑 BIAS 通道。
+// Python/MATLAB GUI 用 0xA6 0x0D mask 来运行时修改 BIAS_SENSP。
 static uint8_t binaryControlState = 0;
 volatile uint8_t currentEnabledMask = ADS_ACTIVE_CH_MASK;
-volatile uint8_t currentSrb2Mask = ADS_ACTIVE_CH_MASK;
 volatile uint8_t channelGain[8] = {24, 24, 24, 24, 24, 24, 24, 24};
 volatile uint8_t channelGainCode[8] = {
   CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24,
@@ -240,8 +216,8 @@ volatile uint8_t channelGainCode[8] = {
 };
 
 // Binary controls: A6 0D mask, or A7 channel gain flags.
-// A7 channel is 0..7; flags: bit0 enabled, bit1 BIAS include, bit2 SRB2.
-// A8 referenceMode: 0=global SRB1, 1=per-channel SRB2.
+// A7 channel is 0..7; flags: bit0 enabled, bit1 BIAS_P.
+// bit2 (SRB2) is deliberately ignored in this SRB1-only firmware.
 static uint8_t binaryControlRegister = 0;
 static uint8_t binaryControlChannel = 0;
 static uint8_t binaryControlGain = 24;
@@ -281,14 +257,12 @@ void handleCommand(char command);
 void setGainByValue(uint8_t gain);
 void setBiasSensPMask(uint8_t mask);
 void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags);
-void setReferenceMode(uint8_t mode);
 bool gainToCode(uint8_t gain, uint8_t &code);
-uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2 = false);
+uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux);
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode);
 void printHelpAndDiagnostics();
 void clearDiagnostics();
 void printRegisterReadback();
-void printReadyBanner();
 void sendConfigAck(uint8_t command, uint8_t argument);
 
 uint16_t crc16CcittFalse(const uint8_t *data, size_t length);
@@ -322,7 +296,7 @@ void setup() {
   initPins();
   startNscClock();
   hardwareResetAds();
-  configureFrontendLocked(currentMode);
+  configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
 
   frameQueue = xQueueCreate(FRAME_QUEUE_LENGTH, sizeof(StreamFrame));
   if (!frameQueue) {
@@ -358,19 +332,13 @@ void setup() {
   runPhase = PHASE_STOPPED;
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
-  printReadyBanner();
+  Serial.println();
+  Serial.println("ESP32C3 ADS1299 SRB1-ONLY READY - INxP SIGNAL / SRB1 REF / P-ONLY BIAS");
+  Serial.println("Commands: b/s/e/p/m/*/n/o/q/t/1/2/4/6/8/12/24/r/? plus binary A6 0D mask for BIAS_SENSP");
 }
 
 void loop() {
-  // Serial monitors often attach after setup() has already printed. Repeat a
-  // READY line until the first host byte arrives. The first GUI/terminal byte
-  // permanently stops these messages, so text cannot pollute binary frames.
-  if (!hostCommandSeen &&
-      runPhase != PHASE_STREAMING &&
-      (millis() - lastReadyBannerMs) >= 1500u) {
-    printReadyBanner();
-  }
-  vTaskDelay(pdMS_TO_TICKS(100));
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 // ============================ DRDY ISR ============================
@@ -485,11 +453,10 @@ void serialStreamTask(void *argument) {
 }
 
 void processSerialByte(char c) {
-  hostCommandSeen = true;
   const uint8_t byteValue = static_cast<uint8_t>(c);
 
   // 二进制控制协议必须先于 ASCII 数字/命令解析：
-  // 0xA6 0x0D mask -> 根据 SRB1/SRB2 参考模式自动路由 BIAS P/N。
+  // 0xA6 0x0D mask -> 只修改 ADS1299 BIAS_SENSP(0x0D)，BIAS_SENSN 不变。
   if (binaryControlState == 1) {
     binaryControlRegister = byteValue;
     binaryControlState = 2;
@@ -525,12 +492,6 @@ void processSerialByte(char c) {
     return;
   }
 
-  if (binaryControlState == 20) {
-    setReferenceMode(byteValue);
-    binaryControlState = 0;
-    return;
-  }
-
   if (byteValue == 0xA6) {
     flushNumericCommand();
     binaryControlState = 1;
@@ -540,12 +501,6 @@ void processSerialByte(char c) {
   if (byteValue == 0xA7) {
     flushNumericCommand();
     binaryControlState = 10;
-    return;
-  }
-
-  if (byteValue == 0xA8) {
-    flushNumericCommand();
-    binaryControlState = 20;
     return;
   }
 
@@ -606,7 +561,7 @@ void handleCommand(char command) {
     case 'm':
     case 'M':
     case '*':
-      // 推荐模式：只把信号电极侧纳入 BIAS（SRB1->P，SRB2->N）。
+      // 推荐 SRB1 配置：只把实际测量 P 端纳入 BIAS，N/SRB1 参考端不纳入。
       configureFrontend(MODE_EEG_BIAS_P_ONLY);
       return;
 
@@ -661,12 +616,9 @@ bool gainToCode(uint8_t gain, uint8_t &code) {
   }
 }
 
-uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2) {
-  return static_cast<uint8_t>(
-    ((gainCode & 0x07u) << 4) |
-    (srb2 ? 0x08u : 0x00u) |
-    (mux & 0x07u)
-  );
+uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux) {
+  // SRB2 (CHnSET bit3) is intentionally never set in the SRB1-only variant.
+  return static_cast<uint8_t>(((gainCode & 0x07u) << 4) | (mux & 0x07u));
 }
 
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode) {
@@ -727,18 +679,12 @@ void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags) {
   if (flags & 0x01u) currentEnabledMask |= bit; else currentEnabledMask &= static_cast<uint8_t>(~bit);
   if ((flags & 0x02u) && (flags & 0x01u)) currentBiasSensPMask |= bit;
   else currentBiasSensPMask &= static_cast<uint8_t>(~bit);
-  if ((flags & 0x04u) && (flags & 0x01u)) currentSrb2Mask |= bit;
-  else currentSrb2Mask &= static_cast<uint8_t>(~bit);
   configureFrontend(static_cast<FrontendMode>(currentMode));
-}
-
-void setReferenceMode(uint8_t mode) {
-  if (runPhase == PHASE_STREAMING || mode > REFERENCE_SRB2) return;
-  currentReferenceMode = static_cast<ReferenceMode>(mode);
-  if (currentReferenceMode == REFERENCE_SRB2 && currentSrb2Mask == 0x00) {
-    currentSrb2Mask = currentEnabledMask;
+  if (!streamingEnabled) {
+    Serial.printf("CH%u config: %s PGA=%ux BIAS_P=%u SRB1=GLOBAL SRB2=0\n",
+      (unsigned)(channel + 1), (flags & 0x01u) ? "ON" : "OFF", (unsigned)gain,
+      (unsigned)((flags >> 1) & 1u));
   }
-  configureFrontend(static_cast<FrontendMode>(currentMode));
 }
 
 // ============================ Frontend modes ============================
@@ -777,13 +723,8 @@ void configureFrontendLocked(FrontendMode mode) {
 
     case MODE_EEG_BIAS_P_ONLY:
       config2 = CONFIG2_NORMAL;
-      if (currentReferenceMode == REFERENCE_SRB2) {
-        biasP = 0x00;
-        biasN = currentBiasSensPMask;
-      } else {
-        biasP = currentBiasSensPMask;
-        biasN = 0x00;
-      }
+      biasP = currentBiasSensPMask;
+      biasN = 0x00;
       break;
 
     case MODE_EEG_BIAS_OFF:
@@ -810,22 +751,16 @@ void configureFrontendLocked(FrontendMode mode) {
   uint8_t selectedMux = CH_MUX_NORMAL;
   if (mode == MODE_INPUT_SHORTED) selectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) selectedMux = CH_MUX_TEST;
-  const bool normalEegMode =
+  const bool srb1Enabled =
     mode == MODE_EEG_BIAS_PN ||
     mode == MODE_EEG_BIAS_P_ONLY ||
     mode == MODE_EEG_BIAS_OFF;
-  const bool srb1Enabled =
-    normalEegMode && currentReferenceMode == REFERENCE_SRB1;
   biasP &= currentEnabledMask;
   biasN &= currentEnabledMask;
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
     const uint8_t ch = static_cast<uint8_t>(address - ADS_FIRST_CH_REG);
     const bool channelIsActive = (currentEnabledMask & (1u << ch)) != 0;
-    const bool useSrb2 =
-      normalEegMode &&
-      currentReferenceMode == REFERENCE_SRB2 &&
-      ((currentSrb2Mask & (1u << ch)) != 0);
-    const uint8_t activeSetting = makeChannelSetting(channelGainCode[ch], selectedMux, useSrb2);
+    const uint8_t activeSetting = makeChannelSetting(channelGainCode[ch], selectedMux);
     const uint8_t poweredDownSetting = makePoweredDownChannelSetting(channelGainCode[ch]);
     writeAdsRegister(address, channelIsActive ? activeSetting : poweredDownSetting);
   }
@@ -844,21 +779,14 @@ bool verifyFrontendLocked(FrontendMode mode) {
   uint8_t expectedMux = CH_MUX_NORMAL;
   uint8_t expectedBiasP = currentBiasSensPMask;
   uint8_t expectedBiasN = 0x00;
-  const bool normalEegMode =
+  const bool expectedSrb1 =
     mode == MODE_EEG_BIAS_PN ||
     mode == MODE_EEG_BIAS_P_ONLY ||
     mode == MODE_EEG_BIAS_OFF;
-  const bool expectedSrb1 =
-    normalEegMode && currentReferenceMode == REFERENCE_SRB1;
 
   if (mode == MODE_INPUT_SHORTED) expectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) expectedMux = CH_MUX_TEST;
-  if (mode == MODE_EEG_BIAS_PN) {
-    expectedBiasN = currentBiasSensPMask;
-  } else if (mode == MODE_EEG_BIAS_P_ONLY && currentReferenceMode == REFERENCE_SRB2) {
-    expectedBiasP = 0x00;
-    expectedBiasN = currentBiasSensPMask;
-  }
+  if (mode == MODE_EEG_BIAS_PN) expectedBiasN = currentBiasSensPMask;
   if (mode == MODE_EEG_BIAS_OFF || mode == MODE_INPUT_SHORTED || mode == MODE_INTERNAL_TEST) {
     expectedBiasP = 0x00;
     expectedBiasN = 0x00;
@@ -873,11 +801,7 @@ bool verifyFrontendLocked(FrontendMode mode) {
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
     const uint8_t ch = static_cast<uint8_t>(address - ADS_FIRST_CH_REG);
     const bool enabled = (currentEnabledMask & (1u << ch)) != 0;
-    const bool useSrb2 =
-      normalEegMode &&
-      currentReferenceMode == REFERENCE_SRB2 &&
-      ((currentSrb2Mask & (1u << ch)) != 0);
-    const uint8_t expectedActive = makeChannelSetting(channelGainCode[ch], expectedMux, useSrb2);
+    const uint8_t expectedActive = makeChannelSetting(channelGainCode[ch], expectedMux);
     const uint8_t expectedDisabled = makePoweredDownChannelSetting(channelGainCode[ch]);
     ok &= readAdsRegister(address) == (enabled ? expectedActive : expectedDisabled);
   }
@@ -980,9 +904,7 @@ void buildStreamFrame(
   if (currentMode == MODE_EEG_BIAS_PN ||
       currentMode == MODE_EEG_BIAS_P_ONLY ||
       currentMode == MODE_EEG_BIAS_OFF) {
-    if (currentReferenceMode == REFERENCE_SRB1) {
-      flags |= (1u << 7); // SRB1 ON
-    }
+    flags |= (1u << 7); // SRB1 ON only for normal EEG input modes
   }
   p[15] = flags;
 
@@ -1194,13 +1116,9 @@ uint8_t readAdsRegister(uint8_t address) {
 
 // ============================ Diagnostics ============================
 void sendConfigAck(uint8_t command, uint8_t argument) {
-  // Fixed 12-byte binary acknowledgement. It is emitted only in response to
-  // A6/A7, while the GUI has stopped the stream, so it cannot contaminate EEG
-  // frames. Values are read from the ADS1299, not copied from GUI state.
   uint8_t reply[12] = {
     0xBC, command, argument, 0xFF, 0xFF, 0xFF,
-    0xFF, static_cast<uint8_t>(currentReferenceMode),
-    static_cast<uint8_t>(currentMode), 0x00,
+    0xFF, 0x00, static_cast<uint8_t>(currentMode), 0x00,
     currentEnabledMask, 0x00
   };
 
@@ -1218,20 +1136,6 @@ void sendConfigAck(uint8_t command, uint8_t argument) {
 
   for (uint8_t i = 0; i < 11; ++i) reply[11] ^= reply[i];
   Serial.write(reply, sizeof(reply));
-}
-
-void printReadyBanner() {
-  lastReadyBannerMs = millis();
-  Serial.println();
-  Serial.printf(
-    "%s - reference=%s, mode=%s, gain=%ux\n",
-    ADS_FIRMWARE_BANNER,
-    currentReferenceMode == REFERENCE_SRB2 ? "SRB2/OpenBCI" : "SRB1",
-    currentMode == MODE_EEG_BIAS_PN ? "BIAS_P+N" :
-      (currentMode == MODE_EEG_BIAS_P_ONLY ? "BIAS_SIGNAL_SIDE" : "DIAGNOSTIC"),
-    (unsigned)currentGain
-  );
-  Serial.println("READY: send 'b' for binary stream, or open the GUI and click Start.");
 }
 
 void clearDiagnostics() {
@@ -1265,15 +1169,13 @@ void printHelpAndDiagnostics() {
                 (unsigned long)queueDropCount,
                 (unsigned long)maxReadTimeUs);
   Serial.printf("gain=%ux gainCode=%u\n", (unsigned)currentGain, (unsigned)currentGainCode);
-  Serial.printf("reference=%s enabledMask=0x%02X biasMask=0x%02X srb2Mask=0x%02X\n",
-                currentReferenceMode == REFERENCE_SRB2 ? "SRB2" : "SRB1",
-                currentEnabledMask, currentBiasSensPMask, currentSrb2Mask);
+  Serial.printf("enabledMask=0x%02X biasPMask=0x%02X SRB2=FORCED_OFF\n",
+                currentEnabledMask, currentBiasSensPMask);
   for (uint8_t ch = 0; ch < 8; ++ch) {
-    Serial.printf("CH%u: %s PGA=%ux BIAS=%u SRB2=%u\n",
+    Serial.printf("CH%u: %s PGA=%ux BIAS_P=%u SRB2=0\n",
       (unsigned)(ch + 1), (currentEnabledMask & (1u << ch)) ? "ON" : "OFF",
       (unsigned)channelGain[ch],
-      (unsigned)((currentBiasSensPMask >> ch) & 1u),
-      (unsigned)((currentSrb2Mask >> ch) & 1u));
+      (unsigned)((currentBiasSensPMask >> ch) & 1u));
   }
   Serial.println("commands: b s e/p/m/* n o q t 1/2/4/6/8/12/24 r ?");
   printRegisterReadback();

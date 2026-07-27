@@ -21,8 +21,18 @@ Protocol expected from firmware:
 
 BIAS_SENSP command sent by this app:
   A6 0D XX
-where XX is bit mask for CH1..CH8. This only changes ADS1299 register 0x0D.
-Your firmware must support this binary command.
+where XX is the logical BIAS channel mask. Compatible firmware routes it
+to BIAS_SENSP for SRB1 or BIAS_SENSN for SRB2.
+
+Per-channel hardware command:
+  A7 CH GAIN FLAGS
+where FLAGS bit0 enables the channel and bit1 includes it in the active
+reference mode's BIAS summing network.
+FLAGS bit2 controls the per-channel SRB2 switch.
+
+Reference command:
+  A8 MODE
+where MODE 0 selects SRB1 and MODE 1 selects SRB2.
 """
 
 from __future__ import annotations
@@ -68,16 +78,22 @@ SYNC1 = 0xA5
 SYNC2 = 0x5A
 VREF = 4.5
 VALID_GAINS = [1, 2, 4, 6, 8, 12, 24]
+REFERENCE_SRB1 = 0
+REFERENCE_SRB2 = 1
+REFERENCE_ITEMS = [
+    ("SRB2 / OpenBCI（信号接 INxN）", REFERENCE_SRB2),
+    ("SRB1 全局参考（信号接 INxP）", REFERENCE_SRB1),
+]
 MODE_ITEMS = [
-    ("EEG SRB1 + BIAS P-only", b"p", 1),
-    ("EEG SRB1 + BIAS P+N", b"n", 0),
-    ("EEG BIAS off", b"o", 2),
+    ("OpenBCI EEG + BIAS P+N", b"n", 0),
+    ("EEG + BIAS 仅信号侧", b"p", 1),
+    ("EEG + BIAS off", b"o", 2),
     ("ADS internal short", b"q", 3),
     ("ADS internal test square", b"t", 4),
 ]
 MODE_NAMES = {
-    0: "EEG/P+N",
-    1: "EEG/P-only",
+    0: "EEG/BIAS P+N",
+    1: "EEG/BIAS signal-side",
     2: "EEG/BIAS-off",
     3: "SHORTED",
     4: "TEST",
@@ -229,6 +245,46 @@ class RingBuffer:
         self.head = (self.head + 1) % self.capacity
         self.count = min(self.count + 1, self.capacity)
 
+    def append_batch(
+        self,
+        values: np.ndarray,
+        valid: np.ndarray,
+        sequence: np.ndarray,
+        mode: np.ndarray,
+    ):
+        values = np.asarray(values, dtype=np.float32)
+        if values.ndim != 2 or values.shape[0] != self.channels:
+            raise ValueError("values must have shape (channels, samples)")
+        n = values.shape[1]
+        if n <= 0:
+            return
+        valid = np.asarray(valid, dtype=bool)
+        sequence = np.asarray(sequence, dtype=np.uint32)
+        mode = np.asarray(mode, dtype=np.uint8)
+        if not (valid.size == sequence.size == mode.size == n):
+            raise ValueError("batch metadata length mismatch")
+        if n > self.capacity:
+            values = values[:, -self.capacity:]
+            valid = valid[-self.capacity:]
+            sequence = sequence[-self.capacity:]
+            mode = mode[-self.capacity:]
+            n = self.capacity
+
+        first = min(n, self.capacity - self.head)
+        end = self.head + first
+        self.data[:, self.head:end] = values[:, :first]
+        self.valid[self.head:end] = valid[:first]
+        self.seq[self.head:end] = sequence[:first]
+        self.mode[self.head:end] = mode[:first]
+        remaining = n - first
+        if remaining:
+            self.data[:, :remaining] = values[:, first:]
+            self.valid[:remaining] = valid[first:]
+            self.seq[:remaining] = sequence[first:]
+            self.mode[:remaining] = mode[first:]
+        self.head = (self.head + n) % self.capacity
+        self.count = min(self.count + n, self.capacity)
+
     def latest(self, n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         n = int(min(max(n, 0), self.count))
         if n == 0:
@@ -296,7 +352,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
         self.channel_enabled = np.array([True] * 5 + [False] * 3, dtype=bool)
         self.channel_bias = np.array([True] * 5 + [False] * 3, dtype=bool)
-        self.channel_srb2 = np.zeros(CHANNELS, dtype=bool)
+        # OpenBCI-style default: measurement electrodes on INxN and the
+        # common reference electrode on SRB2. SRB1 remains selectable for
+        # boards that physically route the SRB1 pin.
+        self.reference_mode = REFERENCE_SRB2
+        self.channel_srb2 = np.array([True] * 5 + [False] * 3, dtype=bool)
         self.lsb_uv = self.calc_lsb_uv()
         self.ring = RingBuffer(CHANNELS, FS * 90)            # untouched input-referred uV
         self.filtered_ring = RingBuffer(CHANNELS, FS * 90)   # continuous causal display chain
@@ -324,7 +384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.first_seq: Optional[int] = None
         self.first_clock: Optional[float] = None
         self.fs_est = np.nan
-        self.current_mode = 1
+        self.current_mode = 0
         self.last_read_us = 0
         self.max_read_us = 0
         self.last_pending = 0
@@ -345,10 +405,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alpha_capture_start = 0.0
         self.alpha_capture_values: List[float] = []
 
-        # Display chain: continuous causal 1-40 Hz + narrow 50 Hz notch.
-        self.sos_display_band = signal.butter(2, [1.0, 40.0], btype="bandpass", fs=FS, output="sos")
-        notch_b, notch_a = signal.iirnotch(50.0, 30.0, fs=FS)
-        self.sos_notch = signal.tf2sos(notch_b, notch_a)
+        # Display chain defaults must match the toolbar: 5-50 Hz plus power-line
+        # rejection.  At 250 SPS a physical 150 Hz component aliases to 100 Hz,
+        # so the 100 Hz section also suppresses the third harmonic after sampling.
+        self.sos_display_band = signal.butter(2, [5.0, 50.0], btype="bandpass", fs=FS, output="sos")
+        notch_sections = []
+        for notch_hz in (50.0, 100.0):
+            notch_b, notch_a = signal.iirnotch(notch_hz, 30.0, fs=FS)
+            notch_sections.append(signal.tf2sos(notch_b, notch_a))
+        self.sos_notch = np.vstack(notch_sections)
         # Alpha chain is independent of GUI display switches. Offline/window analysis uses zero phase.
         self.sos_alpha_band = signal.butter(2, [1.0, 40.0], btype="bandpass", fs=FS, output="sos")
         # A lower beta keeps the spectrum stable without making changes appear
@@ -358,6 +423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.psd_worker_busy = False
         self.psd_request_id = 0
         self.psd_last_signature = None
+        self._last_nav_update = 0.0
         self.reset_processing_state()
 
         self._build_clinical_ui()
@@ -365,17 +431,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.serial_timer = QtCore.QTimer(self)
         self.serial_timer.timeout.connect(self.poll_serial)
-        self.serial_timer.start(10)
+        self.serial_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.serial_timer.start(8)
 
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.update_fast_plots)
-        self.plot_timer.start(80)
+        self.plot_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.plot_timer.start(50)
 
         self.psd_timer = QtCore.QTimer(self)
         self.psd_timer.timeout.connect(self.update_psd_and_info)
-        # PSD is cheap enough to request twice per second, but the calculation
-        # itself runs in a worker so serial/plot painting never waits for it.
-        self.psd_timer.start(500)
+        # One analysis request per second keeps CPU headroom for serial parsing
+        # and 20 FPS waveform painting.
+        self.psd_timer.start(1000)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -447,7 +515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(QtWidgets.QLabel("PSD上限"), row, 6)
         self.psd_max_spin = QtWidgets.QDoubleSpinBox()
         self.psd_max_spin.setRange(20, FS / 2)
-        self.psd_max_spin.setValue(40)
+        self.psd_max_spin.setValue(65)
         controls.addWidget(self.psd_max_spin, row, 7)
 
         self.psd_raw_check = QtWidgets.QCheckBox("PSD显示原始诊断")
@@ -479,7 +547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.offline_label, row, 10, 1, 2)
 
         row += 1
-        bias_box = QtWidgets.QGroupBox("BIAS_SENSP：勾选参与 BIAS 正端平均的通道，只写 0x0D，BIAS_SENSN 不动")
+        bias_box = QtWidgets.QGroupBox("BIAS 通道：写入后读取 ADS1299 的 SENSP/SENSN 验证")
         bias_layout = QtWidgets.QHBoxLayout(bias_box)
         self.bias_checks = []
         for i in range(1, CHANNELS + 1):
@@ -490,7 +558,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bias_layout.addWidget(cb)
         self.bias_mask_label = QtWidgets.QLabel("mask=0x1F")
         bias_layout.addWidget(self.bias_mask_label)
-        self.bias_apply_btn = QtWidgets.QPushButton("应用 BIAS_SENSP")
+        self.bias_apply_btn = QtWidgets.QPushButton("写入并读回验证")
         self.bias_apply_btn.clicked.connect(self.apply_bias_sensp)
         bias_layout.addWidget(self.bias_apply_btn)
         self.bias_ch15_btn = QtWidgets.QPushButton("CH1-5")
@@ -550,7 +618,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_clinical_ui(self):
         """Compact clinical-review layout; acquisition diagnostics remain available."""
-        pg.setConfigOptions(antialias=True, background=OMNI_BLACK, foreground="#d7d7d7")
+        # Antialiasing eight continuously moving traces is expensive and adds
+        # no useful EEG detail at screen resolution.
+        pg.setConfigOptions(antialias=False, background=OMNI_BLACK, foreground="#d7d7d7")
         self.setWindowTitle("全域智能 Omni-Intelligence | ADS1299 EEG 工作站")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
@@ -654,7 +724,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hp_spin.setRange(0.1, 30); self.hp_spin.setValue(5); self.hp_spin.setSuffix(" Hz")
         self.lp_spin = QtWidgets.QDoubleSpinBox()
         self.lp_spin.setRange(10, 120); self.lp_spin.setValue(50); self.lp_spin.setSuffix(" Hz")
-        self.notch_check = QtWidgets.QCheckBox("50 Hz 陷波"); self.notch_check.setChecked(True)
+        self.notch_check = QtWidgets.QCheckBox("50/100 Hz 谐波陷波"); self.notch_check.setChecked(True)
+        self.notch_check.setToolTip(
+            "级联抑制 50 Hz 和 100 Hz；采样率为 250 SPS 时，150 Hz 会混叠到 100 Hz。"
+        )
         self.hp_spin.valueChanged.connect(self._filter_settings_changed)
         self.lp_spin.valueChanged.connect(self._filter_settings_changed)
         self.notch_check.stateChanged.connect(self._filter_settings_changed)
@@ -674,6 +747,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self.start_stream)
         self.stop_btn = QtWidgets.QPushButton("停止")
         self.stop_btn.clicked.connect(self.stop_stream)
+        self.reference_combo = QtWidgets.QComboBox()
+        for label, value in REFERENCE_ITEMS:
+            self.reference_combo.addItem(label, value)
+        self.reference_combo.setCurrentIndex(0)
+        self.reference_combo.setMinimumWidth(205)
+        self.reference_combo.setToolTip(
+            "SRB1：每通道信号接 INxP，参考接 SRB1；"
+            "SRB2：每通道信号接 INxN，参考接 SRB2。"
+        )
+        self.apply_reference_btn = QtWidgets.QPushButton("应用参考")
+        self.apply_reference_btn.clicked.connect(self.apply_reference_mode)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -690,9 +774,9 @@ class MainWindow(QtWidgets.QMainWindow):
         serial_layout.addWidget(self.connect_btn)
         serial_layout.addWidget(self.start_btn)
         serial_layout.addWidget(self.stop_btn)
-        serial_hint = QtWidgets.QLabel("扫描 → 选择设备 → 打开串口 → 开始采集")
-        serial_hint.setStyleSheet("color:#6c625d;")
-        serial_layout.addWidget(serial_hint)
+        serial_layout.addWidget(QtWidgets.QLabel("参考"))
+        serial_layout.addWidget(self.reference_combo)
+        serial_layout.addWidget(self.apply_reference_btn)
         self.status_label = QtWidgets.QLabel("未扫描")
         self.status_label.setStyleSheet("color:#c94700; font-weight:600;")
         serial_layout.addWidget(self.status_label, 1)
@@ -717,6 +801,43 @@ class MainWindow(QtWidgets.QMainWindow):
         wave_page_layout.setContentsMargins(2, 2, 2, 2)
         wave_page_layout.setSpacing(3)
         self.view_tabs.addTab(wave_page, "波形")
+
+        # A dedicated, full-size single-channel view. Double-clicking any
+        # channel plot below selects the channel and switches to this tab.
+        self.single_channel_index = 0
+        single_page = QtWidgets.QWidget()
+        single_layout = QtWidgets.QVBoxLayout(single_page)
+        single_layout.setContentsMargins(5, 5, 5, 5)
+        single_header = QtWidgets.QHBoxLayout()
+        single_header.addWidget(QtWidgets.QLabel("放大通道"))
+        self.single_channel_combo = QtWidgets.QComboBox()
+        self.single_channel_combo.addItems([f"CH{i}" for i in range(1, CHANNELS + 1)])
+        self.single_channel_combo.currentIndexChanged.connect(self._single_channel_changed)
+        single_header.addWidget(self.single_channel_combo)
+        self.single_channel_status = QtWidgets.QLabel("CH1 | 等待数据")
+        self.single_channel_status.setStyleSheet("color:#c94700;font-weight:600;")
+        single_header.addWidget(self.single_channel_status, 1)
+        back_to_all = QtWidgets.QPushButton("返回八通道")
+        back_to_all.clicked.connect(lambda: self.view_tabs.setCurrentIndex(0))
+        single_header.addWidget(back_to_all)
+        single_layout.addLayout(single_header)
+        self.single_plot = pg.PlotWidget(axisItems={"bottom": ClockAxisItem(orientation="bottom")})
+        self.single_plot.setBackground(OMNI_BLACK)
+        self.single_plot.setMenuEnabled(False)
+        self.single_plot.setMouseEnabled(x=True, y=False)
+        self.single_plot.showGrid(x=True, y=True, alpha=0.22)
+        self.single_plot.setLabel("left", "幅值", units="uV")
+        self.single_plot.setLabel("bottom", "时间")
+        self.single_zero_line = self.single_plot.addLine(
+            y=0, pen=pg.mkPen("#56616b", width=1)
+        )
+        self.single_curve = self.single_plot.plot(
+            pen=pg.mkPen(OMNI_ORANGE, width=1.5), connect="finite"
+        )
+        self.single_curve.setClipToView(True)
+        self.single_curve.setDownsampling(auto=True, method="peak")
+        single_layout.addWidget(self.single_plot, 1)
+        self.single_tab_index = self.view_tabs.addTab(single_page, "单通道放大")
         layout.addWidget(self.view_tabs, 1)
 
         self.nav_plot = pg.PlotWidget()
@@ -798,6 +919,8 @@ class MainWindow(QtWidgets.QMainWindow):
             plot = self.wave_widget.addPlot(row=ch, col=0)
             plot.setMenuEnabled(False)
             plot.setMouseEnabled(x=True, y=False)
+            if ch > 0:
+                plot.setXLink(self.channel_plots[0])
             plot.showGrid(x=True, y=True, alpha=0.18)
             plot.setLabel("left", f"CH{ch+1}", units="uV")
             if ch < CHANNELS - 1:
@@ -806,11 +929,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.setLabel("bottom", "时间", units="s")
             curve = plot.plot(pen=pg.mkPen(OMNI_ORANGE if ch == 0 else "#d7d7d7", width=1.0),
                               connect="finite")
+            curve.setClipToView(True)
+            curve.setDownsampling(auto=True, method="peak")
             self.channel_plots.append(plot)
             self.stack_curves.append(curve)
         self.stack_plot = self.channel_plots[0]
         self.stack_plot.getViewBox().sigXRangeChanged.connect(self._main_range_changed)
         self.stack_plot.getViewBox().installEventFilter(self)
+        self.wave_widget.scene().sigMouseClicked.connect(self._wave_scene_clicked)
         wave_layout.addWidget(self.wave_widget, 1)
         wave_page_layout.addWidget(wave_row, 1)
 
@@ -828,7 +954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.psd_raw_check.stateChanged.connect(self.reset_psd_smoothing)
         self.psd_max_spin = QtWidgets.QDoubleSpinBox()
         self.psd_max_spin.setRange(10.0, FS / 2)
-        self.psd_max_spin.setValue(40.0)
+        self.psd_max_spin.setValue(65.0)
         self.psd_max_spin.setSingleStep(5.0)
         self.psd_max_spin.setSuffix(" Hz")
         self.offline_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.offline_slider.valueChanged.connect(self.offline_slider_changed)
@@ -887,7 +1013,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yrange_spin = QtWidgets.QDoubleSpinBox(); self.yrange_spin.setValue(200)
         self.file_status = QtWidgets.QLabel("未打开文件")
         self.range_status = QtWidgets.QLabel("0.0–0.0 s")
-        self.filter_status = QtWidgets.QLabel("5–50 Hz + 50 Hz notch")
+        self.filter_status = QtWidgets.QLabel("5–50 Hz + 50/100 Hz harmonic notch")
         self.statusBar().addWidget(self.file_status, 1)
         self.statusBar().addPermanentWidget(self.range_status)
         self.statusBar().addPermanentWidget(self.filter_status)
@@ -919,9 +1045,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_time_changed(self, value):
         if self.offline_uv is not None:
             self.offline_end = min(self._total_samples(), int((value + self.win_spin.value()) * FS))
+            self.reset_psd_smoothing()
         self.update_fast_plots()
 
     def _window_changed(self, *_):
+        if self.offline_uv is not None:
+            self.offline_end = min(
+                self._total_samples(),
+                int((self.start_time_spin.value() + self.win_spin.value()) * FS),
+            )
+            self.reset_psd_smoothing()
         self.update_fast_plots()
 
     def _nav_region_changed(self):
@@ -933,6 +1066,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.win_spin.blockSignals(False); self.start_time_spin.blockSignals(False)
         if self.offline_uv is not None:
             self.offline_end = min(self._total_samples(), int(hi * FS))
+            self.reset_psd_smoothing()
         self.update_fast_plots()
 
     def page(self, direction):
@@ -959,6 +1093,44 @@ class MainWindow(QtWidgets.QMainWindow):
         if 0 <= ch < CHANNELS:
             self._select_channel(ch)
 
+    def _wave_scene_clicked(self, event):
+        """Select on one click; open the isolated channel tab on double-click."""
+        if event.button() != QtCore.Qt.LeftButton:
+            return
+        scene_pos = event.scenePos()
+        channel = None
+        for ch, plot in enumerate(self.channel_plots):
+            if plot.sceneBoundingRect().contains(scene_pos):
+                channel = ch
+                break
+        if channel is None:
+            return
+        self._select_channel(channel)
+        is_double = bool(event.double()) if hasattr(event, "double") else False
+        if is_double:
+            self.show_single_channel(channel)
+            event.accept()
+
+    def show_single_channel(self, channel: int):
+        channel = int(np.clip(channel, 0, CHANNELS - 1))
+        self.single_channel_index = channel
+        self.single_channel_combo.blockSignals(True)
+        self.single_channel_combo.setCurrentIndex(channel)
+        self.single_channel_combo.blockSignals(False)
+        self.view_tabs.setCurrentIndex(self.single_tab_index)
+        self.update_fast_plots()
+        self.set_status(
+            f"CH{channel+1} 已在“单通道放大”Tab 中独立显示；"
+            "双击其他通道可直接切换。"
+        )
+
+    def _single_channel_changed(self, channel: int):
+        if channel < 0:
+            return
+        self.single_channel_index = int(channel)
+        self._select_channel(self.single_channel_index)
+        self.update_fast_plots()
+
     def _select_channel(self, ch):
         self.channel_combo.setCurrentIndex(ch)
         for i, curve in enumerate(self.stack_curves):
@@ -974,6 +1146,64 @@ class MainWindow(QtWidgets.QMainWindow):
                 "}"
             )
 
+    def reference_is_srb2(self) -> bool:
+        return self.reference_mode == REFERENCE_SRB2
+
+    def set_reference_mode_local(self, mode: int):
+        self.reference_mode = REFERENCE_SRB2 if int(mode) == REFERENCE_SRB2 else REFERENCE_SRB1
+        if hasattr(self, "reference_combo"):
+            index = self.reference_combo.findData(self.reference_mode)
+            if index >= 0:
+                self.reference_combo.blockSignals(True)
+                self.reference_combo.setCurrentIndex(index)
+                self.reference_combo.blockSignals(False)
+        self.refresh_channel_parameter_labels()
+
+    def reference_short_name(self) -> str:
+        return "SRB2" if self.reference_is_srb2() else "SRB1"
+
+    def bias_register_name(self) -> str:
+        if self.current_mode == 0:
+            return "BIAS_SENSP+BIAS_SENSN"
+        return "BIAS_SENSN" if self.reference_is_srb2() else "BIAS_SENSP"
+
+    def read_config_ack(self, expected_command: int, timeout: float = 1.2):
+        """Read and validate the firmware's 12-byte ADS register readback."""
+        if not self.ser or not self.ser.is_open:
+            return None
+        deadline = time.perf_counter() + timeout
+        buffer = bytearray()
+        marker = bytes((0xBC, expected_command & 0xFF))
+        while time.perf_counter() < deadline:
+            waiting = int(self.ser.in_waiting)
+            if waiting:
+                buffer.extend(self.ser.read(waiting))
+                start = buffer.find(marker)
+                if start >= 0 and len(buffer) >= start + 12:
+                    packet = bytes(buffer[start:start + 12])
+                    checksum = 0
+                    for value in packet[:11]:
+                        checksum ^= value
+                    if checksum != packet[11]:
+                        del buffer[:start + 2]
+                        continue
+                    return {
+                        "command": packet[1],
+                        "argument": packet[2],
+                        "channel_register": packet[3],
+                        "bias_p": packet[4],
+                        "bias_n": packet[5],
+                        "misc1": packet[6],
+                        "reference": packet[7],
+                        "mode": packet[8],
+                        "verified": bool(packet[9] & 0x01),
+                        "enabled_mask": packet[10],
+                    }
+                if len(buffer) > 256:
+                    del buffer[:-32]
+            time.sleep(0.01)
+        return None
+
     def refresh_channel_parameter_labels(self):
         """Keep the per-channel hardware state visible without opening a dialog."""
         if not hasattr(self, "channel_buttons"):
@@ -981,16 +1211,23 @@ class MainWindow(QtWidgets.QMainWindow):
         for ch, button in enumerate(self.channel_buttons):
             enabled = bool(self.channel_enabled[ch])
             bias = "BIAS✓" if self.channel_bias[ch] else "BIAS—"
-            srb2 = "SRB2✓" if self.channel_srb2[ch] else "SRB2—"
             power = "ON" if enabled else "OFF"
-            button.setText(f"CH{ch+1}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {srb2}")
+            if self.reference_is_srb2():
+                reference = "SRB2✓" if self.channel_srb2[ch] and enabled else "SRB2—"
+            else:
+                reference = "SRB1全局"
+            button.setText(f"CH{ch+1}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {reference}")
             icon = QtGui.QPixmap(11, 11)
             icon.fill(QtGui.QColor("#56bd31" if enabled else "#8b969e"))
             button.setIcon(QtGui.QIcon(icon))
             button.setToolTip(
                 f"CH{ch+1}: {'启用' if enabled else '禁用'}, PGA ×{int(self.channel_gains[ch])}, "
-                f"{'参与' if self.channel_bias[ch] else '不参与'} BIAS 计算, "
-                f"SRB2 {'接入' if self.channel_srb2[ch] else '断开'}"
+                f"{'参与' if self.channel_bias[ch] else '不参与'} {self.bias_register_name()}；"
+                + (
+                    f"SRB2 {'接入' if self.channel_srb2[ch] and enabled else '断开'}"
+                    if self.reference_is_srb2()
+                    else "EEG 模式使用全局 SRB1"
+                )
             )
 
     def open_channel_settings(self, ch):
@@ -1009,16 +1246,24 @@ class MainWindow(QtWidgets.QMainWindow):
         gain.addItems([str(value) for value in VALID_GAINS])
         gain.setCurrentText(str(int(self.channel_gains[ch])))
         form.addRow("PGA 增益", gain)
-        bias = QtWidgets.QCheckBox("加入 BIAS_SENSP 共模反馈计算")
+        bias = QtWidgets.QCheckBox(f"加入 {self.bias_register_name()} 共模反馈计算")
         bias.setChecked(bool(self.channel_bias[ch]))
         form.addRow("BIAS", bias)
-        srb2 = QtWidgets.QCheckBox("将该通道 P 端接入 SRB2 公共参考")
+        srb2 = QtWidgets.QCheckBox("该通道接入 SRB2 公共参考")
         srb2.setChecked(bool(self.channel_srb2[ch]))
+        srb2.setEnabled(self.reference_is_srb2())
         form.addRow("SRB2", srb2)
-        note = QtWidgets.QLabel(
-            "注：SRB2 是 CHnSET 的逐通道开关；SRB1 是 ADS1299 MISC1 的全局开关，"
-            "不能真正按通道独立设置。"
-        )
+        if self.reference_is_srb2():
+            note_text = (
+                "SRB2 模式：测量电极接 INxN，公共参考接 SRB2；"
+                "MISC1.SRB1 关闭，BIAS 默认从 N 侧取样。"
+            )
+        else:
+            note_text = (
+                "SRB1 模式：测量电极接 INxP，公共参考接 SRB1；"
+                "SRB1 全局开启，逐通道 SRB2 不生效。"
+            )
+        note = QtWidgets.QLabel(note_text)
         note.setWordWrap(True)
         note.setStyleSheet("color:#5d6870;")
         form.addRow(note)
@@ -1028,10 +1273,15 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(buttons)
 
         def update_summary(*_args):
+            reference = (
+                f"SRB2 {'ON' if srb2.isChecked() else 'OFF'}"
+                if self.reference_is_srb2()
+                else "SRB1 GLOBAL"
+            )
             summary.setText(
                 f"CH{ch+1}  |  {'ON' if enabled.isChecked() else 'OFF'}  |  "
                 f"PGA ×{gain.currentText()}  |  BIAS {'YES' if bias.isChecked() else 'NO'}  |  "
-                f"SRB2 {'ON' if srb2.isChecked() else 'OFF'}"
+                f"{reference}"
             )
 
         enabled.toggled.connect(update_summary)
@@ -1047,21 +1297,36 @@ class MainWindow(QtWidgets.QMainWindow):
             ch, enabled.isChecked(), int(gain.currentText()), bias.isChecked(), srb2.isChecked()
         )
 
-    def apply_channel_settings(self, ch, enabled, gain, bias, srb2):
-        flags = (0x01 if enabled else 0) | (0x02 if bias else 0) | (0x04 if srb2 else 0)
+    def apply_channel_settings(self, ch, enabled, gain, bias, srb2=None):
+        if srb2 is None:
+            srb2 = bool(self.channel_srb2[ch])
+        effective_srb2 = bool(srb2 and enabled and self.reference_is_srb2())
+        flags = (
+            (0x01 if enabled else 0)
+            | (0x02 if bias and enabled else 0)
+            | (0x04 if effective_srb2 else 0)
+        )
         was_streaming = bool(self.streaming)
+        ack = None
         try:
             if self.ser and self.ser.is_open and self.offline_uv is None:
                 if was_streaming:
                     self.ser.write(b"s")
                     self.streaming = False
-                    time.sleep(0.08)
+                    time.sleep(0.12)
                 self.ser.reset_input_buffer()
                 self.ser.write(bytes([0xA7, ch & 0x07, gain & 0xFF, flags]))
-                time.sleep(0.12)
-                if was_streaming:
-                    self.ser.write(b"b")
-                    self.streaming = True
+                ack = self.read_config_ack(0xA7)
+                if ack is None:
+                    raise RuntimeError(
+                        "固件未返回 A7 寄存器读回。请烧录带配置 ACK 的最新固件。"
+                    )
+                if ack["argument"] != (ch & 0x07) or not ack["verified"]:
+                    raise RuntimeError(
+                        f"ADS1299 配置校验失败：CH{ch+1}, "
+                        f"CHnSET=0x{ack['channel_register']:02X}, "
+                        f"BIAS_P=0x{ack['bias_p']:02X}, BIAS_N=0x{ack['bias_n']:02X}"
+                    )
             self.channel_enabled[ch] = bool(enabled)
             self.channel_gains[ch] = int(gain)
             self.channel_bias[ch] = bool(bias and enabled)
@@ -1070,12 +1335,91 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_channel_parameter_labels()
             self.ring.clear()
             self.reset_processing_state()
+            readback = (
+                f"；ADS读回 CHnSET=0x{ack['channel_register']:02X}, "
+                f"P=0x{ack['bias_p']:02X}, N=0x{ack['bias_n']:02X}"
+                if ack is not None else "；仅更新离线显示参数"
+            )
             self.set_status(
-                f"CH{ch+1}: {'ON' if enabled else 'OFF'}, PGA×{gain}, "
-                f"BIAS={'YES' if bias and enabled else 'NO'}, SRB2={'ON' if srb2 and enabled else 'OFF'}"
+                f"已确认 CH{ch+1}: {'ON' if enabled else 'OFF'}, PGA×{gain}, "
+                f"{self.bias_register_name()}={'YES' if bias and enabled else 'NO'}, "
+                + (
+                    f"SRB2={'ON' if effective_srb2 else 'OFF'}"
+                    if self.reference_is_srb2()
+                    else "SRB1=GLOBAL"
+                )
+                + readback
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "通道设置失败", str(exc))
+        finally:
+            if was_streaming and self.ser and self.ser.is_open:
+                try:
+                    self.ser.reset_input_buffer()
+                    self.ser.write(b"b")
+                    self.streaming = True
+                except Exception:
+                    self.streaming = False
+
+    def apply_reference_mode(self):
+        new_mode = int(self.reference_combo.currentData())
+        was_streaming = bool(self.streaming)
+        try:
+            if self.ser and self.ser.is_open and self.offline_uv is None:
+                if was_streaming:
+                    self.ser.write(b"s")
+                    self.streaming = False
+                    time.sleep(0.08)
+                self.ser.reset_input_buffer()
+                self.ser.write(bytes([0xA8, new_mode & 0x01]))
+                time.sleep(0.12)
+
+                # Re-send the eight channel configurations so a SRB2-capable
+                # firmware receives the exact per-channel switch mask.
+                payload = bytearray()
+                for ch in range(CHANNELS):
+                    enabled = bool(self.channel_enabled[ch])
+                    flags = (
+                        (0x01 if enabled else 0)
+                        | (0x02 if self.channel_bias[ch] and enabled else 0)
+                        | (
+                            0x04
+                            if new_mode == REFERENCE_SRB2
+                            and self.channel_srb2[ch]
+                            and enabled
+                            else 0
+                        )
+                    )
+                    payload.extend((0xA7, ch, int(self.channel_gains[ch]), flags))
+                self.ser.write(payload)
+                time.sleep(0.25)
+                # A7-capable firmware returns one readback ACK per channel.
+                # This bulk synchronization does not need to expose all eight
+                # replies, so discard them before normal polling/streaming.
+                self.ser.reset_input_buffer()
+                if was_streaming:
+                    self.ser.write(b"b")
+                    self.streaming = True
+
+            self.set_reference_mode_local(new_mode)
+            self.set_bias_checks(
+                sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i])
+            )
+            self.ring.clear()
+            self.filtered_ring.clear()
+            self.reset_processing_state()
+            if new_mode == REFERENCE_SRB2:
+                self.set_status(
+                    "参考已切换为 SRB2：信号接 INxN，参考接 SRB2，"
+                    "BIAS 自动使用 BIAS_SENSN；原始极性为 SRB2-INxN。"
+                )
+            else:
+                self.set_status(
+                    "参考已切换为 SRB1：信号接 INxP，参考接 SRB1，"
+                    "BIAS 自动使用 BIAS_SENSP；原始极性为 INxP-SRB1。"
+                )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "参考模式切换失败", str(exc))
 
     def _main_range_changed(self, _viewbox, x_range):
         if getattr(self, "_syncing_plot", False) or self.offline_uv is None:
@@ -1087,6 +1431,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_time_spin.setValue(max(0.0, float(x_range[0])))
         self.win_spin.blockSignals(False)
         self.start_time_spin.blockSignals(False)
+        self.offline_end = min(self._total_samples(), int(x_range[1] * FS))
+        self.reset_psd_smoothing()
         self.update_fast_plots()
 
     def export_csv(self):
@@ -1100,14 +1446,85 @@ class MainWindow(QtWidgets.QMainWindow):
             np.savetxt(path, matrix, delimiter=",", header=header, comments="", fmt="%.7g")
             self.set_status(f"已导出 {path}")
 
+    def build_mne_raw(self):
+        """Build an unfiltered MNE RawArray from the currently imported BIN."""
+        if self.offline_uv is None:
+            raise RuntimeError("请先打开一个 BIN 文件。")
+
+        import mne
+
+        channel_names = [f"CH{i}" for i in range(1, CHANNELS + 1)]
+        info = mne.create_info(channel_names, FS, ch_types=["eeg"] * CHANNELS)
+        info["line_freq"] = 50.0
+        info["description"] = (
+            f"ADS1299 raw BIN import: "
+            f"{Path(getattr(self, 'loaded_path', 'unknown.bin')).name}"
+        )
+        raw = mne.io.RawArray(
+            self.offline_uv.astype(np.float64) * 1e-6,
+            info,
+            verbose="ERROR",
+        )
+
+        # Preserve CRC/validity information as standard MNE BAD annotations.
+        valid = np.asarray(self.offline_valid, dtype=bool)
+        if valid.size == self.offline_uv.shape[1] and not valid.all():
+            bad = ~valid
+            padded = np.r_[False, bad, False].astype(np.int8)
+            edges = np.diff(padded)
+            starts = np.flatnonzero(edges == 1)
+            ends = np.flatnonzero(edges == -1)
+            annotations = mne.Annotations(
+                onset=starts.astype(float) / FS,
+                duration=(ends - starts).astype(float) / FS,
+                description=["BAD_frame"] * len(starts),
+            )
+            raw.set_annotations(annotations)
+        return raw
+
+    def save_mne_exports(self) -> Tuple[Path, Path]:
+        """Save automatic MNE interchange CSV and native FIF exports."""
+        if self.offline_uv is None:
+            raise RuntimeError("请先打开一个 BIN 文件。")
+
+        recordings_dir = Path(__file__).resolve().parent / "recordings"
+        # Keep the directory spelling requested by the project owner.
+        nme_dir = recordings_dir / "nme"
+        fif_dir = recordings_dir / "fif"
+        nme_dir.mkdir(parents=True, exist_ok=True)
+        fif_dir.mkdir(parents=True, exist_ok=True)
+
+        source_stem = Path(getattr(self, "loaded_path", "ADS1299")).stem
+        mne_csv_path = nme_dir / f"{source_stem}_mne.csv"
+        fif_path = fif_dir / f"{source_stem}_raw.fif"
+
+        # MNE stores EEG in volts, so this interchange CSV deliberately uses V.
+        time_s = np.arange(self.offline_uv.shape[1], dtype=np.float64) / FS
+        matrix = np.column_stack(
+            (time_s, self.offline_uv.astype(np.float64).T * 1e-6)
+        )
+        header = "time_s," + ",".join(
+            f"CH{i}_V" for i in range(1, CHANNELS + 1)
+        )
+        np.savetxt(
+            mne_csv_path,
+            matrix,
+            delimiter=",",
+            header=header,
+            comments="",
+            fmt="%.10g",
+        )
+
+        raw = self.build_mne_raw()
+        raw.save(fif_path, overwrite=True, fmt="double", verbose="ERROR")
+        return mne_csv_path, fif_path
+
     def open_mne_browser(self):
         if self.offline_uv is None:
             QtWidgets.QMessageBox.information(self, "MNE 浏览器", "请先打开一个 BIN 文件。")
             return
         try:
-            import mne
-            info = mne.create_info([f"CH{i}" for i in range(1, 9)], FS, ch_types="eeg")
-            mne.io.RawArray(self.offline_uv.astype(float) * 1e-6, info, verbose=False).plot(
+            self.build_mne_raw().plot(
                 duration=self.win_spin.value(), scalings={"eeg": self.sensitivity_spin.value()*1e-6},
                 block=False, title=Path(getattr(self, "loaded_path", "ADS1299")).name)
         except Exception as exc:
@@ -1167,7 +1584,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ser.reset_input_buffer()
             self.ser.write(b"s")
             self.connect_btn.setText("关闭串口")
-            self.set_status(f"已打开 {port}。现在可以点击“开始采集”。")
+            self.apply_reference_mode()
+            self.set_status(
+                f"已打开 {port}，并同步 {self.reference_short_name()} 参考与通道参数。"
+                "现在可以点击“开始采集”。"
+            )
         except Exception as exc:
             self.ser = None
             QtWidgets.QMessageBox.critical(self, "连接失败", str(exc))
@@ -1264,6 +1685,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 y = signal.sosfilt(self.sos_notch, y)
         return y
 
+    def filter_offline_view(self, start: int, end: int) -> np.ndarray:
+        """Filter an offline view with context, then crop it to the visible range.
+
+        Filtering only the visible samples makes ``sosfiltfilt`` treat both
+        screen edges as signal boundaries.  Its startup/ending transient then
+        looks like a real amplitude wobble.  Extra samples (or reflected data
+        at the actual file boundaries) keep that transient outside the view.
+        """
+        view_len = max(0, end - start)
+        if self.offline_uv is None or view_len == 0:
+            return np.empty((CHANNELS, 0), dtype=float)
+
+        hp = max(0.1, float(self.hp_spin.value()))
+        context = max(3 * FS, int(np.ceil(5.0 * FS / hp)))
+        source_len = self.offline_uv.shape[1]
+        context_start = max(0, start - context)
+        context_end = min(source_len, end + context)
+        values = self.offline_uv[:, context_start:context_end].astype(float, copy=True)
+        valid = self.offline_valid[context_start:context_end].copy()
+
+        left_missing = max(0, context - (start - context_start))
+        right_missing = max(0, context - (context_end - end))
+        if left_missing or right_missing:
+            # Reflecting the real endpoint gives the zero-phase filter enough
+            # settling data without inventing a step or changing saved data.
+            pad_mode = "reflect" if values.shape[1] > 1 else "edge"
+            values = np.pad(values, ((0, 0), (left_missing, right_missing)), mode=pad_mode)
+            valid = np.pad(valid, (left_missing, right_missing), mode="edge")
+
+        crop_start = left_missing + (start - context_start)
+        crop_end = crop_start + view_len
+        filtered = np.vstack([
+            self.filter_offline_display(values[ch], valid)
+            for ch in range(CHANNELS)
+        ])
+        result = filtered[:, crop_start:crop_end]
+        view_valid = self.offline_valid[start:end]
+        if view_valid.size == result.shape[1] and not np.all(view_valid):
+            result[:, ~view_valid] = np.nan
+        return result
+
     def filter_for_alpha(self, x: np.ndarray) -> np.ndarray:
         x = signal.detrend(np.asarray(x, dtype=float), type="linear")
         if x.size < 64:
@@ -1276,11 +1738,24 @@ class MainWindow(QtWidgets.QMainWindow):
             y = signal.sosfilt(self.sos_alpha_band, y)
         return y
 
-    def append_live_filtered(self, frames: List[Frame]):
+    def append_live_filtered(
+        self,
+        frames: List[Frame],
+        values: Optional[np.ndarray] = None,
+        valid: Optional[np.ndarray] = None,
+        sequence: Optional[np.ndarray] = None,
+        modes: Optional[np.ndarray] = None,
+    ):
         if not frames:
             return
-        values = np.stack([fr.uv for fr in frames], axis=1).astype(float)
-        valid = np.array([fr.valid for fr in frames], dtype=bool)
+        if values is None:
+            values = np.stack([fr.uv for fr in frames], axis=1).astype(np.float32)
+        if valid is None:
+            valid = np.array([fr.valid for fr in frames], dtype=bool)
+        if sequence is None:
+            sequence = np.array([fr.sequence for fr in frames], dtype=np.uint32)
+        if modes is None:
+            modes = np.array([fr.mode for fr in frames], dtype=np.uint8)
         filled = values.copy()
         for ch in range(CHANNELS):
             if not self.have_filter_input[ch]:
@@ -1302,12 +1777,12 @@ class MainWindow(QtWidgets.QMainWindow):
             y, self.display_zi_band[ch] = signal.sosfilt(
                 self.sos_display_band, filled[ch], zi=self.display_zi_band[ch]
             )
-            y, self.display_zi_notch[ch] = signal.sosfilt(
-                self.sos_notch, y, zi=self.display_zi_notch[ch]
-            )
+            if not hasattr(self, "notch_check") or self.notch_check.isChecked():
+                y, self.display_zi_notch[ch] = signal.sosfilt(
+                    self.sos_notch, y, zi=self.display_zi_notch[ch]
+                )
             filled[ch] = y
-        for i, fr in enumerate(frames):
-            self.filtered_ring.append_values(filled[:, i], fr.valid, fr.sequence, fr.mode)
+        self.filtered_ring.append_batch(filled, valid, sequence, modes)
 
     def smooth_psd_db(self, f: np.ndarray, p: np.ndarray) -> np.ndarray:
         now_db = 10.0 * np.log10(np.asarray(p, dtype=float) + np.finfo(float).eps)
@@ -1583,6 +2058,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def process_frames(self, frames: List[Frame], live: bool):
         now = time.perf_counter()
+        detected_reference = None
         for fr in frames:
             self.packet_count += 1
             if not (fr.flags & 0x01):
@@ -1611,20 +2087,29 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled_counts = fr.raw_counts[self.channel_enabled]
             self.saturation_samples += int(np.sum(np.abs(enabled_counts) > 0.95 * (2**23 - 1)))
             self.current_mode = fr.mode
+            if fr.mode in (0, 1, 2):
+                detected_reference = (
+                    REFERENCE_SRB1 if (fr.flags & 0x80) else REFERENCE_SRB2
+                )
             self.last_read_us = fr.read_us
             self.max_read_us = max(self.max_read_us, fr.read_us)
             self.last_pending = fr.pending
             self.last_queue_depth = fr.queue_depth
-            if live:
-                self.ring.append(fr)
         if live:
-            self.append_live_filtered(frames)
+            values = np.stack([fr.uv for fr in frames], axis=1).astype(np.float32)
+            valid = np.array([fr.valid for fr in frames], dtype=bool)
+            sequence = np.array([fr.sequence for fr in frames], dtype=np.uint32)
+            modes = np.array([fr.mode for fr in frames], dtype=np.uint8)
+            self.ring.append_batch(values, valid, sequence, modes)
+            self.append_live_filtered(frames, values, valid, sequence, modes)
+        if detected_reference is not None and detected_reference != self.reference_mode:
+            self.set_reference_mode_local(detected_reference)
 
     # ---------------- BIAS_SENSP ----------------
     def current_bias_mask(self) -> int:
         mask = 0
         for i, cb in enumerate(self.bias_checks):
-            if cb.isChecked():
+            if cb.isChecked() and self.channel_enabled[i]:
                 mask |= (1 << i)
         return mask & 0xFF
 
@@ -1632,6 +2117,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bias_mask_label.setText(f"mask=0x{self.current_bias_mask():02X}")
 
     def set_bias_checks(self, mask: int):
+        enabled_mask = sum(
+            (1 << i) for i in range(CHANNELS) if self.channel_enabled[i]
+        )
+        mask &= enabled_mask
         for i, cb in enumerate(self.bias_checks):
             cb.blockSignals(True)
             cb.setChecked(bool(mask & (1 << i)))
@@ -1642,11 +2131,45 @@ class MainWindow(QtWidgets.QMainWindow):
         mask = self.current_bias_mask()
         if not self.require_serial():
             return
+        was_streaming = bool(self.streaming)
         try:
+            if was_streaming:
+                self.ser.write(b"s")
+                self.streaming = False
+                time.sleep(0.12)
+            self.ser.reset_input_buffer()
             self.ser.write(bytes([0xA6, 0x0D, mask]))
-            self.set_status(f"已发送 BIAS_SENSP = 0x{mask:02X}。注意：这个命令不改 BIAS_SENSN。")
+            ack = self.read_config_ack(0xA6)
+            if ack is None:
+                raise RuntimeError(
+                    "固件未返回 A6 寄存器读回。请烧录带配置 ACK 的最新固件。"
+                )
+            if ack["argument"] != mask or not ack["verified"]:
+                raise RuntimeError(
+                    f"ADS1299 BIAS 校验失败：请求=0x{mask:02X}, "
+                    f"逻辑mask=0x{ack['channel_register']:02X}, "
+                    f"P=0x{ack['bias_p']:02X}, N=0x{ack['bias_n']:02X}"
+                )
+            for i in range(CHANNELS):
+                self.channel_bias[i] = bool(mask & (1 << i))
+            self.set_bias_checks(mask)
+            self.refresh_channel_parameter_labels()
+            self.set_status(
+                f"BIAS 写入已由 ADS1299 读回确认：逻辑 mask=0x{mask:02X}，"
+                f"BIAS_SENSP=0x{ack['bias_p']:02X}，"
+                f"BIAS_SENSN=0x{ack['bias_n']:02X}，"
+                f"MISC1=0x{ack['misc1']:02X}。"
+            )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "BIAS_SENSP 发送失败", str(exc))
+            QtWidgets.QMessageBox.critical(self, "BIAS 写入/校验失败", str(exc))
+        finally:
+            if was_streaming and self.ser and self.ser.is_open:
+                try:
+                    self.ser.reset_input_buffer()
+                    self.ser.write(b"b")
+                    self.streaming = True
+                except Exception:
+                    self.streaming = False
 
     # ---------------- bin import/offline ----------------
     def import_bin(self):
@@ -1668,6 +2191,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.offline_seq = np.array([f.sequence for f in frames], dtype=np.uint32)
             self.offline_mode = np.array([f.mode for f in frames], dtype=np.uint8)
             self.current_mode = int(self.offline_mode[-1])
+            if self.current_mode in (0, 1, 2):
+                self.set_reference_mode_local(
+                    REFERENCE_SRB1 if (frames[-1].flags & 0x80) else REFERENCE_SRB2
+                )
             self.offline_end = self.offline_uv.shape[1]
             self.offline_slider.setEnabled(True)
             self.offline_slider.setRange(1, self.offline_end)
@@ -1677,7 +2204,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.file_status.setText(
                     f"{Path(path).name}  |  {FS} Hz  |  有效帧 {int(np.sum(self.offline_valid))}/{self.offline_end}"
                 )
-            self.set_status(f"已导入 {path}，有效帧 {self.offline_end}，CRC坏帧 {parser.crc_bad}。")
+            try:
+                mne_csv_path, fif_path = self.save_mne_exports()
+                valid_count = int(np.sum(self.offline_valid))
+                total_count = int(self.offline_uv.shape[1])
+                self.set_status(
+                    f"已导入 {path}，有效帧 {valid_count}/{total_count}，"
+                    f"CRC坏帧 {parser.crc_bad}；"
+                    f"已保存 {mne_csv_path.name} 和 {fif_path.name}。"
+                )
+            except Exception as export_exc:
+                self.set_status(
+                    f"已导入 {path}，但自动保存 MNE/FIF 失败：{export_exc}"
+                )
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "MNE/FIF 自动导出失败",
+                    f"BIN 已正常导入，但自动导出失败：\n{export_exc}",
+                )
             self.update_fast_plots()
             self.update_psd_and_info()
         except Exception as exc:
@@ -1703,6 +2247,36 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         source = self.filtered_ring if filtered_live else self.ring
         return source.latest(n)
+
+    def get_psd_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+        """Return an offline interval of at least 10 s around the visible view."""
+        if self.offline_uv is not None:
+            total = self.offline_uv.shape[1]
+            visible_start = int(round(float(self.start_time_spin.value()) * FS))
+            visible_length = max(1, int(round(float(self.win_spin.value()) * FS)))
+            visible_start = max(0, min(visible_start, max(0, total - 1)))
+            visible_end = min(total, visible_start + visible_length)
+
+            # Keep waveform zoom independent from spectral resolution. Center
+            # a minimum ten-second PSD interval on the visible view, and shift
+            # it at file boundaries to preserve its full length when possible.
+            analysis_length = min(total, max(10 * FS, visible_end - visible_start))
+            center = (visible_start + visible_end) // 2
+            start = center - analysis_length // 2
+            start = max(0, min(start, total - analysis_length))
+            end = start + analysis_length
+            return (
+                self.offline_uv[:, start:end].copy(),
+                self.offline_valid[start:end].copy(),
+                self.offline_seq[start:end].copy(),
+                self.offline_mode[start:end].copy(),
+                start,
+                end,
+            )
+        data, valid, seq, mode = self.get_view_data(10.0, filtered_live=False)
+        end = int(self.packet_count)
+        start = max(0, end - data.shape[1])
+        return data, valid, seq, mode, start, end
 
     # ---------------- signal processing/plotting ----------------
     def prepare_plot_signal(self, x: np.ndarray, valid: np.ndarray, filtered_live: bool) -> np.ndarray:
@@ -1739,7 +2313,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 med = float(np.median(finite))
                 half = float(max(10.0, np.percentile(np.abs(finite - med), 99.5) * 1.2))
                 self.time_plot.setYRange(med - half, med + half, padding=0)
-        chain = "连续1-40Hz+50Hz陷波" if self.filter_check.isChecked() else "原始去均值"
+        chain = "连续5-50Hz+50/100Hz谐波陷波" if self.filter_check.isChecked() else "原始去均值"
         self.time_plot.setTitle(
             f"{self.channel_combo.currentText()} 时域 | {MODE_NAMES.get(self.current_mode, 'UNKNOWN')} | {chain}"
         )
@@ -1777,23 +2351,75 @@ class MainWindow(QtWidgets.QMainWindow):
             end = min(total_n, start + int(seconds * FS))
             data = self.offline_uv[:, start:end].copy()
             valid = self.offline_valid[start:end].copy()
+            live_filtered = False
         else:
-            data, valid, _seq, _mode = self.get_view_data(seconds, filtered_live=False)
+            live_filtered = bool(self.filter_check.isChecked())
+            data, valid, _seq, _mode = self.get_view_data(
+                seconds, filtered_live=live_filtered
+            )
             start_s = max(0.0, (total_n - data.shape[1]) / FS)
             self.start_time_spin.blockSignals(True)
             self.start_time_spin.setValue(start_s)
             self.start_time_spin.blockSignals(False)
         if data.shape[1] < 2:
             return
-        arr = np.vstack([self.prepare_plot_signal(data[c], valid, False) for c in range(CHANNELS)])
+        if self.offline_uv is None and live_filtered:
+            # The causal filter was already applied once when samples entered
+            # filtered_ring. Never rerun zero-phase filtering on every repaint.
+            arr = np.asarray(data, dtype=float)
+            if valid.size == arr.shape[1] and not np.all(valid):
+                arr = arr.copy()
+                arr[:, ~valid] = np.nan
+        elif self.offline_uv is None:
+            arr = np.asarray(data, dtype=float)
+            if valid.size == arr.shape[1] and not np.all(valid):
+                arr = arr.copy()
+                arr[:, ~valid] = np.nan
+            arr -= np.nanmean(arr, axis=1, keepdims=True)
+        else:
+            if self.filter_check.isChecked():
+                arr = self.filter_offline_view(start, end)
+            else:
+                arr = np.vstack([
+                    self.prepare_plot_signal(data[c], valid, False)
+                    for c in range(CHANNELS)
+                ])
         t = start_s + np.arange(data.shape[1]) / FS
         for c, curve in enumerate(self.stack_curves):
             scale = float(self.channel_scales[c].value())
             curve.setData(t, arr[c])
             self.channel_plots[c].setYRange(-scale, scale, padding=0)
+
+        # Reuse the already prepared display array; the enlarged tab adds no
+        # extra filtering pass and therefore remains inexpensive in live mode.
+        single_ch = int(np.clip(self.single_channel_index, 0, CHANNELS - 1))
+        single_scale = float(self.channel_scales[single_ch].value())
+        self.single_curve.setData(t, arr[single_ch])
+        self.single_plot.setXRange(start_s, start_s + seconds, padding=0)
+        self.single_plot.setYRange(-single_scale, single_scale, padding=0)
+        display_chain = (
+            f"{self.hp_spin.value():g}–{self.lp_spin.value():g} Hz"
+            + (" + 50/100 Hz harmonic notch" if self.notch_check.isChecked() else "")
+            if self.filter_check.isChecked()
+            else "原始数据（去直流）"
+        )
+        reference = (
+            f"SRB2 {'ON' if self.channel_srb2[single_ch] else 'OFF'}"
+            if self.reference_is_srb2()
+            else "SRB1 GLOBAL"
+        )
+        self.single_plot.setTitle(
+            f"CH{single_ch+1} 独立波形 | {display_chain} | ±{single_scale:g} uV"
+        )
+        self.single_channel_status.setText(
+            f"CH{single_ch+1} | {'ON' if self.channel_enabled[single_ch] else 'OFF'}"
+            f" | PGA ×{int(self.channel_gains[single_ch])}"
+            f" | {'BIAS✓' if self.channel_bias[single_ch] else 'BIAS—'}"
+            f" | {reference}"
+        )
         self._syncing_plot = True
-        for plot in self.channel_plots:
-            plot.setXRange(start_s, start_s + seconds, padding=0)
+        # The remaining seven ViewBoxes are X-linked to the first.
+        self.channel_plots[0].setXRange(start_s, start_s + seconds, padding=0)
         self._syncing_plot = False
         if self.offline_uv is not None:
             stride = max(1, total_n // 3000)
@@ -1801,30 +2427,34 @@ class MainWindow(QtWidgets.QMainWindow):
             overview -= np.nanmean(overview)
             self.nav_curve.setData(np.arange(overview.size)*stride/FS, overview)
             self.nav_plot.setXRange(0, total_s, padding=0)
-        self._syncing_nav = True
-        self.nav_region.setRegion((start_s, min(total_s, start_s+seconds)))
-        self._syncing_nav = False
+        now = time.monotonic()
+        if self.offline_uv is not None or now - self._last_nav_update >= 0.2:
+            self._last_nav_update = now
+            self._syncing_nav = True
+            self.nav_region.setRegion((start_s, min(total_s, start_s+seconds)))
+            self._syncing_nav = False
         hp, lp = self.hp_spin.value(), self.lp_spin.value()
-        notch = " + 50 Hz notch" if self.notch_check.isChecked() else ""
+        notch = " + 50/100 Hz harmonic notch" if self.notch_check.isChecked() else ""
         mode = f"{hp:g}–{lp:g} Hz{notch}" if self.filter_check.isChecked() else "原始数据（逐通道去直流）"
         self.range_status.setText(f"{start_s:.1f}–{min(total_s,start_s+seconds):.1f} s")
         self.filter_status.setText(mode)
 
     def update_psd_and_info(self):
         """Request PSD work without blocking serial reads or plot painting."""
-        data, valid, seq, mode = self.get_view_data(10.0, filtered_live=False)
+        data, valid, seq, mode, analysis_start, analysis_end = self.get_psd_data()
         if data.shape[1] < FS * 4:
             self.latest_window_good = False
+            self.psd_curve.setData([], [])
             self.latest_window_reason = "数据不足 4 秒"
             self.psd_plot.setTitle("Welch PSD | 等待至少 4 秒数据")
             self.update_info_text()
             return
 
         ch = self.channel_combo.currentIndex()
-        source_count = self.offline_end if self.offline_uv is not None else self.packet_count
         signature = (
             bool(self.offline_uv is not None),
-            int(source_count),
+            int(analysis_start),
+            int(analysis_end),
             int(ch),
             bool(self.psd_raw_check.isChecked()),
             int(self.psd_max_spin.value()),
@@ -2005,8 +2635,12 @@ class MainWindow(QtWidgets.QMainWindow):
         selected_config = (
             f"CH{selected_ch+1} {'ON' if self.channel_enabled[selected_ch] else 'OFF'}, "
             f"PGA x{int(self.channel_gains[selected_ch])}, "
-            f"BIAS={'YES' if self.channel_bias[selected_ch] else 'NO'}, "
-            f"SRB2={'ON' if self.channel_srb2[selected_ch] else 'OFF'}"
+            f"{self.bias_register_name()}={'YES' if self.channel_bias[selected_ch] else 'NO'}, "
+            + (
+                f"SRB2={'ON' if self.channel_srb2[selected_ch] else 'OFF'}, SRB1=OFF"
+                if self.reference_is_srb2()
+                else "SRB1=GLOBAL, SRB2=OFF"
+            )
         )
         fs_text = f"{self.fs_est:.2f}" if np.isfinite(self.fs_est) else "---"
         alpha_peak = f"{self.latest_alpha_peak:.2f} Hz" if np.isfinite(self.latest_alpha_peak) else "---"
@@ -2048,7 +2682,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Queue-drop hints  : {self.queue_drop_hints}",
                 f"SPI read last/max : {self.last_read_us} / {self.max_read_us} us",
                 f"Pending / Queue   : {self.last_pending} / {self.last_queue_depth}",
-                f"BIAS_SENSP mask   : 0x{self.current_bias_mask():02X}",
+                f"Logical BIAS mask: 0x{self.current_bias_mask():02X}",
                 "",
                 f"Raw RMS           : {raw_rms}",
                 f"Filtered RMS      : {filtered_rms}",

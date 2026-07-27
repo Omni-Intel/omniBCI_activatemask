@@ -6,3 +6,5 @@ __pycache__/
 ui_preview_*.png
 .idea/
 .vscode/
+recordings/nme/
+recordings/fif/
