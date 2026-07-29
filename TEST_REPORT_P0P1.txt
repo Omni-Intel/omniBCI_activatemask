@@ -10,7 +10,12 @@ Checks completed before packaging:
 6. Stateful live filter test: output sample count matches input sample count
 7. Invalid-frame test: invalid mask is preserved after filter-state continuity filling
 8. Real bundled BIN parser test: CRC parsing completed successfully on selected recordings
+9. Impedance GUI offscreen construction: PASS (8 channels, 500 ms refresh timer)
+10. Synthetic 31.25 Hz impedance fit: PASS (5/12/60/100 kOhm recovered exactly)
+11. Contact labels: PASS (good/usable/poor thresholds at 10/50 kOhm)
+12. All three firmware variants: balanced braces and A9/LOFF register paths present
 
 Runtime note:
-The build environment did not contain PySide6, so the complete GUI window could not be launched here.
-The included requirements.txt and install_and_run.bat install the required GUI dependencies on Windows.
+The complete GUI and impedance dialog were launched with the Qt offscreen backend.
+No ADS1299 hardware or Arduino compiler was available in this environment, so final
+on-device register readback and known-resistor calibration remain hardware checks.

@@ -1,5 +1,20 @@
 # P0+P1 Change Log
 
+## OpenBCI-style electrode impedance
+
+- Added a CH1-CH8 impedance panel with live kΩ values and green/orange/red
+  contact-quality labels.
+- Added the `A9 <mask>` command to all three bundled firmware variants.
+- Firmware uses the ADS1299 native 6 nA, 31.25 Hz AC lead-off source and
+  automatically routes it to `LOFF_SENSP` for SRB1 or `LOFF_SENSN` for SRB2.
+- Every enable/disable operation reads back and verifies `LOFF`,
+  `LOFF_SENSP`, `LOFF_SENSN`, and `LOFF_FLIP`.
+- Impedance is estimated from a 31.25 Hz sine fit using the OpenBCI-style
+  series-resistor correction. The default is 9.98 kΩ for this PCB's
+  4.99 kΩ channel-input plus 4.99 kΩ AREF/SRB1 resistors.
+- Normal BIN recording is finalized before impedance excitation starts, so
+  diagnostic carrier data is not mixed into an EEG recording.
+
 ## Automatic MNE and FIF export on BIN import
 
 - Importing a BIN now automatically builds an unfiltered eight-channel MNE
