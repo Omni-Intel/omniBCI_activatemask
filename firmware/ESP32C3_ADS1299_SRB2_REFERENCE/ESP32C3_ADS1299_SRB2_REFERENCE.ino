@@ -1,14 +1,14 @@
 /*
-  ESP32-C3 + ADS1299：OpenBCI 接线、SRB2 默认 EEG 固件
+  ESP32-C3 + ADS1299：SRB2 公共参考 EEG 固件
 
   本文件是完整独立固件，不依赖其他 .ino。
 
   默认硬件与寄存器配置：
-    - EEG 测量电极接 IN1N～IN8N（OpenBCI N1P～N8P 排针）；
+    - EEG 测量电极接 IN1N～IN8N；
     - 公共参考电极接 SRB2，BIAS 电极接 BIASOUT；
     - CH1～CH5 开启、CH6～CH8 关闭、PGA=24、250 SPS；
     - 有效通道 CHnSET.SRB2=1，MISC1.SRB1=0；
-    - OpenBCI 默认 BIAS P+N：BIAS_SENSP=0x1F、BIAS_SENSN=0x1F；
+    - 默认 BIAS P+N：BIAS_SENSP=0x1F、BIAS_SENSN=0x1F；
     - ADS 原始极性是 SRB2-INxN，固件不翻转原始数据。
 
   数据链路：
@@ -32,7 +32,7 @@
   串口命令：
     b : 开始 48 字节二进制数据流
     s : 停止数据流
-    n : OpenBCI 默认 BIAS P+N
+    n : 默认 BIAS P+N
     e / p / m / * : 仅把当前参考模式的信号侧加入 BIAS
     o : 关闭 BIAS
     q : ADS1299 内部短路
@@ -190,7 +190,7 @@ enum ReferenceMode : uint8_t {
 #endif
 
 #ifndef ADS_FIRMWARE_BANNER
-#define ADS_FIRMWARE_BANNER "ESP32C3 ADS1299 OPENBCI-SRB2 READY"
+#define ADS_FIRMWARE_BANNER "ADS1299 SRB2 READY"
 #endif
 
 enum RunPhase : uint8_t {
@@ -233,7 +233,7 @@ volatile uint8_t currentGainCode = CH_GAIN_CODE_24;
 // GUI 可动态修改的 BIAS_SENSP mask；默认 CH1-CH5。
 // 这是逻辑 BIAS mask；SRB1 路由到 SENSP，SRB2 路由到 SENSN。
 volatile uint8_t currentBiasSensPMask = ADS_ACTIVE_CH_MASK;
-// Logical signal-electrode mask for OpenBCI-style impedance measurement.
+// Logical signal-electrode mask for AC impedance measurement.
 volatile uint8_t currentLeadOffMask = 0x00;
 
 // 二进制控制协议：0xA6 <register> <value>
@@ -1280,7 +1280,7 @@ void printReadyBanner() {
   Serial.printf(
     "%s - reference=%s, mode=%s, gain=%ux\n",
     ADS_FIRMWARE_BANNER,
-    currentReferenceMode == REFERENCE_SRB2 ? "SRB2/OpenBCI" : "SRB1",
+    currentReferenceMode == REFERENCE_SRB2 ? "SRB2" : "SRB1",
     currentMode == MODE_EEG_BIAS_PN ? "BIAS_P+N" :
       (currentMode == MODE_EEG_BIAS_P_ONLY ? "BIAS_SIGNAL_SIDE" : "DIAGNOSTIC"),
     (unsigned)currentGain
