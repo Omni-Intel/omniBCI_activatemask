@@ -99,6 +99,7 @@
 #define CONFIG2_NORMAL       0xC0
 #define CONFIG2_TEST_SLOW    0xD1
 #define CONFIG3_INTERNAL_REF 0xEC
+#define LOFF_AC_6NA_31HZ     0x02
 
 #define CH_MUX_NORMAL        0x00
 #define CH_MUX_SHORTED       0x01
@@ -232,6 +233,8 @@ volatile uint8_t currentGainCode = CH_GAIN_CODE_24;
 // GUI 可动态修改的 BIAS_SENSP mask；默认 CH1-CH5。
 // 这是逻辑 BIAS mask；SRB1 路由到 SENSP，SRB2 路由到 SENSN。
 volatile uint8_t currentBiasSensPMask = ADS_ACTIVE_CH_MASK;
+// Logical signal-electrode mask for OpenBCI-style impedance measurement.
+volatile uint8_t currentLeadOffMask = 0x00;
 
 // 二进制控制协议：0xA6 <register> <value>
 // Python/MATLAB GUI 用 0xA6 0x0D mask 运行时修改逻辑 BIAS 通道。
@@ -247,6 +250,7 @@ volatile uint8_t channelGainCode[8] = {
 // Binary controls: A6 0D mask, or A7 channel gain flags.
 // A7 channel is 0..7; flags: bit0 enabled, bit1 BIAS include, bit2 SRB2.
 // A8 referenceMode: 0=global SRB1, 1=per-channel SRB2.
+// A9 leadOffMask: ADS1299 6 nA, 31.25 Hz AC impedance excitation.
 static uint8_t binaryControlRegister = 0;
 static uint8_t binaryControlChannel = 0;
 static uint8_t binaryControlGain = 24;
@@ -287,6 +291,7 @@ void setGainByValue(uint8_t gain);
 void setBiasSensPMask(uint8_t mask);
 void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags);
 void setReferenceMode(uint8_t mode);
+void setLeadOffMask(uint8_t mask);
 bool gainToCode(uint8_t gain, uint8_t &code);
 uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2 = false);
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode);
@@ -536,6 +541,13 @@ void processSerialByte(char c) {
     return;
   }
 
+  if (binaryControlState == 30) {
+    setLeadOffMask(byteValue);
+    sendConfigAck(0xA9, byteValue);
+    binaryControlState = 0;
+    return;
+  }
+
   if (byteValue == 0xA6) {
     flushNumericCommand();
     binaryControlState = 1;
@@ -551,6 +563,12 @@ void processSerialByte(char c) {
   if (byteValue == 0xA8) {
     flushNumericCommand();
     binaryControlState = 20;
+    return;
+  }
+
+  if (byteValue == 0xA9) {
+    flushNumericCommand();
+    binaryControlState = 30;
     return;
   }
 
@@ -746,6 +764,12 @@ void setReferenceMode(uint8_t mode) {
   configureFrontend(static_cast<FrontendMode>(currentMode));
 }
 
+void setLeadOffMask(uint8_t mask) {
+  if (runPhase == PHASE_STREAMING) return;
+  currentLeadOffMask = static_cast<uint8_t>(mask & currentEnabledMask);
+  configureFrontend(static_cast<FrontendMode>(currentMode));
+}
+
 // ============================ Frontend modes ============================
 void configureFrontend(FrontendMode mode) {
   if (runPhase == PHASE_STREAMING) return;
@@ -821,6 +845,12 @@ void configureFrontendLocked(FrontendMode mode) {
     mode == MODE_EEG_BIAS_OFF;
   const bool srb1Enabled =
     normalEegMode && currentReferenceMode == REFERENCE_SRB1;
+  const uint8_t leadOffMask =
+    normalEegMode ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
+  const uint8_t leadOffP =
+    currentReferenceMode == REFERENCE_SRB1 ? leadOffMask : 0x00;
+  const uint8_t leadOffN =
+    currentReferenceMode == REFERENCE_SRB2 ? leadOffMask : 0x00;
   biasP &= currentEnabledMask;
   biasN &= currentEnabledMask;
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
@@ -837,7 +867,10 @@ void configureFrontendLocked(FrontendMode mode) {
 
   writeAdsRegister(0x0D, biasP);
   writeAdsRegister(0x0E, biasN);
-  writeAdsRegister(0x0F, 0x00);  // LOFF_FLIP
+  writeAdsRegister(0x04, leadOffMask ? LOFF_AC_6NA_31HZ : 0x00);
+  writeAdsRegister(0x0F, leadOffP);  // LOFF_SENSP
+  writeAdsRegister(0x10, leadOffN);  // LOFF_SENSN
+  writeAdsRegister(0x11, 0x00);      // LOFF_FLIP
   writeAdsRegister(0x15, srb1Enabled ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
 
   currentMode = mode;
@@ -855,6 +888,12 @@ bool verifyFrontendLocked(FrontendMode mode) {
     mode == MODE_EEG_BIAS_OFF;
   const bool expectedSrb1 =
     normalEegMode && currentReferenceMode == REFERENCE_SRB1;
+  const uint8_t expectedLeadOffMask =
+    normalEegMode ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
+  const uint8_t expectedLeadOffP =
+    currentReferenceMode == REFERENCE_SRB1 ? expectedLeadOffMask : 0x00;
+  const uint8_t expectedLeadOffN =
+    currentReferenceMode == REFERENCE_SRB2 ? expectedLeadOffMask : 0x00;
 
   if (mode == MODE_INPUT_SHORTED) expectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) expectedMux = CH_MUX_TEST;
@@ -888,7 +927,10 @@ bool verifyFrontendLocked(FrontendMode mode) {
   }
   ok &= readAdsRegister(0x0D) == expectedBiasP;
   ok &= readAdsRegister(0x0E) == expectedBiasN;
-  ok &= readAdsRegister(0x0F) == 0x00;
+  ok &= readAdsRegister(0x04) == (expectedLeadOffMask ? LOFF_AC_6NA_31HZ : 0x00);
+  ok &= readAdsRegister(0x0F) == expectedLeadOffP;
+  ok &= readAdsRegister(0x10) == expectedLeadOffN;
+  ok &= readAdsRegister(0x11) == 0x00;
   ok &= readAdsRegister(0x15) == (expectedSrb1 ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
   return ok;
 }
@@ -1211,12 +1253,19 @@ void sendConfigAck(uint8_t command, uint8_t argument) {
 
   if (runPhase != PHASE_STREAMING) {
     xSemaphoreTake(adsBusMutex, portMAX_DELAY);
-    reply[3] = command == 0xA7
-      ? readAdsRegister(static_cast<uint8_t>(ADS_FIRST_CH_REG + (argument & 0x07u)))
-      : currentBiasSensPMask;
-    reply[4] = readAdsRegister(0x0D);
-    reply[5] = readAdsRegister(0x0E);
-    reply[6] = readAdsRegister(0x15);
+    if (command == 0xA9) {
+      reply[3] = currentLeadOffMask;
+      reply[4] = readAdsRegister(0x0F);
+      reply[5] = readAdsRegister(0x10);
+      reply[6] = readAdsRegister(0x04);
+    } else {
+      reply[3] = command == 0xA7
+        ? readAdsRegister(static_cast<uint8_t>(ADS_FIRST_CH_REG + (argument & 0x07u)))
+        : currentBiasSensPMask;
+      reply[4] = readAdsRegister(0x0D);
+      reply[5] = readAdsRegister(0x0E);
+      reply[6] = readAdsRegister(0x15);
+    }
     xSemaphoreGive(adsBusMutex);
     reply[9] = configurationVerified ? 0x01u : 0x00u;
   }
