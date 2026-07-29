@@ -14,6 +14,7 @@ Checks completed before packaging:
 10. Synthetic 31.25 Hz impedance fit: PASS (5/12/60/100 kOhm recovered exactly)
 11. Contact labels: PASS (good/usable/poor thresholds at 10/50 kOhm)
 12. All three firmware variants: balanced braces and A9/LOFF register paths present
+13. Reference compensation switch: PASS (SRB1=9.98 kOhm, SRB2=4.40 kOhm)
 
 Runtime note:
 The complete GUI and impedance dialog were launched with the Qt offscreen backend.

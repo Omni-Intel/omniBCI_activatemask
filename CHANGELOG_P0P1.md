@@ -9,9 +9,10 @@
   automatically routes it to `LOFF_SENSP` for SRB1 or `LOFF_SENSN` for SRB2.
 - Every enable/disable operation reads back and verifies `LOFF`,
   `LOFF_SENSP`, `LOFF_SENSN`, and `LOFF_FLIP`.
-- Impedance is estimated from a 31.25 Hz sine fit using the OpenBCI-style
-  series-resistor correction. The default is 9.98 kΩ for this PCB's
-  4.99 kΩ channel-input plus 4.99 kΩ AREF/SRB1 resistors.
+- Impedance is estimated from a 31.25 Hz sine fit using reference-specific
+  series-resistor correction: 9.98 kΩ for SRB1 and 4.40 kΩ for SRB2.
+- Applying a reference mode immediately synchronizes the impedance
+  compensation control while retaining manual short-circuit calibration.
 - Normal BIN recording is finalized before impedance excitation starts, so
   diagnostic carrier data is not mixed into an EEG recording.
 

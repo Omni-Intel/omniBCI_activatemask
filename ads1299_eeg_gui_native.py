@@ -87,7 +87,8 @@ VREF = 4.5
 VALID_GAINS = [1, 2, 4, 6, 8, 12, 24]
 LEAD_OFF_FREQUENCY_HZ = FS / 8.0
 LEAD_OFF_CURRENT_NA = 6.0
-LEAD_OFF_SERIES_KOHM = 9.98
+LEAD_OFF_SERIES_SRB1_KOHM = 9.98
+LEAD_OFF_SERIES_SRB2_KOHM = 4.40
 REFERENCE_SRB1 = 0
 REFERENCE_SRB2 = 1
 REFERENCE_ITEMS = [
@@ -1187,6 +1188,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def reference_is_srb2(self) -> bool:
         return self.reference_mode == REFERENCE_SRB2
 
+    def impedance_series_default_kohm(self) -> float:
+        return (
+            LEAD_OFF_SERIES_SRB2_KOHM
+            if self.reference_is_srb2()
+            else LEAD_OFF_SERIES_SRB1_KOHM
+        )
+
+    def sync_impedance_series_compensation(self):
+        if self.impedance_series_spin is None:
+            return
+        value = self.impedance_series_default_kohm()
+        self.impedance_series_spin.setValue(value)
+        self.impedance_series_spin.setToolTip(
+            f"已按 {self.reference_short_name()} 参考自动设置为 {value:.2f} kΩ；"
+            "也可按对应接口的外部短接实测值校准。"
+        )
+
     def set_reference_mode_local(self, mode: int):
         self.reference_mode = REFERENCE_SRB2 if int(mode) == REFERENCE_SRB2 else REFERENCE_SRB1
         if hasattr(self, "reference_combo"):
@@ -1195,6 +1213,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.reference_combo.blockSignals(True)
                 self.reference_combo.setCurrentIndex(index)
                 self.reference_combo.blockSignals(False)
+        self.sync_impedance_series_compensation()
         self.refresh_channel_parameter_labels()
 
     def reference_short_name(self) -> str:
@@ -2016,12 +2035,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.impedance_series_spin.setRange(0.0, 100.0)
         self.impedance_series_spin.setDecimals(2)
         self.impedance_series_spin.setSingleStep(0.01)
-        self.impedance_series_spin.setValue(LEAD_OFF_SERIES_KOHM)
+        self.impedance_series_spin.setValue(self.impedance_series_default_kohm())
         self.impedance_series_spin.setSuffix(" kΩ")
-        self.impedance_series_spin.setToolTip(
-            "本板 AINxP 与 AREF 路径各有 4.99 kΩ，默认补偿合计 9.98 kΩ；"
-            "也可按外部短接实测值校准。"
-        )
+        self.sync_impedance_series_compensation()
         calibration.addWidget(self.impedance_series_spin)
         calibration.addStretch(1)
         layout.addLayout(calibration)
@@ -2221,7 +2237,7 @@ class MainWindow(QtWidgets.QMainWindow):
             series_kohm = (
                 float(self.impedance_series_spin.value())
                 if self.impedance_series_spin is not None
-                else LEAD_OFF_SERIES_KOHM
+                else self.impedance_series_default_kohm()
             )
             impedance_kohm = max(
                 0.0, carrier_peak_uv / LEAD_OFF_CURRENT_NA - series_kohm
