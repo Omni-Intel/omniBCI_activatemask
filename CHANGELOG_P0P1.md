@@ -1,6 +1,6 @@
 # P0+P1 Change Log
 
-## OpenBCI-style electrode impedance
+## Electrode impedance detection
 
 - Added a CH1-CH8 impedance panel with live kΩ values and green/orange/red
   contact-quality labels.
@@ -54,11 +54,11 @@
 - GUI state is no longer presented as hardware-confirmed when the firmware
   returns no acknowledgement or register verification fails.
 
-## OpenBCI SRB2 front-end correction
+## SRB2 front-end correction
 
-- Corrected the project default to the documented OpenBCI montage: signals on INxN, common reference on SRB2.
-- GUI now opens with SRB2/OpenBCI and BIAS P+N selected while retaining SRB1 and signal-side-only modes.
-- Added `ESP32C3_ADS1299_OPENBCI_SRB2_REFERENCE` as a dedicated, non-destructive firmware entry point.
+- Corrected the project default to signals on INxN with the common reference on SRB2.
+- GUI now opens with SRB2 and BIAS P+N selected while retaining SRB1 and signal-side-only modes.
+- Added `ESP32C3_ADS1299_SRB2_REFERENCE` as the dedicated SRB2 firmware entry point.
 - Added a repeating READY banner until the first host command so a late-opened serial monitor is not blank.
 - Preserved raw ADS polarity (`SRB2-INxN`) and left any display inversion to the GUI layer.
 
@@ -81,10 +81,10 @@
 - Added batched ring-buffer writes, linked X axes, visible-range clipping and automatic downsampling.
 - Increased waveform painting to 20 FPS while reducing PSD scheduling to 1 Hz.
 
-## Omni-Intelligence visual system
+## 全域智能视觉系统
 
-- Reused the supplied Omni-Intelligence bilingual logo and application mark.
-- Replaced the blue clinical theme with the Omni white, black and orange palette.
+- Reused the supplied 全域智能 logo and application mark.
+- Applied the 全域智能 white, black and orange visual system.
 - Changed waveform and PSD canvases to signal-black with orange active traces.
 - Added orange selection, navigator, tabs, status and dialog accents.
 

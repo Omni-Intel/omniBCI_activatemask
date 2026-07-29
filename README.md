@@ -1,6 +1,6 @@
-# 全域智能 Omni-Intelligence ADS1299 EEG 工作站
+# 全域智能 ADS1299 EEG 工作站
 
-这是一个面向 ADS1299 + ESP32-C3 的原生 Python 脑电采集、BIN 录制和离线回放工具。界面使用全域智能 Omni-Intelligence 白/黑/橙品牌视觉与紧凑的临床脑电走纸布局，保留真实微伏标定、原始数据诊断、滤波显示副本和 MNE 联动能力。
+这是一个面向 ADS1299 + ESP32-C3 的原生 Python 脑电采集、BIN 录制和离线回放工具。界面使用全域智能白/黑/橙品牌视觉与紧凑的专业脑电走纸布局，保留真实微伏标定、原始数据诊断、滤波显示副本和 MNE 联动能力。
 
 ## 主要功能
 
@@ -98,11 +98,11 @@ py -3 ads1299_eeg_gui_native.py
 
 默认采样率为 250 Hz。微伏换算由 `VREF=4.5 V`、PGA 和 ADS1299 24-bit 量程计算。
 
-## OpenBCI 风格阻抗检测
+## 电极阻抗检测
 
 串口控制栏的“阻抗检测”可对 CH1～CH8 分别显示电极阻抗和接触质量。固件使用
 ADS1299 原生 `6 nA @ 31.25 Hz` 交流导联脱落激励；SRB1 接线自动写
-`LOFF_SENSP`，SRB2/OpenBCI 接线自动写 `LOFF_SENSN`。
+`LOFF_SENSP`，SRB2 公共参考接线自动写 `LOFF_SENSN`。
 
 ```text
 A9 MASK
@@ -137,7 +137,7 @@ GUI 会读取并校验 ADS1299 的 `LOFF`、`LOFF_SENSP`、`LOFF_SENSN` 和
 
 ### SRB2 短接校准
 
-SRB2/OpenBCI 模式使用 `LOFF_SENSN`，信号电极接 `INxN`，公共参考接
+SRB2 公共参考模式使用 `LOFF_SENSN`，信号电极接 `INxN`，公共参考接
 `SRB2`。在外部接口短接 `N1` 与 `SRB2` 时，电流经过两只 2.2 kΩ电阻，
 未补偿理论读数为 4.40 kΩ。不要用 `N1–P1` 短接代替 `N1–SRB2` 回路校准。
 
@@ -149,7 +149,7 @@ SRB2/OpenBCI 模式使用 `LOFF_SENSN`，信号电极接 `INxN`，公共参考�
 A6 0D XX
 ```
 
-`XX` 的 bit0–bit7 分别对应 CH1–CH8。GUI 和固件都会先用当前启用通道掩码过滤 `XX`。OpenBCI 默认 `BIAS P+N` 模式会把 mask 同时写入 `BIAS_SENSP` 和 `BIAS_SENSN`；“仅信号侧”模式在 SRB1 下只写 `BIAS_SENSP`，在 SRB2 下只写 `BIAS_SENSN`。
+`XX` 的 bit0–bit7 分别对应 CH1–CH8。GUI 和固件都会先用当前启用通道掩码过滤 `XX`。`BIAS P+N` 模式会把 mask 同时写入 `BIAS_SENSP` 和 `BIAS_SENSN`；“仅信号侧”模式在 SRB1 下只写 `BIAS_SENSP`，在 SRB2 下只写 `BIAS_SENSN`。
 
 ## 逐通道硬件设置
 
@@ -193,16 +193,16 @@ GUI 修改 BIAS、PGA、通道电源或 SRB2 时，不再仅凭复选框推定�
 状态栏会显示实际读回的 P/N mask。没有 ACK、ACK 校验错误或 ADS1299
 寄存器不匹配都会弹出“写入/校验失败”，不会再显示成已成功。
 
-## OpenBCI 前端参考与 BIAS 接法
+## SRB2 公共参考与 BIAS 接法
 
 ```text
-测量电极 CH1～CH8 -> IN1N～IN8N（OpenBCI N1P～N8P 排针）
+测量电极 CH1～CH8 -> IN1N～IN8N
 公共参考电极      -> SRB2
 BIAS 电极         -> BIASOUT 板级输出
 SRB1              -> 关闭
 ```
 
-这是 OpenBCI 官方 EEG 接法：有效通道 `CHnSET.SRB2=1`，`MISC1.SRB1=0`，原始极性为 `SRB2-INxN`。OpenBCI 默认 Bias Include 会把有效通道同时加入 P/N BIAS；GUI 仍保留“仅信号侧”模式用于对比。禁用、开路、饱和或接触不良的通道不应加入 BIAS 求和网络。
+SRB2 公共参考接法要求有效通道 `CHnSET.SRB2=1`、`MISC1.SRB1=0`，原始极性为 `SRB2-INxN`。`BIAS P+N` 会把有效通道同时加入 P/N BIAS；GUI 仍保留“仅信号侧”模式用于对比。禁用、开路、饱和或接触不良的通道不应加入 BIAS 求和网络。
 
 ## 实时显示性能
 
@@ -233,10 +233,10 @@ run.bat                     直接启动
 firmware/                   ESP32-C3 + ADS1299 固件
   ESP32C3_ADS1299_CH1_5_DEFAULT_PONLY_BIAS_GUI_PATCHED/
                             GUI 配套双参考固件，支持 A8 切换 SRB1/SRB2
-  ESP32C3_ADS1299_OPENBCI_SRB2_REFERENCE/
-                            OpenBCI 接线专用入口；默认 SRB2、BIAS P+N
+  ESP32C3_ADS1299_SRB2_REFERENCE/
+                            SRB2 公共参考入口；默认 SRB2、BIAS P+N
   ESP32C3_ADS1299_SRB1_PONLY_REFERENCE/
-                            固定 SRB1 旧硬件专用；不要用于 OpenBCI 接线
+                            固定 SRB1 硬件专用；不要用于 SRB2 接线
 assets/                     全域智能 Logo 与应用图标
 recordings/                 测试 BIN、CSV 和分析结果
   nme/                      导入 BIN 后自动生成的 MNE 交换 CSV（单位 V）

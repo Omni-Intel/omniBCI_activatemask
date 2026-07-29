@@ -92,11 +92,11 @@ LEAD_OFF_SERIES_SRB2_KOHM = 4.40
 REFERENCE_SRB1 = 0
 REFERENCE_SRB2 = 1
 REFERENCE_ITEMS = [
-    ("SRB2 / OpenBCI（信号接 INxN）", REFERENCE_SRB2),
+    ("SRB2 公共参考（信号接 INxN）", REFERENCE_SRB2),
     ("SRB1 全局参考（信号接 INxP）", REFERENCE_SRB1),
 ]
 MODE_ITEMS = [
-    ("OpenBCI EEG + BIAS P+N", b"n", 0),
+    ("EEG + BIAS P+N", b"n", 0),
     ("EEG + BIAS 仅信号侧", b"p", 1),
     ("EEG + BIAS off", b"o", 2),
     ("ADS internal short", b"q", 3),
@@ -351,16 +351,15 @@ class PsdWorker(QtCore.QRunnable):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ADS1299 Native Python EEG GUI - P0+P1 filtering")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站")
         self.resize(1500, 920)
 
         self.gain = 24  # legacy/global command value
         self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
         self.channel_enabled = np.array([True] * 5 + [False] * 3, dtype=bool)
         self.channel_bias = np.array([True] * 5 + [False] * 3, dtype=bool)
-        # OpenBCI-style default: measurement electrodes on INxN and the
-        # common reference electrode on SRB2. SRB1 remains selectable for
-        # boards that physically route the SRB1 pin.
+        # Default: measurement electrodes on INxN and the common reference
+        # electrode on SRB2. SRB1 remains selectable for boards that route it.
         self.reference_mode = REFERENCE_SRB2
         self.channel_srb2 = np.array([True] * 5 + [False] * 3, dtype=bool)
         self.lsb_uv = self.calc_lsb_uv()
@@ -445,7 +444,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_nav_update = 0.0
         self.reset_processing_state()
 
-        self._build_clinical_ui()
+        self._build_omni_ui()
         self.refresh_ports()
 
         self.serial_timer = QtCore.QTimer(self)
@@ -496,7 +495,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn = QtWidgets.QPushButton("停止")
         self.stop_btn.clicked.connect(self.stop_stream)
         self.impedance_btn = QtWidgets.QPushButton("阻抗检测")
-        self.impedance_btn.setToolTip("OpenBCI 风格：ADS1299 以 6 nA、31.25 Hz 激励并实时估算电极阻抗")
+        self.impedance_btn.setToolTip("ADS1299 以 6 nA、31.25 Hz 激励并实时估算电极阻抗")
         self.impedance_btn.clicked.connect(self.open_impedance_dialog)
         controls.addWidget(self.stop_btn, row, 5)
 
@@ -644,12 +643,12 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_split.addWidget(self.info_text)
         bottom_split.setSizes([1000, 480])
 
-    def _build_clinical_ui(self):
-        """Compact clinical-review layout; acquisition diagnostics remain available."""
+    def _build_omni_ui(self):
+        """全域智能 compact review layout with acquisition diagnostics."""
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
         pg.setConfigOptions(antialias=False, background=OMNI_BLACK, foreground="#d7d7d7")
-        self.setWindowTitle("全域智能 Omni-Intelligence | ADS1299 EEG 工作站")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)
@@ -703,12 +702,12 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self.logo_label = QtWidgets.QLabel()
-        self.logo_label.setToolTip("全域智能 Omni-Intelligence")
+        self.logo_label.setToolTip("全域智能")
         self.logo_label.setFixedSize(220, 54)
         self.logo_label.setAlignment(QtCore.Qt.AlignCenter)
         logo = QtGui.QPixmap(str(LOGO_PATH))
         if logo.isNull():
-            self.logo_label.setText("全域智能 | OMNI")
+            self.logo_label.setText("全域智能")
             self.logo_label.setStyleSheet("color:#ff5a01;font-size:18px;font-weight:800;")
         else:
             self.logo_label.setPixmap(logo.scaled(
@@ -777,7 +776,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self.stop_stream)
         self.impedance_btn = QtWidgets.QPushButton("阻抗检测")
         self.impedance_btn.setToolTip(
-            "OpenBCI 风格：ADS1299 以 6 nA、31.25 Hz 激励并实时估算电极阻抗"
+            "ADS1299 以 6 nA、31.25 Hz 激励并实时估算电极阻抗"
         )
         self.impedance_btn.clicked.connect(self.open_impedance_dialog)
         self.reference_combo = QtWidgets.QComboBox()
@@ -2019,7 +2018,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("OpenBCI 风格电极阻抗检测")
+        dialog.setWindowTitle("电极阻抗检测")
         dialog.setMinimumWidth(520)
         layout = QtWidgets.QVBoxLayout(dialog)
         note = QtWidgets.QLabel(

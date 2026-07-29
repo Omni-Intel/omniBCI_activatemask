@@ -1,12 +1,12 @@
 /*
   ESP32-C3 + ADS1299：SRB1 EEG 诊断数据流（软件 SPI，供自定义 MATLAB 窗口读取）
 
-  这版的目标不是伪装成 OpenBCI Cyton，而是把“采集链路是否可靠”说清楚：
+  本固件目标是把采集链路状态完整、可验证地呈现出来：
     1. 完全保留软件 SPI，不调用 SPI.begin()；
     2. MCU 只发送 ADS1299 原始码，不在 MCU 上滤波；
     3. 每帧包含 32-bit 序号、ADS STATUS、读取耗时、模式和 CRC16；
     4. 上位机可以分别统计：串口 CRC 错、序号丢失、ADS STATUS 错位；
-    5. 提供 OpenBCI 风格 SRB1 配置，以及短路噪声和内部方波诊断模式；
+    5. 提供 SRB1 配置，以及短路噪声和内部方波诊断模式；
     6. 数据流中绝不插入状态文字，避免周期 impulse 和解析错位。
 
   默认上电配置：CH1-CH5 开启，CH6-CH8 禁用，SRB1 on，BIAS P-only：SENSP=0x1F, SENSN=0x00。
@@ -228,7 +228,7 @@ volatile uint8_t currentGainCode = CH_GAIN_CODE_24;
 // GUI 可动态修改的 BIAS_SENSP mask；默认 CH1-CH5。
 // 这是逻辑 BIAS mask；SRB1 路由到 SENSP，SRB2 路由到 SENSN。
 volatile uint8_t currentBiasSensPMask = ADS_ACTIVE_CH_MASK;
-// Logical signal-electrode mask used by OpenBCI-style impedance measurement.
+// Logical signal-electrode mask used by AC impedance measurement.
 // SRB1 routes it to LOFF_SENSP; SRB2 routes it to LOFF_SENSN.
 volatile uint8_t currentLeadOffMask = 0x00;
 
@@ -1276,7 +1276,7 @@ void printReadyBanner() {
   Serial.printf(
     "%s - reference=%s, mode=%s, gain=%ux\n",
     ADS_FIRMWARE_BANNER,
-    currentReferenceMode == REFERENCE_SRB2 ? "SRB2/OpenBCI" : "SRB1",
+    currentReferenceMode == REFERENCE_SRB2 ? "SRB2" : "SRB1",
     currentMode == MODE_EEG_BIAS_PN ? "BIAS_P+N" :
       (currentMode == MODE_EEG_BIAS_P_ONLY ? "BIAS_SIGNAL_SIDE" : "DIAGNOSTIC"),
     (unsigned)currentGain

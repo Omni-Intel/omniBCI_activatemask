@@ -1,12 +1,12 @@
 /*
   ESP32-C3 + ADS1299：SRB1 EEG 诊断数据流（软件 SPI，供自定义 MATLAB 窗口读取）
 
-  这版的目标不是伪装成 OpenBCI Cyton，而是把“采集链路是否可靠”说清楚：
+  本固件目标是把采集链路状态完整、可验证地呈现出来：
     1. 完全保留软件 SPI，不调用 SPI.begin()；
     2. MCU 只发送 ADS1299 原始码，不在 MCU 上滤波；
     3. 每帧包含 32-bit 序号、ADS STATUS、读取耗时、模式和 CRC16；
     4. 上位机可以分别统计：串口 CRC 错、序号丢失、ADS STATUS 错位；
-    5. 提供 OpenBCI 风格 SRB1 配置，以及短路噪声和内部方波诊断模式；
+    5. 提供 SRB1 配置，以及短路噪声和内部方波诊断模式；
     6. 数据流中绝不插入状态文字，避免周期 impulse 和解析错位。
 
   默认上电配置：CH1-CH5 开启，CH6-CH8 禁用，SRB1 on，BIAS P-only：SENSP=0x1F, SENSN=0x00。
