@@ -247,6 +247,11 @@ CHANGELOG_P0P1.md           变更记录
 
 ## 注意事项
 
+- 工具栏“导出 BDF/FIF…”可将已导入的 BIN 或刚结束的实时采集转换为
+  BDF+、MNE FIF，或同时生成两种格式。点击“停止”或导入 BIN 后也会询问
+  是否立即转换。BDF 使用 24-bit 数字范围与 µV 物理单位；FIF 保留
+  `BAD_frame` 注释。
+
 - GUI 中的 PGA 必须与 ADS1299 固件实际 PGA 一致，否则微伏数值会按错误比例换算。
 - 自动MNE/FIF导出使用未滤波原始微伏数据；CRC坏帧会作为`BAD_frame`注释写入FIF。
 - SHORTED/TEST 模式主要用于原始链路诊断，不应作为人体 EEG 或 Alpha 结果解释。
