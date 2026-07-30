@@ -73,6 +73,7 @@ except Exception as exc:  # pragma: no cover
 
 FS = 250
 CHANNELS = 8
+MNE_CHANNEL_TYPE = "eeg"
 BAUD = 921600
 FRAME_BYTES = 48
 BYTES_PER_SECOND = FRAME_BYTES * FS
@@ -691,6 +692,8 @@ class MainWindow(QtWidgets.QMainWindow):
         export_action = file_menu.addAction("导出 CSV…")
         export_action.setShortcut("Ctrl+Shift+S")
         export_action.triggered.connect(self.export_csv)
+        format_action = file_menu.addAction("导出 BDF/FIF…")
+        format_action.triggered.connect(self.export_biosignal_formats)
         file_menu.addSeparator()
         file_menu.addAction("退出", self.close, QtGui.QKeySequence.Quit)
         view_menu = self.menuBar().addMenu("视图")
@@ -699,7 +702,9 @@ class MainWindow(QtWidgets.QMainWindow):
         acquire_menu = self.menuBar().addMenu("采集")
         acquire_menu.addAction("连接/断开串口", self.toggle_connection)
         acquire_menu.addAction("开始采集并保存 BIN", self.start_stream)
-        acquire_menu.addAction("停止采集", self.stop_stream)
+        acquire_menu.addAction(
+            "停止采集", lambda: self.stop_stream(offer_export=True)
+        )
 
         toolbar = self.addToolBar("EEG 工具")
         toolbar.setMovable(False)
@@ -738,6 +743,7 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(open_action)
         toolbar.addAction(export_action)
+        toolbar.addAction(format_action)
         toolbar.addSeparator()
 
         self.filter_check = QtWidgets.QCheckBox("滤波后")
@@ -794,7 +800,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn = QtWidgets.QPushButton("开始采集")
         self.start_btn.clicked.connect(self.start_stream)
         self.stop_btn = QtWidgets.QPushButton("停止")
-        self.stop_btn.clicked.connect(self.stop_stream)
+        self.stop_btn.clicked.connect(lambda: self.stop_stream(offer_export=True))
         self.impedance_btn = QtWidgets.QPushButton("阻抗检测")
         self.impedance_btn.setToolTip(
             "ADS1299 以 6 nA、31.25 Hz 激励并实时估算电极阻抗"
@@ -1535,6 +1541,134 @@ class MainWindow(QtWidgets.QMainWindow):
             np.savetxt(path, matrix, delimiter=",", header=header, comments="", fmt="%.7g")
             self.set_status(f"已导出 {path}")
 
+    def export_biosignal_formats(self, source_path=None):
+        """Interactively export the imported or just-recorded signal."""
+        if isinstance(source_path, bool):
+            source_path = None
+        if self.streaming:
+            QtWidgets.QMessageBox.information(
+                self, "导出 BDF/FIF", "请先停止实时采集，再选择导出格式。"
+            )
+            return
+        try:
+            if source_path:
+                self._load_bin_path(str(source_path))
+            elif self.offline_uv is None:
+                candidate = Path(self.raw_path) if self.raw_path else None
+                if candidate and candidate.exists() and candidate.stat().st_size:
+                    self._load_bin_path(str(candidate))
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self, "导出 BDF/FIF", "请先导入 BIN 或完成一次实时采集。"
+                    )
+                    return
+
+            choices = ["BDF + MNE FIF", "BDF", "MNE FIF"]
+            choice, ok = QtWidgets.QInputDialog.getItem(
+                self,
+                "选择导出格式",
+                "请选择要生成的文件格式：",
+                choices,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            source = Path(getattr(self, "loaded_path", self.raw_path or "ADS1299.bin"))
+            output_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "选择导出目录",
+                str(source.parent),
+            )
+            if not output_dir:
+                return
+            output_root = Path(output_dir)
+            output_root.mkdir(parents=True, exist_ok=True)
+            stem = source.stem
+            written = []
+            if "BDF" in choice:
+                bdf_path = output_root / f"{stem}.bdf"
+                self.save_bdf(bdf_path)
+                written.append(bdf_path)
+            if "FIF" in choice:
+                fif_path = output_root / f"{stem}_raw.fif"
+                self.build_mne_raw().save(
+                    fif_path, overwrite=True, fmt="double", verbose="ERROR"
+                )
+                written.append(fif_path)
+            names = "\n".join(str(path) for path in written)
+            self.set_status(f"已导出：{', '.join(path.name for path in written)}")
+            QtWidgets.QMessageBox.information(
+                self, "导出完成", f"已生成：\n{names}"
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "导出 BDF/FIF 失败", str(exc))
+
+    def save_bdf(self, path: Path):
+        """Write the unfiltered input-referred signal as 24-bit BDF+."""
+        if self.offline_uv is None:
+            raise RuntimeError("没有可导出的采样数据。")
+        try:
+            import pyedflib
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 BDF 依赖 pyedflib，请运行：py -3 -m pip install pyedflib"
+            ) from exc
+
+        path = Path(path)
+        data = np.asarray(self.offline_uv, dtype=np.float64)
+        writer = pyedflib.EdfWriter(
+            str(path),
+            CHANNELS,
+            file_type=pyedflib.FILETYPE_BDFPLUS,
+        )
+        try:
+            headers = []
+            for ch in range(CHANNELS):
+                finite = data[ch][np.isfinite(data[ch])]
+                peak = float(np.max(np.abs(finite))) if finite.size else 1.0
+                physical_peak = max(100, int(np.ceil(peak * 1.1)))
+                headers.append({
+                    "label": f"CH{ch + 1}",
+                    "dimension": "uV",
+                    "sample_frequency": FS,
+                    "physical_min": -physical_peak,
+                    "physical_max": physical_peak,
+                    "digital_min": -8388608,
+                    "digital_max": 8388607,
+                    "transducer": "ADS1299",
+                    "prefilter": "Raw, unfiltered",
+                })
+            writer.setSignalHeaders(headers)
+            writer.setPatientCode("")
+            writer.setEquipment("ADS1299")
+            writer.writeSamples([
+                np.nan_to_num(data[ch], nan=0.0, posinf=0.0, neginf=0.0)
+                for ch in range(CHANNELS)
+            ])
+            remainder = data.shape[1] % FS
+            if remainder:
+                writer.writeAnnotation(
+                    float(data.shape[1]) / FS,
+                    float(FS - remainder) / FS,
+                    "BDF_padding",
+                )
+
+            valid = np.asarray(self.offline_valid, dtype=bool)
+            if valid.size == data.shape[1] and not valid.all():
+                padded = np.r_[False, ~valid, False].astype(np.int8)
+                edges = np.diff(padded)
+                starts = np.flatnonzero(edges == 1)
+                ends = np.flatnonzero(edges == -1)
+                for start, end in zip(starts, ends):
+                    writer.writeAnnotation(
+                        float(start) / FS,
+                        float(end - start) / FS,
+                        "BAD_frame",
+                    )
+        finally:
+            writer.close()
+
     def build_mne_raw(self):
         """Build an unfiltered MNE RawArray from the currently imported BIN."""
         if self.offline_uv is None:
@@ -1543,7 +1677,9 @@ class MainWindow(QtWidgets.QMainWindow):
         import mne
 
         channel_names = [f"CH{i}" for i in range(1, CHANNELS + 1)]
-        info = mne.create_info(channel_names, FS, ch_types=["eeg"] * CHANNELS)
+        info = mne.create_info(
+            channel_names, FS, ch_types=[MNE_CHANNEL_TYPE] * CHANNELS
+        )
         info["line_freq"] = 50.0
         info["description"] = (
             f"ADS1299 raw BIN import: "
@@ -2308,10 +2444,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.close_raw_file()
             QtWidgets.QMessageBox.critical(self, "开始失败", str(exc))
 
-    def stop_stream(self):
+    def stop_stream(self, offer_export: bool = False):
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
             return
+        was_streaming = bool(self.streaming)
+        finished_path = self.raw_path
         if self.ser and self.ser.is_open:
             try:
                 self.ser.write(b"s")
@@ -2319,6 +2457,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         self.streaming = False
         self.close_raw_file()
+        if (
+            offer_export
+            and was_streaming
+            and finished_path
+            and Path(finished_path).exists()
+            and Path(finished_path).stat().st_size
+        ):
+            self.set_status(f"采集已停止，原始 BIN：{finished_path}")
+            if QtWidgets.QMessageBox.question(
+                self,
+                "采集完成",
+                "原始 BIN 已保存。是否现在转换为 BDF 或 MNE FIF？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            ) == QtWidgets.QMessageBox.Yes:
+                self.export_biosignal_formats(finished_path)
 
     def close_raw_file(self):
         if self.raw_file:
@@ -2552,58 +2706,61 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.streaming = False
 
     # ---------------- bin import/offline ----------------
+    def _load_bin_path(self, path: str):
+        """Load one raw BIN into the shared offline/export data model."""
+        raw = Path(path).read_bytes()
+        parser = AdsFrameParser(self.channel_lsb_uv)
+        frames = parser.feed(raw)
+        if not frames:
+            raise RuntimeError("没有解析出有效 48-byte 帧。")
+        self.reset_processing_state()
+        self.offline_uv = np.stack([f.uv for f in frames], axis=1).astype(np.float32)
+        self.loaded_path = str(path)
+        self.offline_valid = np.array([f.valid for f in frames], dtype=bool)
+        self.offline_seq = np.array([f.sequence for f in frames], dtype=np.uint32)
+        self.offline_mode = np.array([f.mode for f in frames], dtype=np.uint8)
+        self.current_mode = int(self.offline_mode[-1])
+        if self.current_mode in (0, 1, 2):
+            self.set_reference_mode_local(
+                REFERENCE_SRB1 if (frames[-1].flags & 0x80) else REFERENCE_SRB2
+            )
+        self.offline_end = self.offline_uv.shape[1]
+        self.offline_slider.setEnabled(True)
+        self.offline_slider.setRange(1, self.offline_end)
+        self.offline_slider.setValue(self.offline_end)
+        self.offline_label.setText(
+            f"{Path(path).name}: {self.offline_end / FS:.1f}s"
+        )
+        if hasattr(self, "file_status"):
+            self.file_status.setText(
+                f"{Path(path).name}  |  {FS} Hz  |  "
+                f"有效帧 {int(np.sum(self.offline_valid))}/{self.offline_end}"
+            )
+        self.update_fast_plots()
+        self.update_psd_and_info()
+        return parser
+
     def import_bin(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "导入 raw bin", "", "BIN files (*.bin);;All files (*.*)")
         if not path:
             return
         try:
             self.stop_stream()
-            raw = Path(path).read_bytes()
-            parser = AdsFrameParser(self.channel_lsb_uv)
-            frames = parser.feed(raw)
-            if not frames:
-                QtWidgets.QMessageBox.warning(self, "导入失败", "没有解析出有效 48-byte 帧。")
-                return
-            self.reset_processing_state()
-            self.offline_uv = np.stack([f.uv for f in frames], axis=1).astype(np.float32)
-            self.loaded_path = path
-            self.offline_valid = np.array([f.valid for f in frames], dtype=bool)
-            self.offline_seq = np.array([f.sequence for f in frames], dtype=np.uint32)
-            self.offline_mode = np.array([f.mode for f in frames], dtype=np.uint8)
-            self.current_mode = int(self.offline_mode[-1])
-            if self.current_mode in (0, 1, 2):
-                self.set_reference_mode_local(
-                    REFERENCE_SRB1 if (frames[-1].flags & 0x80) else REFERENCE_SRB2
-                )
-            self.offline_end = self.offline_uv.shape[1]
-            self.offline_slider.setEnabled(True)
-            self.offline_slider.setRange(1, self.offline_end)
-            self.offline_slider.setValue(self.offline_end)
-            self.offline_label.setText(f"{Path(path).name}: {self.offline_end/FS:.1f}s")
-            if hasattr(self, "file_status"):
-                self.file_status.setText(
-                    f"{Path(path).name}  |  {FS} Hz  |  有效帧 {int(np.sum(self.offline_valid))}/{self.offline_end}"
-                )
-            try:
-                mne_csv_path, fif_path = self.save_mne_exports()
-                valid_count = int(np.sum(self.offline_valid))
-                total_count = int(self.offline_uv.shape[1])
-                self.set_status(
-                    f"已导入 {path}，有效帧 {valid_count}/{total_count}，"
-                    f"CRC坏帧 {parser.crc_bad}；"
-                    f"已保存 {mne_csv_path.name} 和 {fif_path.name}。"
-                )
-            except Exception as export_exc:
-                self.set_status(
-                    f"已导入 {path}，但自动保存 MNE/FIF 失败：{export_exc}"
-                )
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "MNE/FIF 自动导出失败",
-                    f"BIN 已正常导入，但自动导出失败：\n{export_exc}",
-                )
-            self.update_fast_plots()
-            self.update_psd_and_info()
+            parser = self._load_bin_path(path)
+            valid_count = int(np.sum(self.offline_valid))
+            total_count = int(self.offline_uv.shape[1])
+            self.set_status(
+                f"已导入 {path}，有效帧 {valid_count}/{total_count}，"
+                f"CRC坏帧 {parser.crc_bad}。"
+            )
+            if QtWidgets.QMessageBox.question(
+                self,
+                "转换采集文件",
+                "BIN 已导入。是否现在转换为 BDF 或 MNE FIF？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            ) == QtWidgets.QMessageBox.Yes:
+                self.export_biosignal_formats()
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "导入失败", str(exc))
 
