@@ -116,6 +116,10 @@ OMNI_ORANGE = "#ff5a01"
 OMNI_ORANGE_DARK = "#c94700"
 OMNI_BLACK = "#080808"
 OMNI_PAPER = "#f6f7f9"
+CHANNEL_COLORS = [
+    "#7B61FF", "#2478FF", "#00A6D6", "#00A878",
+    "#8EBB2A", "#E0A800", "#F47A22", "#E84545",
+]
 
 
 @dataclass
@@ -624,7 +628,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.psd_plot.showGrid(x=True, y=True, alpha=0.25)
         self.psd_plot.setLabel("bottom", "Frequency", units="Hz")
         self.psd_plot.setLabel("left", "PSD", units="dB uV^2/Hz")
-        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen(width=1.5))
+        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen("#111111", width=2.2))
         self.psd_plot.addLine(x=8, pen=pg.mkPen(style=QtCore.Qt.DashLine))
         self.psd_plot.addLine(x=13, pen=pg.mkPen(style=QtCore.Qt.DashLine))
         top_split.addWidget(self.psd_plot)
@@ -647,7 +651,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """全域智能 compact review layout with acquisition diagnostics."""
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
-        pg.setConfigOptions(antialias=False, background=OMNI_BLACK, foreground="#d7d7d7")
+        pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#424245")
         self.setWindowTitle("全域智能 | ADS1299 EEG 工作站")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
@@ -705,14 +709,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logo_label.setToolTip("全域智能")
         self.logo_label.setFixedSize(220, 54)
         self.logo_label.setAlignment(QtCore.Qt.AlignCenter)
-        logo = QtGui.QPixmap(str(LOGO_PATH))
-        if logo.isNull():
-            self.logo_label.setText("全域智能")
-            self.logo_label.setStyleSheet("color:#ff5a01;font-size:18px;font-weight:800;")
-        else:
-            self.logo_label.setPixmap(logo.scaled(
-                212, 50, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-            ))
+        # Compose the EEG identity inside the original 220 x 54 logo slot so
+        # the P0P1 toolbar geometry and every surrounding control stay put.
+        logo_canvas = QtGui.QPixmap(220, 54)
+        logo_canvas.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(logo_canvas)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        mark = QtGui.QPixmap(str(APP_ICON_PATH))
+        if not mark.isNull():
+            painter.drawPixmap(
+                4, 4, mark.scaled(
+                    46, 46, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+                )
+            )
+        painter.setPen(QtGui.QColor("#1d1d1f"))
+        painter.setFont(QtGui.QFont("Microsoft YaHei UI", 12, QtGui.QFont.Bold))
+        painter.drawText(QtCore.QRect(57, 5, 155, 25), QtCore.Qt.AlignLeft, "全域智能")
+        painter.setPen(QtGui.QColor(OMNI_ORANGE))
+        painter.setFont(QtGui.QFont("Microsoft YaHei UI", 9, QtGui.QFont.DemiBold))
+        painter.drawText(
+            QtCore.QRect(57, 28, 155, 20),
+            QtCore.Qt.AlignLeft,
+            "脑电测试 · EEG",
+        )
+        painter.end()
+        self.logo_label.setPixmap(logo_canvas)
         toolbar.addWidget(self.logo_label)
         toolbar.addSeparator()
         toolbar.addAction(open_action)
@@ -855,7 +876,7 @@ class MainWindow(QtWidgets.QMainWindow):
         single_header.addWidget(back_to_all)
         single_layout.addLayout(single_header)
         self.single_plot = pg.PlotWidget(axisItems={"bottom": ClockAxisItem(orientation="bottom")})
-        self.single_plot.setBackground(OMNI_BLACK)
+        self.single_plot.setBackground("#ffffff")
         self.single_plot.setMenuEnabled(False)
         self.single_plot.setMouseEnabled(x=True, y=False)
         self.single_plot.showGrid(x=True, y=True, alpha=0.22)
@@ -865,7 +886,7 @@ class MainWindow(QtWidgets.QMainWindow):
             y=0, pen=pg.mkPen("#56616b", width=1)
         )
         self.single_curve = self.single_plot.plot(
-            pen=pg.mkPen(OMNI_ORANGE, width=1.5), connect="finite"
+            pen=pg.mkPen(CHANNEL_COLORS[0], width=2.4), connect="finite"
         )
         self.single_curve.setClipToView(True)
         self.single_curve.setDownsampling(auto=True, method="peak")
@@ -879,8 +900,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav_plot.hideAxis("left")
         self.nav_plot.setMouseEnabled(x=True, y=False)
         self.nav_plot.getPlotItem().setMenuEnabled(False)
-        self.nav_plot.setBackground(OMNI_BLACK)
-        self.nav_curve = self.nav_plot.plot(pen=pg.mkPen("#c9c9c9", width=1))
+        self.nav_plot.setBackground("#ffffff")
+        self.nav_curve = self.nav_plot.plot(pen=pg.mkPen("#86868b", width=1))
         self.nav_region = pg.LinearRegionItem(values=(0, 10), movable=True,
             brush=pg.mkBrush(255, 90, 1, 45), pen=pg.mkPen(OMNI_ORANGE, width=1.5))
         self.nav_region.sigRegionChanged.connect(self._nav_region_changed)
@@ -946,7 +967,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Each channel gets its own PlotItem and y-range.  This removes the
         # artificial lane offsets and lets every channel use its own amplitude.
         self.wave_widget = pg.GraphicsLayoutWidget()
-        self.wave_widget.setBackground(OMNI_BLACK)
+        self.wave_widget.setBackground("#ffffff")
         self.channel_plots = []
         self.stack_curves = []
         for ch in range(CHANNELS):
@@ -961,7 +982,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.hideAxis("bottom")
             else:
                 plot.setLabel("bottom", "时间", units="s")
-            curve = plot.plot(pen=pg.mkPen(OMNI_ORANGE if ch == 0 else "#d7d7d7", width=1.0),
+            curve = plot.plot(pen=pg.mkPen(CHANNEL_COLORS[ch], width=2.0),
                               connect="finite")
             curve.setClipToView(True)
             curve.setDownsampling(auto=True, method="peak")
@@ -999,12 +1020,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_btn = QtWidgets.QPushButton(); self.closed_btn = QtWidgets.QPushButton()
         self.time_plot = pg.PlotWidget(); self.time_curve = self.time_plot.plot()
         self.psd_plot = pg.PlotWidget()
-        self.psd_plot.setBackground(OMNI_BLACK)
+        self.psd_plot.setBackground("#ffffff")
         self.psd_plot.showGrid(x=True, y=True, alpha=0.22)
         self.psd_plot.setLabel("bottom", "频率", units="Hz")
         self.psd_plot.setLabel("left", "PSD", units="dB µV²/Hz")
         self.psd_plot.setTitle("Welch PSD | 等待数据")
-        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen(OMNI_ORANGE, width=1.6))
+        self.psd_curve = self.psd_plot.plot(pen=pg.mkPen("#111111", width=2.2))
         self.psd_plot.addLine(x=8, pen=pg.mkPen("#ff9a5c", style=QtCore.Qt.DashLine))
         self.psd_plot.addLine(x=13, pen=pg.mkPen("#ff9a5c", style=QtCore.Qt.DashLine))
         psd_page = QtWidgets.QWidget()
@@ -1172,8 +1193,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_channel(self, ch):
         self.channel_combo.setCurrentIndex(ch)
         for i, curve in enumerate(self.stack_curves):
-            curve.setPen(pg.mkPen(OMNI_ORANGE if i == ch else "#d7d7d7",
-                                  width=1.7 if i == ch else 1.0))
+            curve.setPen(pg.mkPen(
+                CHANNEL_COLORS[i],
+                width=3.0 if i == ch else 2.0,
+            ))
+        self.single_curve.setPen(pg.mkPen(CHANNEL_COLORS[ch], width=2.4))
         for i, button in enumerate(self.channel_buttons):
             button.setStyleSheet(
                 "QToolButton{"
