@@ -20,7 +20,7 @@
 
 - Importing a BIN now automatically builds an unfiltered eight-channel MNE
   `RawArray` in volts at 250 Hz.
-- Saves an MNE interchange CSV under `recordings/nme`.
+- Saves an MNE interchange CSV under `recordings/mne`.
 - Saves a native double-precision `*_raw.fif` under `recordings/fif`.
 - Creates both directories automatically and overwrites the matching derived
   files when the same BIN is imported again.

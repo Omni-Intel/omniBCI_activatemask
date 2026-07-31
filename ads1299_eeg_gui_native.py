@@ -334,7 +334,11 @@ class PsdWorkerSignals(QtCore.QObject):
 class PsdWorker(QtCore.QRunnable):
     """Run the relatively expensive PSD/quality calculation off the GUI thread."""
 
-    def __init__(self, owner, request_id: int, x: np.ndarray, valid: np.ndarray, seq: np.ndarray, mode: np.ndarray):
+    def __init__(
+        self, owner, request_id: int, x: np.ndarray, valid: np.ndarray,
+        seq: np.ndarray, mode: np.ndarray, sos_band: np.ndarray,
+        use_notch: bool,
+    ):
         super().__init__()
         self.owner = owner
         self.request_id = request_id
@@ -342,12 +346,17 @@ class PsdWorker(QtCore.QRunnable):
         self.valid = np.asarray(valid, dtype=bool)
         self.seq = np.asarray(seq, dtype=np.uint32)
         self.mode = np.asarray(mode, dtype=np.uint8)
+        self.sos_band = np.asarray(sos_band, dtype=float).copy()
+        self.use_notch = bool(use_notch)
         self.signals = PsdWorkerSignals()
 
     @QtCore.Slot()
     def run(self):
         try:
-            result = self.owner.compute_alpha_from_window(self.x, self.valid, self.seq, self.mode)
+            result = self.owner.compute_alpha_from_window(
+                self.x, self.valid, self.seq, self.mode,
+                sos_band=self.sos_band, use_notch=self.use_notch,
+            )
             self.signals.finished.emit(self.request_id, (result, self.x, self.valid))
         except Exception as exc:  # pragma: no cover - surfaced in the GUI
             self.signals.failed.emit(self.request_id, str(exc))
@@ -437,8 +446,6 @@ class MainWindow(QtWidgets.QMainWindow):
             notch_b, notch_a = signal.iirnotch(notch_hz, 30.0, fs=FS)
             notch_sections.append(signal.tf2sos(notch_b, notch_a))
         self.sos_notch = np.vstack(notch_sections)
-        # Alpha chain is independent of GUI display switches. Offline/window analysis uses zero phase.
-        self.sos_alpha_band = signal.butter(2, [1.0, 40.0], btype="bandpass", fs=FS, output="sos")
         # A lower beta keeps the spectrum stable without making changes appear
         # several seconds late (the old 0.85 setting felt stuck in live use).
         self.psd_smooth_beta = 0.65
@@ -568,8 +575,8 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(QtWidgets.QLabel("bin名"), row, 0)
         self.bin_name = QtWidgets.QLineEdit("eeg_%TIME%_gain%GAIN%.bin")
         controls.addWidget(self.bin_name, row, 1, 1, 4)
-        self.import_btn = QtWidgets.QPushButton("导入bin")
-        self.import_btn.clicked.connect(self.import_bin)
+        self.import_btn = QtWidgets.QPushButton("导入文件")
+        self.import_btn.clicked.connect(self.import_file)
         controls.addWidget(self.import_btn, row, 5)
         self.offline_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.offline_slider.setEnabled(False)
@@ -686,9 +693,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # File and view menus retain the existing acquisition functionality.
         file_menu = self.menuBar().addMenu("文件")
-        open_action = file_menu.addAction("打开 BIN…")
+        open_action = file_menu.addAction("导入文件…")
         open_action.setShortcut(QtGui.QKeySequence.Open)
-        open_action.triggered.connect(self.import_bin)
+        open_action.triggered.connect(self.import_file)
         export_action = file_menu.addAction("导出 CSV…")
         export_action.setShortcut("Ctrl+Shift+S")
         export_action.triggered.connect(self.export_csv)
@@ -742,8 +749,14 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(self.logo_label)
         toolbar.addSeparator()
         toolbar.addAction(open_action)
-        toolbar.addAction(export_action)
-        toolbar.addAction(format_action)
+        export_file_button = QtWidgets.QToolButton()
+        export_file_button.setText("导出文件…")
+        export_file_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        export_file_menu = QtWidgets.QMenu(export_file_button)
+        export_file_menu.addAction(export_action)
+        export_file_menu.addAction(format_action)
+        export_file_button.setMenu(export_file_menu)
+        toolbar.addWidget(export_file_button)
         toolbar.addSeparator()
 
         self.filter_check = QtWidgets.QCheckBox("滤波后")
@@ -897,6 +910,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.single_curve.setClipToView(True)
         self.single_curve.setDownsampling(auto=True, method="peak")
         single_layout.addWidget(self.single_plot, 1)
+        self.single_nav_plot = pg.PlotWidget()
+        self.single_nav_plot.setFixedHeight(62)
+        self.single_nav_plot.hideAxis("left")
+        self.single_nav_plot.setMouseEnabled(x=True, y=False)
+        self.single_nav_plot.getPlotItem().setMenuEnabled(False)
+        self.single_nav_plot.setBackground("#ffffff")
+        self.single_nav_curve = self.single_nav_plot.plot(
+            pen=pg.mkPen("#86868b", width=1)
+        )
+        self.single_nav_region = pg.LinearRegionItem(
+            values=(0, 10),
+            movable=True,
+            brush=pg.mkBrush(255, 90, 1, 45),
+            pen=pg.mkPen(OMNI_ORANGE, width=1.5),
+        )
+        self.single_nav_region.sigRegionChanged.connect(self._nav_region_changed)
+        self.single_nav_plot.addItem(self.single_nav_region)
+        self.single_nav_plot.setVisible(False)
+        single_layout.addWidget(self.single_nav_plot)
         self.single_tab_index = self.view_tabs.addTab(single_page, "单通道放大")
         self.view_tabs.currentChanged.connect(self.update_fast_plots)
         layout.addWidget(self.view_tabs, 1)
@@ -1122,10 +1154,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reset_psd_smoothing()
         self.update_fast_plots()
 
-    def _nav_region_changed(self):
+    def _nav_region_changed(self, region=None):
         if getattr(self, "_syncing_nav", False):
             return
-        lo, hi = self.nav_region.getRegion()
+        active_region = region if region is not None else self.nav_region
+        lo, hi = active_region.getRegion()
         self.win_spin.blockSignals(True); self.start_time_spin.blockSignals(True)
         self.win_spin.setValue(max(1, hi - lo)); self.start_time_spin.setValue(max(0, lo))
         self.win_spin.blockSignals(False); self.start_time_spin.blockSignals(False)
@@ -1532,14 +1565,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def export_csv(self):
         if self.offline_uv is None:
-            QtWidgets.QMessageBox.information(self, "导出 CSV", "请先打开一个 BIN 文件。")
+            QtWidgets.QMessageBox.information(self, "导出 CSV", "请先导入一个 BIN 或 BDF 文件。")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出 CSV", "", "CSV (*.csv)")
-        if path:
-            header = "time_s," + ",".join(f"CH{i}_uV" for i in range(1, 9))
-            matrix = np.column_stack((np.arange(self.offline_uv.shape[1]) / FS, self.offline_uv.T))
-            np.savetxt(path, matrix, delimiter=",", header=header, comments="", fmt="%.7g")
-            self.set_status(f"已导出 {path}")
+        recordings_dir = Path(__file__).resolve().parent / "recordings"
+        mne_dir = recordings_dir / "mne"
+        mne_dir.mkdir(parents=True, exist_ok=True)
+        source = Path(getattr(self, "loaded_path", self.raw_path or "ADS1299"))
+        path = mne_dir / f"{source.stem}_mne.csv"
+        header = "time_s," + ",".join(f"CH{i}_uV" for i in range(1, 9))
+        matrix = np.column_stack((np.arange(self.offline_uv.shape[1]) / FS, self.offline_uv.T))
+        np.savetxt(path, matrix, delimiter=",", header=header, comments="", fmt="%.7g")
+        self.set_status(f"已导出 {path}")
+        QtWidgets.QMessageBox.information(self, "导出完成", f"已生成：\n{path}")
 
     def export_biosignal_formats(self, source_path=None):
         """Interactively export the imported or just-recorded signal."""
@@ -1575,23 +1612,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if not ok:
                 return
             source = Path(getattr(self, "loaded_path", self.raw_path or "ADS1299.bin"))
-            output_dir = QtWidgets.QFileDialog.getExistingDirectory(
-                self,
-                "选择导出目录",
-                str(source.parent),
-            )
-            if not output_dir:
-                return
-            output_root = Path(output_dir)
-            output_root.mkdir(parents=True, exist_ok=True)
+            recordings_dir = Path(__file__).resolve().parent / "recordings"
+            bdf_dir = recordings_dir / "bdf"
+            fif_dir = recordings_dir / "fif"
+            bdf_dir.mkdir(parents=True, exist_ok=True)
+            fif_dir.mkdir(parents=True, exist_ok=True)
             stem = source.stem
             written = []
             if "BDF" in choice:
-                bdf_path = output_root / f"{stem}.bdf"
+                bdf_path = bdf_dir / f"{stem}.bdf"
                 self.save_bdf(bdf_path)
                 written.append(bdf_path)
             if "FIF" in choice:
-                fif_path = output_root / f"{stem}_raw.fif"
+                fif_path = fif_dir / f"{stem}_raw.fif"
                 self.build_mne_raw().save(
                     fif_path, overwrite=True, fmt="double", verbose="ERROR"
                 )
@@ -1670,9 +1703,9 @@ class MainWindow(QtWidgets.QMainWindow):
             writer.close()
 
     def build_mne_raw(self):
-        """Build an unfiltered MNE RawArray from the currently imported BIN."""
+        """Build an unfiltered MNE RawArray from the currently imported file."""
         if self.offline_uv is None:
-            raise RuntimeError("请先打开一个 BIN 文件。")
+            raise RuntimeError("请先导入一个 BIN 或 BDF 文件。")
 
         import mne
 
@@ -1682,8 +1715,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         info["line_freq"] = 50.0
         info["description"] = (
-            f"ADS1299 raw BIN import: "
-            f"{Path(getattr(self, 'loaded_path', 'unknown.bin')).name}"
+            f"ADS1299 GUI file import: "
+            f"{Path(getattr(self, 'loaded_path', 'unknown')).name}"
         )
         raw = mne.io.RawArray(
             self.offline_uv.astype(np.float64) * 1e-6,
@@ -1710,17 +1743,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def save_mne_exports(self) -> Tuple[Path, Path]:
         """Save automatic MNE interchange CSV and native FIF exports."""
         if self.offline_uv is None:
-            raise RuntimeError("请先打开一个 BIN 文件。")
+            raise RuntimeError("请先导入一个 BIN 或 BDF 文件。")
 
         recordings_dir = Path(__file__).resolve().parent / "recordings"
-        # Keep the directory spelling requested by the project owner.
-        nme_dir = recordings_dir / "nme"
+        mne_dir = recordings_dir / "mne"
         fif_dir = recordings_dir / "fif"
-        nme_dir.mkdir(parents=True, exist_ok=True)
+        mne_dir.mkdir(parents=True, exist_ok=True)
         fif_dir.mkdir(parents=True, exist_ok=True)
 
         source_stem = Path(getattr(self, "loaded_path", "ADS1299")).stem
-        mne_csv_path = nme_dir / f"{source_stem}_mne.csv"
+        mne_csv_path = mne_dir / f"{source_stem}_mne.csv"
         fif_path = fif_dir / f"{source_stem}_raw.fif"
 
         # MNE stores EEG in volts, so this interchange CSV deliberately uses V.
@@ -1746,7 +1778,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_mne_browser(self):
         if self.offline_uv is None:
-            QtWidgets.QMessageBox.information(self, "MNE 浏览器", "请先打开一个 BIN 文件。")
+            QtWidgets.QMessageBox.information(self, "MNE 浏览器", "请先导入一个 BIN 或 BDF 文件。")
             return
         try:
             self.build_mne_raw().plot(
@@ -1841,8 +1873,8 @@ class MainWindow(QtWidgets.QMainWindow):
         name = name.replace("%TIME%", stamp).replace("%GAIN%", str(self.gain))
         path = Path(name)
         if not path.is_absolute():
-            folder = Path.cwd() / "recordings"
-            folder.mkdir(exist_ok=True)
+            folder = Path(__file__).resolve().parent / "recordings" / "bin"
+            folder.mkdir(parents=True, exist_ok=True)
             path = folder / path
         path.parent.mkdir(parents=True, exist_ok=True)
         return str(path)
@@ -1951,16 +1983,30 @@ class MainWindow(QtWidgets.QMainWindow):
             result[:, ~view_valid] = np.nan
         return result
 
-    def filter_for_alpha(self, x: np.ndarray) -> np.ndarray:
+    def filter_for_psd(
+        self,
+        x: np.ndarray,
+        sos_band: Optional[np.ndarray] = None,
+        use_notch: Optional[bool] = None,
+    ) -> np.ndarray:
+        """Apply the toolbar's current band-pass/notch settings for PSD."""
         x = signal.detrend(np.asarray(x, dtype=float), type="linear")
         if x.size < 64:
             return x
+        band = self.sos_display_band if sos_band is None else np.asarray(sos_band)
+        notch_enabled = (
+            self.notch_check.isChecked()
+            if use_notch is None and hasattr(self, "notch_check")
+            else bool(use_notch)
+        )
         try:
-            y = signal.sosfiltfilt(self.sos_notch, x)
-            y = signal.sosfiltfilt(self.sos_alpha_band, y)
+            y = signal.sosfiltfilt(band, x)
+            if notch_enabled:
+                y = signal.sosfiltfilt(self.sos_notch, y)
         except ValueError:
-            y = signal.sosfilt(self.sos_notch, x)
-            y = signal.sosfilt(self.sos_alpha_band, y)
+            y = signal.sosfilt(band, x)
+            if notch_enabled:
+                y = signal.sosfilt(self.sos_notch, y)
         return y
 
     def append_live_filtered(
@@ -2064,6 +2110,8 @@ class MainWindow(QtWidgets.QMainWindow):
         valid: np.ndarray,
         seq: np.ndarray,
         mode: np.ndarray,
+        sos_band: Optional[np.ndarray] = None,
+        use_notch: Optional[bool] = None,
     ) -> Tuple[bool, str, dict]:
         x = np.asarray(x, dtype=float)
         valid = np.asarray(valid, dtype=bool)
@@ -2089,25 +2137,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if cleaned_all.size < segment_len:
             return False, "不足 4 秒", metrics
 
-        # Raw diagnostic PSD remains completely unfiltered. It is intentionally separate
-        # from the Alpha chain so a notch cannot hide a real 50 Hz hardware problem.
-        raw_detrended = signal.detrend(cleaned_all, type="linear")
+        # Raw diagnostic PSD uses the input samples without band-pass, notch,
+        # or detrending. Welch still applies its analysis window and averaging.
         nfft = max(2048, 2 ** int(np.ceil(np.log2(segment_len))))
         raw_f, raw_p = signal.welch(
-            raw_detrended,
+            cleaned_all,
             fs=FS,
             window="hann",
             nperseg=segment_len,
             noverlap=3 * segment_len // 4,
             nfft=nfft,
+            detrend=False,
         )
         metrics["raw_f"] = raw_f
         metrics["raw_p"] = raw_p
 
-        # Always prepare one filtered PSD for the display.  Alpha quality
+        # Prepare the default PSD with the toolbar's current filter settings.
+        # Alpha quality
         # windows may all be rejected (for example during movement); that
         # should change the quality verdict, not leave the spectrum blank.
-        display_signal = self.filter_for_alpha(cleaned_all)
+        display_signal = self.filter_for_psd(
+            cleaned_all, sos_band=sos_band, use_notch=use_notch
+        )
         display_f, display_p = signal.welch(
             display_signal,
             fs=FS,
@@ -2118,6 +2169,28 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         metrics["display_f"] = display_f
         metrics["display_p"] = display_p
+        metrics["filtered_rms"] = float(np.sqrt(np.mean(display_signal**2)))
+
+        # Always expose Alpha peak/rate from the current Alpha analysis chain.
+        # Window-quality screening is still retained for the optional 20-second
+        # capture workflow, but it no longer blanks the PSD's basic metrics.
+        display_alpha = (display_f >= 8) & (display_f <= 13)
+        display_broad = (display_f >= 4) & (display_f <= 30)
+        if np.any(display_alpha) and np.any(display_broad):
+            display_alpha_power = float(
+                np.trapezoid(display_p[display_alpha], display_f[display_alpha])
+            )
+            display_broad_power = float(
+                np.trapezoid(display_p[display_broad], display_f[display_broad])
+            )
+            display_af = display_f[display_alpha]
+            metrics["alpha_power"] = display_alpha_power
+            metrics["alpha_peak"] = float(
+                display_af[int(np.argmax(display_p[display_alpha]))]
+            )
+            metrics["alpha_rel"] = display_alpha_power / max(
+                display_broad_power, np.finfo(float).eps
+            )
 
         segment_psds: List[np.ndarray] = []
         segment_rms: List[float] = []
@@ -2133,7 +2206,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if not good:
                 reject_reasons.append(reason)
                 continue
-            alpha_signal = self.filter_for_alpha(segment_x)
+            alpha_signal = self.filter_for_psd(
+                segment_x, sos_band=sos_band, use_notch=use_notch
+            )
             f_seg, p_seg = signal.welch(
                 alpha_signal,
                 fs=FS,
@@ -2706,6 +2781,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.streaming = False
 
     # ---------------- bin import/offline ----------------
+    def _finish_offline_load(self, path: str):
+        """Update navigation and plots after any supported file is loaded."""
+        self.offline_end = self.offline_uv.shape[1]
+        self.offline_slider.setEnabled(True)
+        self.offline_slider.setRange(1, self.offline_end)
+        self.offline_slider.setValue(self.offline_end)
+        self.offline_label.setText(
+            f"{Path(path).name}: {self.offline_end / FS:.1f}s"
+        )
+        if hasattr(self, "file_status"):
+            self.file_status.setText(
+                f"{Path(path).name}  |  {FS} Hz  |  "
+                f"有效采样 {int(np.sum(self.offline_valid))}/{self.offline_end}"
+            )
+        self.update_fast_plots()
+        self.update_psd_and_info()
+
     def _load_bin_path(self, path: str):
         """Load one raw BIN into the shared offline/export data model."""
         raw = Path(path).read_bytes()
@@ -2724,28 +2816,87 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_reference_mode_local(
                 REFERENCE_SRB1 if (frames[-1].flags & 0x80) else REFERENCE_SRB2
             )
-        self.offline_end = self.offline_uv.shape[1]
-        self.offline_slider.setEnabled(True)
-        self.offline_slider.setRange(1, self.offline_end)
-        self.offline_slider.setValue(self.offline_end)
-        self.offline_label.setText(
-            f"{Path(path).name}: {self.offline_end / FS:.1f}s"
-        )
-        if hasattr(self, "file_status"):
-            self.file_status.setText(
-                f"{Path(path).name}  |  {FS} Hz  |  "
-                f"有效帧 {int(np.sum(self.offline_valid))}/{self.offline_end}"
-            )
-        self.update_fast_plots()
-        self.update_psd_and_info()
+        self._finish_offline_load(path)
         return parser
 
-    def import_bin(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "导入 raw bin", "", "BIN files (*.bin);;All files (*.*)")
+    def _load_bdf_path(self, path: str):
+        """Load a BDF/BDF+ file into the GUI's common 8-channel data model."""
+        try:
+            import mne
+        except ImportError as exc:
+            raise RuntimeError("读取 BDF 需要 MNE，请先安装 requirements.txt 中的依赖。") from exc
+
+        raw = mne.io.read_raw_bdf(path, preload=True, verbose="ERROR")
+        if not raw.ch_names:
+            raise RuntimeError("BDF 文件中没有可读取的信号通道。")
+
+        # Prefer physiological channels and fall back to every non-stim channel.
+        picks = mne.pick_types(
+            raw.info, eeg=True, eog=True, ecg=True, emg=True,
+            misc=True, stim=False, exclude=[],
+        )
+        if not len(picks):
+            picks = np.array(
+                [i for i, kind in enumerate(raw.get_channel_types()) if kind != "stim"],
+                dtype=int,
+            )
+        if not len(picks):
+            raise RuntimeError("BDF 文件中没有可用的数据通道。")
+
+        raw.pick(picks[:CHANNELS])
+        source_sfreq = float(raw.info["sfreq"])
+        if not np.isclose(source_sfreq, FS):
+            raw.resample(FS, npad="auto", verbose="ERROR")
+
+        data_uv = raw.get_data().astype(np.float64) * 1e6
+        source_channels = data_uv.shape[0]
+        if source_channels < CHANNELS:
+            data_uv = np.pad(
+                data_uv, ((0, CHANNELS - source_channels), (0, 0)),
+                mode="constant",
+            )
+        if data_uv.shape[1] == 0:
+            raise RuntimeError("BDF 文件不包含采样数据。")
+
+        self.reset_processing_state()
+        self.offline_uv = data_uv.astype(np.float32)
+        self.loaded_path = str(path)
+        sample_count = self.offline_uv.shape[1]
+        self.offline_valid = np.ones(sample_count, dtype=bool)
+        self.offline_seq = np.arange(sample_count, dtype=np.uint32)
+        self.offline_mode = np.zeros(sample_count, dtype=np.uint8)
+        self.current_mode = 0
+        self._finish_offline_load(path)
+        return source_channels, source_sfreq
+
+    def import_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "导入文件",
+            "",
+            "支持的文件 (*.bin *.bdf);;ADS1299 BIN (*.bin);;BDF/BDF+ (*.bdf);;所有文件 (*.*)",
+        )
         if not path:
             return
         try:
             self.stop_stream()
+            if Path(path).suffix.lower() == ".bdf":
+                channel_count, source_sfreq = self._load_bdf_path(path)
+                resample_note = (
+                    "" if np.isclose(source_sfreq, FS)
+                    else f"，已从 {source_sfreq:g} Hz 重采样到 {FS} Hz"
+                )
+                pad_note = (
+                    "" if channel_count == CHANNELS
+                    else f"，读取 {channel_count} 个通道并补齐为 {CHANNELS} 通道"
+                )
+                self.set_status(
+                    f"已导入 BDF：{path}{resample_note}{pad_note}，"
+                    f"共 {self.offline_uv.shape[1]} 个采样点。"
+                )
+                return
+            if Path(path).suffix.lower() != ".bin":
+                raise RuntimeError("不支持该文件格式，请选择 .bin 或 .bdf 文件。")
             parser = self._load_bin_path(path)
             valid_count = int(np.sum(self.offline_valid))
             total_count = int(self.offline_uv.shape[1])
@@ -2763,6 +2914,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.export_biosignal_formats()
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "导入失败", str(exc))
+
+    def import_bin(self):
+        """Backward-compatible entry point for older callers."""
+        self.import_file()
 
     def offline_slider_changed(self, value: int):
         self.offline_end = int(value)
@@ -2989,17 +3144,27 @@ class MainWindow(QtWidgets.QMainWindow):
             # The remaining seven ViewBoxes are X-linked to the first.
             self.channel_plots[0].setXRange(start_s, start_s + seconds, padding=0)
             self._syncing_plot = False
-        if not show_single and self.offline_uv is not None:
+        if self.offline_uv is not None:
             stride = max(1, total_n // 3000)
             overview = self.offline_uv[0, ::stride].astype(float)
             overview -= np.nanmean(overview)
-            self.nav_curve.setData(np.arange(overview.size)*stride/FS, overview)
+            overview_t = np.arange(overview.size) * stride / FS
+            self.nav_curve.setData(overview_t, overview)
             self.nav_plot.setXRange(0, total_s, padding=0)
+            self.single_nav_curve.setData(overview_t, overview)
+            self.single_nav_plot.setXRange(0, total_s, padding=0)
+            self.single_nav_plot.setVisible(True)
+        else:
+            self.single_nav_plot.setVisible(False)
         now = time.monotonic()
-        if not show_single and (self.offline_uv is not None or now - self._last_nav_update >= 0.2):
+        if self.offline_uv is not None or (
+            not show_single and now - self._last_nav_update >= 0.2
+        ):
             self._last_nav_update = now
             self._syncing_nav = True
-            self.nav_region.setRegion((start_s, min(total_s, start_s+seconds)))
+            region = (start_s, min(total_s, start_s + seconds))
+            self.nav_region.setRegion(region)
+            self.single_nav_region.setRegion(region)
             self._syncing_nav = False
         hp, lp = self.hp_spin.value(), self.lp_spin.value()
         notch = " + 50/100 Hz harmonic notch" if self.notch_check.isChecked() else ""
@@ -3035,7 +3200,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.psd_worker_busy = True
         request_id = self.psd_request_id
         self.psd_plot.setTitle("Welch PSD | 计算中…")
-        worker = PsdWorker(self, request_id, data[ch], valid, seq, mode)
+        worker = PsdWorker(
+            self, request_id, data[ch], valid, seq, mode,
+            self.sos_display_band.copy(), self.notch_check.isChecked(),
+        )
         worker.signals.finished.connect(self.apply_psd_result)
         worker.signals.failed.connect(self.apply_psd_error)
         self.psd_pool.start(worker)
@@ -3083,10 +3251,10 @@ class MainWindow(QtWidgets.QMainWindow):
             plot_name = "原始诊断 PSD"
         elif alpha_f.size:
             plot_f, plot_p = alpha_f, alpha_p
-            plot_name = "Alpha链 PSD（对数域平滑）"
+            plot_name = "滤波 PSD（对数域平滑）"
         else:
             plot_f, plot_p = display_f, display_p
-            plot_name = "显示 PSD（Alpha质量窗暂不合格）"
+            plot_name = "滤波 PSD（对数域平滑）"
         if plot_f.size:
             max_hz = float(self.psd_max_spin.value())
             smoothed_db = self.smooth_psd_db(plot_f, plot_p)
@@ -3094,20 +3262,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.psd_curve.setData(plot_f[mask], smoothed_db[mask])
             self.psd_plot.setXRange(1, max_hz, padding=0)
 
-        if good:
-            self.latest_alpha_power = metrics["alpha_power"]
-            self.latest_alpha_peak = metrics["alpha_peak"]
-            self.latest_alpha_rel = metrics["alpha_rel"]
-        else:
-            self.latest_alpha_power = np.nan
-            self.latest_alpha_peak = np.nan
-            self.latest_alpha_rel = np.nan
+        self.latest_alpha_power = metrics["alpha_power"]
+        self.latest_alpha_peak = metrics["alpha_peak"]
+        self.latest_alpha_rel = metrics["alpha_rel"]
         self.advance_alpha_capture()
 
-        peak_text = f"{self.latest_alpha_peak:.2f} Hz" if np.isfinite(self.latest_alpha_peak) else "无效"
+        peak_text = f"{self.latest_alpha_peak:.2f} Hz" if np.isfinite(self.latest_alpha_peak) else "---"
         rel_text = f"{100*self.latest_alpha_rel:.1f}%" if np.isfinite(self.latest_alpha_rel) else "---"
-        quality = "PASS" if good else f"REJECT: {reason}"
-        self.psd_plot.setTitle(f"{plot_name} | Alpha {peak_text}, {rel_text} | {quality}")
+        self.psd_plot.setTitle(
+            f"{plot_name} | Alpha 峰值 {peak_text} | Alpha rate {rel_text}"
+        )
         self.update_info_text()
 
     @QtCore.Slot(int, str)

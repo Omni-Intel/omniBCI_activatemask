@@ -239,7 +239,9 @@ firmware/                   ESP32-C3 + ADS1299 固件
                             固定 SRB1 硬件专用；不要用于 SRB2 接线
 assets/                     全域智能 Logo 与应用图标
 recordings/                 测试 BIN、CSV 和分析结果
-  nme/                      导入 BIN 后自动生成的 MNE 交换 CSV（单位 V）
+  bin/                      实时采集生成及已有的原始 BIN
+  bdf/                      导出的 BDF/BDF+
+  mne/                      导入 BIN 后自动生成的 MNE 交换 CSV（单位 V）
   fif/                      导入 BIN 后自动生成的双精度 *_raw.fif
 TEST_REPORT_P0P1.txt        测试记录
 CHANGELOG_P0P1.md           变更记录
