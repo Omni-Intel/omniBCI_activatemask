@@ -1,0 +1,5 @@
+Arduino IDE 打开：
+firmware\ESP32C3_ADS1299_SRB1_BLE_V3\ESP32C3_ADS1299_SRB1_BLE_V3.ino
+
+文件夹名和 ino 文件名都必须是 ESP32C3_ADS1299_SRB1_BLE_V3。
+V8 GUI 必须配套该固件，不能继续使用 v7/V2 固件。

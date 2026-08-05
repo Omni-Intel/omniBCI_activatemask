@@ -1,0 +1,17 @@
+V8 static and protocol checks
+=============================
+- Python py_compile: PASS
+- Reliable DATA block arbitrary fragmentation: PASS
+- Missing block -> NACK -> retransmission -> ordered 48-byte stream: PASS
+- Old stream session packet rejection: PASS
+- Reliable CONTROL packet length/CRC layout: PASS
+- Full firmware C++17 syntax with Bluedroid API stubs: PASS
+- Full firmware C++17 syntax with NimBLE API stubs: PASS
+- Firmware ring store / session ACK release host simulation: PASS
+- requestConnParams references: 0
+- if (!BLEDevice::init(...)) references: 0
+
+Not performed in this environment:
+- Real Arduino-ESP32 toolchain compilation
+- Windows BLE adapter + ESP32-C3 hardware run
+- ADS1299 long-duration bench test
