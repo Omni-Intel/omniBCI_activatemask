@@ -1,66 +1,49 @@
 # ads1299_native_py_gui_P0P1_V8
 
-运行 `install_and_run.bat`，或安装依赖后运行：
+运行 `install_and_run.bat`，或安装 `requirements.txt` 后运行：
 
 ```powershell
 py -3 ads1299_eeg_gui_native.py
 ```
 
-窗口标题应包含 `BLE Reliable V8`。
-
-## 必须配套的新固件
-
-Arduino IDE 打开：
+窗口标题应包含：
 
 ```text
-firmware\ESP32C3_ADS1299_SRB1_BLE_V3\ESP32C3_ADS1299_SRB1_BLE.ino
+BLE Reliable V8 | SRB1/SRB2
 ```
 
-旧版固件发送的是无确认 Notify 字节流；V8 GUI 接收的是 V3 固件的可靠 block 协议，二者不能混用。
+## BLE 固件支持
 
-## 可靠 BLE 数据链路
+本 GUI 同时支持：
 
-每个 DATA block 包含 4 个原有 48-byte ADS 帧，并增加：
+- `OmniBCI-C3-SRB1-V3`：固定 SRB1 可靠 BLE 固件；
+- `OmniBCI-C3-SRB2`：可切换 SRB1/SRB2 的可靠 BLE 固件；
+- `OmniBCI-C3-ADS1299`：可选的统一设备名别名。
 
-- stream session id；
-- block sequence；
-- first sample sequence；
-- frame count / payload length；
-- block CRC16。
+连接后不是只看蓝牙名称判断模式。GUI 会发送一次 A8/A7 探测，并读取固件返回的 ADS 配置 ACK：
 
-GUI 在 BLE 后台线程中重组 block，只把按序恢复出的原始 48-byte 帧交给旧解析器和 BIN 保存逻辑。因此：
+- ACK reference=0：按固定 SRB1 配置，锁定参考选择框；
+- ACK reference=1：确认支持 SRB2，开放 SRB1/SRB2 切换；
+- 后续每个通道的 A7 和逻辑 BIAS mask 都会读回校验。
 
-- 原始 ADS 帧格式不变；
-- BIN 仍是连续的 48-byte 帧流；
-- BLE 分片、乱序与重传不会污染原始文件；
-- GUI 不限幅、不裁剪、不插值。
+因此两个固件即使以后改成同一个广播名 `OmniBCI-C3-ADS1299`，GUI 仍能通过硬件读回区分。默认仍保留两个不同名称，避免两块板同时上电时只能靠蓝牙地址辨认。
 
-GUI 每累计收到若干连续 block 会发送 cumulative ACK；发现缺块会发送 NACK range。固件保留最近约 4.1 秒的 block，优先重传缺块，并限制未确认发送窗口，防止 Windows 暂停接收时继续把 Notify 塞进不可控队列。
+## 接线提醒
 
-每次开始采集会生成新的 stream session id。旧录制中延迟到达的 ACK/数据会被拒绝，避免跨录制误释放缓存。
+### SRB1
 
-## 新增诊断
+- 测量电极：INxP
+- 公共参考：SRB1
+- BIAS：自动路由到 BIAS_SENSP
+- 原始极性：INxP - SRB1
 
-诊断页增加：
+### SRB2
 
-- `Reliable RX blocks`：收到 / 按序交付的 block；
-- `Reliable pending`：等待缺块补齐的乱序 block；
-- `Reliable repair`：收到的重传 block / 无法恢复的 gap marker；
-- `Reliable ACK/NACK`；
-- `Reliable dup/OOO`：重复 / 乱序 block；
-- `Reliable CRC/sync`；
-- `FW retained blocks`；
-- `FW retrans/recover`；
-- `FW overflow/unknown`。
+- 测量电极：INxN
+- 公共参考：SRB2
+- BIAS：自动路由到 BIAS_SENSN
+- 原始极性：SRB2 - INxN
 
-理想状态：
+## 可靠 BLE 层
 
-```text
-Sequence lost          = 0
-Reliable pending       最终回到 0
-Reliable retrans RX    可大于 0
-FW overflow            = 0
-Reliable CRC bad       = 0
-```
-
-`retrans RX > 0` 说明重传机制确实修复过无线缺块，不等于最终丢帧。
+SRB1 与 SRB2 固件使用相同的可靠传输协议：4 个 48-byte EEG 帧组成一个 214-byte block，包含 session ID、block sequence 和 CRC；GUI 使用累计 ACK、NACK、乱序缓存和重传恢复缺块。

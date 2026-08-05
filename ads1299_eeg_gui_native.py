@@ -110,7 +110,13 @@ TRANSPORT_NORMAL_BUDGET_S = 0.0025
 TRANSPORT_CATCHUP_BUDGET_S = 0.0050
 TRANSPORT_REPOLL_DELAY_MS = 1
 TRANSPORT_CATCHUP_THRESHOLD_BYTES = FRAME_BYTES * 10
-BLE_DEVICE_NAME = "OmniBCI-C3-SRB1-V3"
+BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V3"
+BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2"
+BLE_DEVICE_NAME_COMMON = "OmniBCI-C3-ADS1299"
+BLE_DEVICE_NAMES = (BLE_DEVICE_NAME_SRB1, BLE_DEVICE_NAME_SRB2, BLE_DEVICE_NAME_COMMON)
+# Fallback label only. Connection compatibility is verified from GATT UUIDs and
+# the A7 register-readback reference byte, not from the advertised name alone.
+BLE_DEVICE_NAME = BLE_DEVICE_NAME_COMMON
 BLE_SERVICE_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0001"
 BLE_DATA_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0002"
 BLE_CONTROL_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0003"
@@ -628,7 +634,7 @@ class BleTransportWorker(QtCore.QThread):
                     "key": address,
                     "name": name,
                     "address": address,
-                    "preferred": name == BLE_DEVICE_NAME,
+                    "preferred": name in BLE_DEVICE_NAMES,
                 })
             rows.sort(key=lambda item: (not item["preferred"], item["name"].lower(), item["address"]))
             self.scan_finished.emit(rows)
@@ -1186,7 +1192,7 @@ class BleTransportWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | BLE Reliable V8")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | BLE Reliable V8 | SRB1/SRB2")
         self.resize(1500, 920)
 
         self.gain = 24  # legacy/global command value
@@ -1213,6 +1219,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ble_status = {}
         self.ble_low_mtu_warned = False
         self.ble_protocol_warned = False
+        self.ble_supports_srb2 = False
+        self.ble_reference_profile = "unknown"
         self.streaming = False
         self.impedance_active = False
         self.impedance_mask = 0
@@ -1545,7 +1553,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
         pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#424245")
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | BLE Reliable V8")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | BLE Reliable V8 | SRB1/SRB2")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)
@@ -2488,16 +2496,44 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.streaming = False
 
     def apply_reference_mode(self):
-        if self.active_transport == "ble":
+        if self.active_transport == "ble" and not self.ble_supports_srb2:
             self.set_reference_mode_local(REFERENCE_SRB1)
             self.reference_combo.setCurrentIndex(max(0, self.reference_combo.findData(REFERENCE_SRB1)))
-            self.set_status("配套 BLE 固件固定使用 SRB1 + P-only，不能切换到 SRB2。")
+            self.set_status("当前 BLE 固件为固定 SRB1 版本，不能切换到 SRB2。")
             return
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
         new_mode = int(self.reference_combo.currentData())
         was_streaming = bool(self.streaming)
         try:
+            if self.active_transport == "ble" and self.transport_connected() and self.offline_uv is None:
+                if was_streaming:
+                    self.transport_write(b"s")
+                    self.streaming = False
+                    time.sleep(0.08)
+                actual_reference, supports_srb2 = self.sync_ble_configuration(
+                    requested_reference=new_mode, probe_capability=False
+                )
+                self.ble_supports_srb2 = bool(supports_srb2)
+                self.set_reference_mode_local(actual_reference)
+                self.set_bias_checks(
+                    sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i])
+                )
+                self.ring.clear()
+                self.filtered_ring.clear()
+                self.reset_processing_state()
+                if was_streaming:
+                    self.transport_write(b"b")
+                    self.streaming = True
+                self.set_status(
+                    f"BLE 参考已切换为 {self.reference_short_name()}；"
+                    + (
+                        "信号接 INxN，公共参考接 SRB2，BIAS 使用 SENSN。"
+                        if actual_reference == REFERENCE_SRB2
+                        else "信号接 INxP，公共参考接 SRB1，BIAS 使用 SENSP。"
+                    )
+                )
+                return
             if self.transport_connected() and self.offline_uv is None:
                 if was_streaming:
                     self.transport_write(b"s")
@@ -2552,6 +2588,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     "BIAS 自动使用 BIAS_SENSP；原始极性为 INxP-SRB1。"
                 )
         except Exception as exc:
+            if was_streaming and self.transport_connected() and not self.streaming:
+                try:
+                    self.transport_reset_input_buffer()
+                    self.transport_write(b"b")
+                    self.streaming = True
+                except Exception:
+                    pass
             QtWidgets.QMessageBox.critical(self, "参考模式切换失败", str(exc))
 
     def _main_range_changed(self, _viewbox, x_range):
@@ -2831,13 +2874,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.serial_label.setText("蓝牙")
             self.refresh_btn.setText("扫描蓝牙")
             self.connect_btn.setText("连接蓝牙")
-            self.reference_combo.setCurrentIndex(
-                max(0, self.reference_combo.findData(REFERENCE_SRB1))
-            )
-            self.set_reference_mode_local(REFERENCE_SRB1)
+            # Before connection the GUI does not guess from the advertised name.
+            # It probes A8/A7 readback after GATT connection and then locks or
+            # enables the selector according to the actual firmware capability.
             self.reference_combo.setEnabled(False)
             self.apply_reference_btn.setEnabled(False)
-            self.reference_combo.setToolTip("配套 BLE 固件为 SRB1 P-only 固定版本。")
+            self.reference_combo.setToolTip(
+                "连接后自动识别固定 SRB1 固件或可切换 SRB1/SRB2 固件。"
+            )
         else:
             self.serial_label.setText("串口")
             self.refresh_btn.setText("扫描串口")
@@ -2911,9 +2955,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 preferred_index = self.port_combo.count() - 1
         if preferred_index >= 0:
             self.port_combo.setCurrentIndex(preferred_index)
-            self.set_status(f"已发现 {BLE_DEVICE_NAME}，点击“连接蓝牙”。")
+            self.set_status("已发现兼容的 OmniBCI BLE 设备，点击“连接蓝牙”。")
         else:
-            self.set_status("未看到 OmniBCI-C3-SRB1-V3；列表中仍显示了附近 BLE 设备，请勿选错。")
+            self.set_status("未看到已知的 OmniBCI 设备名；仍可选择设备，连接后会校验 GATT 与固件协议。")
         self.port_combo.setEnabled(True)
         self.connect_btn.setEnabled(True)
 
@@ -2924,7 +2968,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.selected_transport() == "ble":
             key = self.port_combo.currentData()
             if not key:
-                QtWidgets.QMessageBox.warning(self, "BLE", "请先扫描蓝牙并选择 OmniBCI-C3-SRB1-V3。")
+                QtWidgets.QMessageBox.warning(self, "BLE", "请先扫描蓝牙并选择 OmniBCI-C3-SRB1-V3、OmniBCI-C3-SRB2 或兼容设备。")
                 return
             if self.ble_worker is None:
                 QtWidgets.QMessageBox.critical(self, "BLE", "缺少 bleak，请运行 install_and_run.bat。")
@@ -2967,29 +3011,99 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_ble_connecting(self, _key: str):
         self.set_status("正在连接并订阅 DATA/STATUS 特征…")
 
-    def sync_ble_configuration(self):
-        """Synchronize GUI channel state to the fixed SRB1 P-only BLE firmware."""
-        self.transport_write(b"s")
-        self.transport_write(b"p")
-        time.sleep(0.10)
-        for ch in range(CHANNELS):
-            enabled = bool(self.channel_enabled[ch])
-            flags = (
-                (0x01 if enabled else 0)
-                | (0x02 if self.channel_bias[ch] and enabled else 0)
+    @staticmethod
+    def ble_reference_hint_from_name(name: str):
+        normalized = str(name or "").strip().upper()
+        if "SRB2" in normalized:
+            return REFERENCE_SRB2
+        if "SRB1" in normalized:
+            return REFERENCE_SRB1
+        return None
+
+    def _ble_write_channel_config(self, ch: int, reference_mode: int):
+        enabled = bool(self.channel_enabled[ch])
+        flags = (
+            (0x01 if enabled else 0)
+            | (0x02 if self.channel_bias[ch] and enabled else 0)
+            | (
+                0x04
+                if reference_mode == REFERENCE_SRB2
+                and self.channel_srb2[ch]
+                and enabled
+                else 0
             )
+        )
+        self.transport_reset_input_buffer()
+        self.transport_write(bytes((0xA7, ch, int(self.channel_gains[ch]), flags)))
+        ack = self.read_config_ack(0xA7, timeout=0.9)
+        if ack is None or ack["argument"] != ch or not ack["verified"]:
+            raise RuntimeError(f"BLE 初始化时 CH{ch+1} 配置读回失败")
+        return ack
+
+    def sync_ble_configuration(self, requested_reference=None, probe_capability: bool = True):
+        """Configure either fixed-SRB1 or dual-reference reliable BLE firmware.
+
+        Capability is determined from the firmware's A7 readback byte 7. This
+        deliberately avoids relying only on the advertised BLE name, so both
+        firmwares may use distinct names or a shared name without changing the
+        GUI protocol. A6 register 0x0D is the logical BIAS mask command for both
+        firmwares; the dual-reference firmware routes it to SENSP or SENSN.
+        """
+        self.transport_write(b"s")
+        time.sleep(0.05)
+
+        supports_srb2 = bool(self.ble_supports_srb2)
+        if probe_capability:
+            # Harmless on the fixed SRB1 firmware: unsupported A8 is ignored.
+            # On the dual firmware this selects SRB2, which is then confirmed by
+            # the reference byte in the following A7 register readback.
             self.transport_reset_input_buffer()
-            self.transport_write(bytes((0xA7, ch, int(self.channel_gains[ch]), flags)))
-            ack = self.read_config_ack(0xA7, timeout=0.8)
-            if ack is None or ack["argument"] != ch or not ack["verified"]:
-                raise RuntimeError(f"BLE 初始化时 CH{ch+1} 配置读回失败")
-        mask = sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i] and self.channel_enabled[i])
+            self.transport_write(bytes((0xA8, REFERENCE_SRB2)))
+            time.sleep(0.08)
+            self.transport_write(b"p")
+            time.sleep(0.08)
+            probe_ack = self._ble_write_channel_config(0, REFERENCE_SRB2)
+            supports_srb2 = int(probe_ack.get("reference", REFERENCE_SRB1)) == REFERENCE_SRB2
+
+        if requested_reference is None:
+            hinted = self.ble_reference_hint_from_name(self.ble_device_name)
+            requested_reference = self.reference_mode if hinted is None else hinted
+        requested_reference = (
+            REFERENCE_SRB2 if int(requested_reference) == REFERENCE_SRB2 else REFERENCE_SRB1
+        )
+        actual_reference = (
+            REFERENCE_SRB2
+            if requested_reference == REFERENCE_SRB2 and supports_srb2
+            else REFERENCE_SRB1
+        )
+
+        self.transport_reset_input_buffer()
+        self.transport_write(bytes((0xA8, actual_reference)))
+        time.sleep(0.08)
+        self.transport_write(b"p")
+        time.sleep(0.08)
+
+        for ch in range(CHANNELS):
+            ack = self._ble_write_channel_config(ch, actual_reference)
+            if int(ack.get("reference", REFERENCE_SRB1)) != actual_reference:
+                raise RuntimeError(
+                    f"BLE 参考模式读回不一致：请求 {('SRB2' if actual_reference else 'SRB1')}，"
+                    f"固件返回 {('SRB2' if ack.get('reference') else 'SRB1')}"
+                )
+
+        mask = sum(
+            (1 << i) for i in range(CHANNELS)
+            if self.channel_bias[i] and self.channel_enabled[i]
+        )
         self.transport_reset_input_buffer()
         self.transport_write(bytes((0xA6, 0x0D, mask & 0xFF)))
-        ack = self.read_config_ack(0xA6, timeout=0.8)
+        ack = self.read_config_ack(0xA6, timeout=0.9)
         if ack is None or ack["argument"] != (mask & 0xFF) or not ack["verified"]:
-            raise RuntimeError("BLE 初始化时 BIAS_SENSP 配置读回失败")
+            raise RuntimeError("BLE 初始化时逻辑 BIAS mask 配置读回失败")
+        if int(ack.get("reference", REFERENCE_SRB1)) != actual_reference:
+            raise RuntimeError("BLE BIAS 配置后的参考模式读回不一致")
         self.transport_reset_input_buffer()
+        return actual_reference, supports_srb2
 
     def on_ble_connected(self, name: str, address: str, mtu: int, reconnected: bool):
         self.transport_connecting = False
@@ -3007,28 +3121,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.reference_combo.setEnabled(False)
         self.apply_reference_btn.setEnabled(False)
-        self.set_reference_mode_local(REFERENCE_SRB1)
-        self.channel_srb2[:] = False
-        self.refresh_channel_parameter_labels()
+
+        hinted_reference = self.ble_reference_hint_from_name(name)
+        requested_reference = (
+            self.reference_mode
+            if reconnected or hinted_reference is None
+            else hinted_reference
+        )
         try:
             self.transport_reset_input_buffer()
-            if reconnected:
-                if self.streaming:
-                    self.transport_write(b"b")
-                self.set_status(
-                    f"BLE 已自动重连：{name}，MTU={mtu}；采集文件继续记录，序号缺口会被统计。"
-                )
-            else:
-                self.sync_ble_configuration()
-                self.current_mode = 1
-                self.mode_before_internal_short = 1
-                self.mode_combo.setCurrentIndex(self._mode_index_from_code(1))
-                self._sync_internal_short_button(False)
-                self.set_status(
-                    f"BLE 已连接：{name}，MTU={mtu}，SRB1 + P-only。点击“开始采集”。"
-                )
+            actual_reference, supports_srb2 = self.sync_ble_configuration(
+                requested_reference=requested_reference,
+                probe_capability=not reconnected or self.ble_reference_profile == "unknown",
+            )
+            self.ble_supports_srb2 = bool(supports_srb2)
+            self.ble_reference_profile = "dual" if supports_srb2 else "srb1_fixed"
+            self.set_reference_mode_local(actual_reference)
+            if actual_reference == REFERENCE_SRB2:
+                for ch in range(CHANNELS):
+                    if self.channel_enabled[ch]:
+                        self.channel_srb2[ch] = True
+            self.reference_combo.setEnabled(bool(supports_srb2))
+            self.apply_reference_btn.setEnabled(bool(supports_srb2))
+            self.reference_combo.setToolTip(
+                "此 BLE 固件支持运行时切换 SRB1/SRB2。"
+                if supports_srb2
+                else "此 BLE 固件固定为 SRB1。"
+            )
+            self.refresh_channel_parameter_labels()
+            self.current_mode = 1
+            self.mode_before_internal_short = 1
+            self.mode_combo.setCurrentIndex(self._mode_index_from_code(1))
+            self._sync_internal_short_button(False)
+            if reconnected and self.streaming:
+                self.transport_write(b"b")
+            action = "已自动重连" if reconnected else "已连接"
+            capability = "可切换 SRB1/SRB2" if supports_srb2 else "固定 SRB1"
+            self.set_status(
+                f"BLE {action}：{name}，MTU={mtu}，当前 {self.reference_short_name()}，"
+                f"{capability}。"
+                + ("采集已恢复。" if reconnected and self.streaming else "点击“开始采集”。")
+            )
         except Exception as exc:
-            self.set_status(f"BLE 已连接，但初始化命令失败：{exc}")
+            self.set_status(f"BLE 已连接，但参考模式/通道初始化失败：{exc}")
 
     def on_ble_disconnected(self, reason: str, will_reconnect: bool):
         self.ble_connected = False
@@ -3098,7 +3233,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if (len(data) < 72 or data[2] != 0x03) and not self.ble_protocol_warned:
             self.ble_protocol_warned = True
             self.set_status(
-                "BLE 固件协议不匹配：V8 GUI 必须烧录 ESP32C3_ADS1299_SRB1_BLE_V3。"
+                "BLE 固件协议不匹配：请烧录可靠传输协议 V3 的 SRB1 或 SRB2 固件。"
             )
         if self.ble_peer_mtu >= BLE_MIN_STREAM_MTU:
             self.ble_low_mtu_warned = False

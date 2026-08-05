@@ -1,0 +1,12 @@
+Static checks performed:
+- C++17 syntax check with mocked Arduino/FreeRTOS/BLE APIs: PASS
+- CONFIG_BLUEDROID_ENABLED branch: PASS
+- CONFIG_NIMBLE_ENABLED branch: PASS
+- Device name: OmniBCI-C3-SRB2
+- Product/file name contains no V3 suffix
+- Reliable block: 4 x 48-byte frames + 20-byte header + 2-byte CRC = 214 bytes
+- Reliable retention ring: 256 blocks
+- ACK/NACK, timeout retransmit and sliding window present
+- SRB2 default, A8 reference switch and A7 bit2 control present
+
+This is not a substitute for an Arduino-ESP32 real-core compile or hardware test.
