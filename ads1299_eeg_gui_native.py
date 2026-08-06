@@ -3,13 +3,13 @@
 ADS1299 EEG Native Python GUI
 --------------------------------
 Fast PyQtGraph-based replacement for the MATLAB diagnostic GUI.
-Reliable BLE V11 transport: bytes delivered by Windows are kept losslessly in a worker-owned queue.
+Reliable BLE V15 saturation-safe transport with asynchronous one-minute BIN segmentation: bytes delivered by Windows are kept losslessly in a worker-owned queue.
 Large Windows BLE delivery bursts are cooperatively parsed in bounded batches,
 while a delayed playback cursor absorbs notification jitter. Raw samples, signal
 amplitude, filtering options, and recording behavior remain unchanged.
 
 Protocol expected from firmware:
-  - BLE DATA uses Reliable Block V1 (session id + block sequence + CRC16)
+  - BLE DATA accepts Reliable Block V1 and compact V2 (session id + block sequence + CRC16)
   - the BLE worker restores the original ordered 48-byte binary frame stream
   - 48-byte binary frames
   - sync: A5 5A
@@ -30,7 +30,10 @@ BIAS_SENSP command sent by this app:
 where XX is the logical BIAS channel mask. Compatible firmware routes it
 to BIAS_SENSP for SRB1 or BIAS_SENSN for SRB2.
 
-Per-channel hardware command:
+Atomic eight-channel initialization command:
+  A5 REFERENCE ENABLED_MASK BIAS_MASK SRB2_MASK GAIN1..GAIN8
+
+Legacy per-channel hardware command:
   A7 CH GAIN FLAGS
 where FLAGS bit0 enables the channel and bit1 includes it in the active
 reference mode's BIAS summing network.
@@ -49,6 +52,8 @@ import time
 import struct
 import binascii
 import asyncio
+import json
+import secrets
 import queue
 import threading
 from collections import deque
@@ -102,30 +107,43 @@ BYTES_PER_SECOND = FRAME_BYTES * FS
 # Each transport turn handles only a bounded number of complete frames, then
 # yields back to Qt.  Unprocessed bytes remain in the worker queue: no sample is
 # clipped, rescaled, discarded, or replaced.
-# V11 uses two independent host schedulers.  The proven P0P1 serial path
+# V15 keeps two independent host schedulers.  The proven P0P1 serial path
 # drains aggressively before paint work, while BLE keeps V8's bounded batches
 # and jitter buffer.  Sharing one compromise scheduler was the main reason the
 # V8/V9 GUI could report serial sequence gaps even when BLE looked smooth.
 SERIAL_POLL_INTERVAL_MS = 2
-BLE_POLL_INTERVAL_MS = 5
+BLE_POLL_INTERVAL_MS = 4
 SERIAL_PLOT_INTERVAL_MS = 80
+# Twenty visual updates per second keep the live cursor responsive while the
+# receive, filtering and BIN writer remain isolated from Qt. Backlog guards
+# still pause painting before the receive path can be starved.
 BLE_PLOT_INTERVAL_MS = 50
 SERIAL_DRAIN_BUDGET_S = 0.006
 SERIAL_RX_BUFFER_BYTES = 1024 * 1024
+# BLE notifications normally contain four ADS frames.  Do not run the complete
+# parser/timeline/filter pipeline once per notification.  Coalesce roughly
+# 24-32 ms of EEG, or flush after the hold timeout, then process one matrix.
+BLE_COALESCE_MIN_FRAMES = 8
+BLE_COALESCE_MIN_BYTES = FRAME_BYTES * BLE_COALESCE_MIN_FRAMES
+BLE_COALESCE_MAX_HOLD_S = 0.025
+BLE_MAX_PROCESS_FRAMES = 96
+BLE_MAX_PROCESS_BYTES = FRAME_BYTES * BLE_MAX_PROCESS_FRAMES
+BLE_PLOT_PAUSE_BACKLOG_BYTES = int(BYTES_PER_SECOND * 0.20)
+BLE_PSD_PAUSE_BACKLOG_BYTES = int(BYTES_PER_SECOND * 0.12)
 TRANSPORT_MAX_BATCH_FRAMES = 24
 TRANSPORT_MAX_BATCH_BYTES = FRAME_BYTES * TRANSPORT_MAX_BATCH_FRAMES
 TRANSPORT_NORMAL_BUDGET_S = 0.0025
 TRANSPORT_CATCHUP_BUDGET_S = 0.0050
-TRANSPORT_REPOLL_DELAY_MS = 1
+TRANSPORT_REPOLL_DELAY_MS = 2
 TRANSPORT_CATCHUP_THRESHOLD_BYTES = FRAME_BYTES * 10
-BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V11"
-BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2-V11"
+BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V3"
+BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2"
 BLE_DEVICE_NAME_COMMON = "OmniBCI-C3-ADS1299"
 BLE_DEVICE_NAMES = (
     BLE_DEVICE_NAME_SRB1,
     BLE_DEVICE_NAME_SRB2,
-    "OmniBCI-C3-SRB1-V3",
-    "OmniBCI-C3-SRB2",
+    "OmniBCI-C3-SRB1-V11",
+    "OmniBCI-C3-SRB2-V11",
     BLE_DEVICE_NAME_COMMON,
 )
 # Fallback label only. Connection compatibility is verified from GATT UUIDs and
@@ -136,36 +154,87 @@ BLE_DATA_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0002"
 BLE_CONTROL_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0003"
 BLE_STATUS_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0004"
 BLE_BLOCK_MAGIC = b"\xB1\x4B"
-BLE_BLOCK_VERSION = 1
+BLE_BLOCK_VERSION_V1 = 1
+BLE_BLOCK_VERSION_V2 = 2
 BLE_BLOCK_HEADER_BYTES = 20
 BLE_BLOCK_CRC_BYTES = 2
-BLE_BLOCK_MAX_PAYLOAD_BYTES = FRAME_BYTES * 4
+BLE_COMPACT_FRAME_BYTES = 36
+BLE_V1_FRAMES_PER_BLOCK = 4
+BLE_V2_FRAMES_PER_BLOCK = 6
+BLE_BLOCK_MAX_PAYLOAD_BYTES = max(
+    FRAME_BYTES * BLE_V1_FRAMES_PER_BLOCK,
+    BLE_COMPACT_FRAME_BYTES * BLE_V2_FRAMES_PER_BLOCK,
+)
 BLE_CTRL_MAGIC = b"\xBA\x43"
 BLE_CTRL_VERSION = 1
 BLE_CTRL_ACK = 1
 BLE_CTRL_NACK_RANGE = 2
 BLE_CTRL_RESET = 3
 BLE_CTRL_PACKET_BYTES = 18
-BLE_RELIABLE_ACK_EVERY_BLOCKS = 8
-BLE_RELIABLE_ACK_MAX_INTERVAL_S = 0.12
+BLE_RELIABLE_ACK_EVERY_BLOCKS = 3
+BLE_RELIABLE_ACK_MAX_INTERVAL_S = 0.08
 BLE_RELIABLE_NACK_REPEAT_S = 0.10
-BLE_RELIABLE_MAX_PENDING_BLOCKS = 128
+BLE_RELIABLE_MAX_PENDING_BLOCKS = 320
+# A lost protocol block must not stop the stream forever.  NACKs are repeated
+# independently of new DATA notifications; after a bounded wait the host skips
+# only the missing protocol block.  The next ADS frame sequence still exposes
+# the real sample loss, so the timeline receives NaNs rather than invented EEG.
+BLE_RELIABLE_WATCHDOG_INTERVAL_S = 0.10
+BLE_RELIABLE_HOLE_RECONNECT_S = 2.5
+BLE_RELIABLE_HOLE_TIMEOUT_S = 12.0
+BLE_RELIABLE_FORCE_SKIP_PENDING = 300
+BLE_RELIABLE_STALL_RECONNECT_S = 3.0
+BLE_RELIABLE_RECONNECT_COOLDOWN_S = 6.0
 BLE_MIN_STREAM_MTU = 100
+# Raw BIN writes are intentionally off the Qt thread.  Windows Defender, disk
+# cache flushes and removable drives can occasionally block a write long enough
+# to starve serial/BLE receive and painting.
+RAW_WRITER_QUEUE_CHUNKS = 2048
+RAW_WRITER_BUFFER_BYTES = 1024 * 1024
+RAW_WRITER_FLUSH_INTERVAL_S = 2.0
+BYTES_PER_SECOND = FRAME_BYTES * FS
+RECORD_SEGMENT_SECONDS = 60
+RECORD_SEGMENT_BYTES = BYTES_PER_SECOND * RECORD_SEGMENT_SECONDS
+RECORD_METADATA_SCHEMA = "omni_ads1299_recording_meta_v1"
+RECORD_METADATA_UPDATE_INTERVAL_S = 5.0
+# Live causal filtering runs in its own worker.  The Qt thread only updates
+# counters/ring buffers and paints already-computed arrays.  This mirrors the
+# acquisition-ring-buffer-consumer split used by BrainFlow/OpenBCI.
+FILTER_RESULT_POLL_MS = 3
+FILTER_RESULT_BUDGET_S = 0.003
+FILTER_OUTPUT_MAX_BATCHES = 256
+FILTER_BACKLOG_PAUSE_PLOT_S = 0.25
+FILTER_BACKLOG_PAUSE_PSD_S = 0.15
+# ADS rail samples are not useful EEG and can create a pathological Qt paint
+# path when a disconnected electrode toggles rapidly between positive and
+# negative full scale. Raw BIN bytes stay untouched; only the live filter and
+# screen paths mask rail samples. This keeps one saturated channel from
+# poisoning the IIR state or freezing all eight plots.
+ADC_SATURATION_FRACTION = 0.95
+PSD_SATURATION_SKIP_RATIO = 0.01
 # STATUS is already subscribed. Avoid active GATT reads while EEG is streaming,
 # because Windows may serialize them with DATA notification delivery.
 BLE_STATUS_POLL_INTERVAL_S = 15.0
 LIVE_CATCHUP_THRESHOLD_S = 0.20
-# Display-only adaptive jitter buffer. It never clips, rescales, drops, or
-# replaces samples. Raw parsing/saving remains immediate; only the live cursor
-# is delayed so Windows BLE delivery gaps are absorbed by already-received data.
-# The previous 0.30 s reserve was smaller than the measured 1.27 s Windows gap.
-DISPLAY_JITTER_BASE_TARGET_S = 2.00
-DISPLAY_JITTER_STARTUP_S = 2.00
-DISPLAY_JITTER_MARGIN_S = 0.55
-DISPLAY_JITTER_MAX_TARGET_S = 4.00
-DISPLAY_JITTER_MIN_RESERVE_S = 0.10
-DISPLAY_JITTER_MAX_DT_S = 0.20
-DISPLAY_JITTER_LONG_GAP_S = 0.10
+# Display-only adaptive jitter buffer. Raw parsing/saving and the filtered
+# history remain complete. The live cursor may skip stale screen history only
+# after a large OS delivery stall, keeping the visible delay within its budget.
+# V15 retains the V14 0.65 s target and caps the live screen near 1 s; raw BIN is independent.
+DISPLAY_JITTER_BASE_TARGET_S = 0.65
+DISPLAY_JITTER_STARTUP_S = 0.55
+DISPLAY_JITTER_MARGIN_S = 0.18
+DISPLAY_JITTER_MAX_TARGET_S = 1.00
+DISPLAY_JITTER_MIN_RESERVE_S = 0.04
+DISPLAY_JITTER_MAX_DT_S = 0.12
+DISPLAY_JITTER_LONG_GAP_S = 0.08
+# Low-latency live view: raw BIN and filtered history remain complete, while
+# the screen cursor is allowed to catch up faster than real time after a Windows
+# BLE burst. If stale screen history exceeds the accepted one-second budget,
+# only the display cursor is resynchronised; recorded samples are untouched.
+DISPLAY_JITTER_CATCHUP_TRIGGER_S = 0.10
+DISPLAY_JITTER_CATCHUP_MAX_RATE = 1.75
+DISPLAY_JITTER_HARD_MAX_S = 1.00
+DISPLAY_JITTER_HARD_HYSTERESIS_S = 0.12
 # Missing BLE frames are represented as invalid timeline samples in the live
 # display ring. This preserves real sample time and prevents packet loss from
 # slowly draining the jitter buffer. Raw BIN bytes remain untouched.
@@ -538,6 +607,612 @@ class PsdWorker(QtCore.QRunnable):
             self.signals.failed.emit(self.request_id, str(exc))
 
 
+@dataclass
+class FilteredBatch:
+    generation: int
+    filtered: np.ndarray
+    valid: np.ndarray
+    sequence: np.ndarray
+    modes: np.ndarray
+
+
+class LiveFilterWorker:
+    """Own the continuous live IIR state outside the Qt GUI thread.
+
+    Transport reception and raw BIN writing must never wait for filtering or
+    painting. Input samples are processed in order; display results use a
+    bounded ring-like queue so a hidden or blocked window cannot grow memory
+    forever. The raw BIN path remains independent and lossless while healthy.
+    """
+
+    _STOP = object()
+
+    def __init__(self, sos_band: np.ndarray, sos_notch: np.ndarray, use_notch: bool):
+        self._in = queue.Queue()
+        self._out = queue.Queue(maxsize=FILTER_OUTPUT_MAX_BATCHES)
+        self._thread = threading.Thread(
+            target=self._run, name="OmniBCI-LiveFilter", daemon=True
+        )
+        self._lock = threading.Lock()
+        self._running = False
+        self._queued_samples = 0
+        self._output_samples = 0
+        self.peak_queued_samples = 0
+        self.batches_processed = 0
+        self.errors = 0
+        self.display_dropped_samples = 0
+        self.last_error = ""
+        self._generation = 0
+        self._sos_band = np.asarray(sos_band, dtype=float).copy()
+        self._sos_notch = np.asarray(sos_notch, dtype=float).copy()
+        self._use_notch = bool(use_notch)
+        self._reset_state()
+
+    def start(self):
+        if self._thread.is_alive():
+            return
+        self._running = True
+        self._thread.start()
+
+    def configure(self, generation: int, sos_band: np.ndarray, sos_notch: np.ndarray, use_notch: bool):
+        self._in.put((
+            "config", int(generation), np.asarray(sos_band, dtype=float).copy(),
+            np.asarray(sos_notch, dtype=float).copy(), bool(use_notch),
+        ))
+
+    def submit(self, generation: int, values, valid, sequence, modes):
+        values = np.asarray(values, dtype=np.float32).copy()
+        valid = np.asarray(valid, dtype=bool).copy()
+        sequence = np.asarray(sequence, dtype=np.uint32).copy()
+        modes = np.asarray(modes, dtype=np.uint8).copy()
+        n = int(values.shape[1]) if values.ndim == 2 else 0
+        if n <= 0:
+            return
+        with self._lock:
+            self._queued_samples += n
+            self.peak_queued_samples = max(self.peak_queued_samples, self._queued_samples)
+        self._in.put(("batch", int(generation), values, valid, sequence, modes))
+
+    def drain(self, max_batches: int = 16):
+        out = []
+        for _ in range(max(1, int(max_batches))):
+            try:
+                batch = self._out.get_nowait()
+            except queue.Empty:
+                break
+            out.append(batch)
+            with self._lock:
+                self._output_samples = max(0, self._output_samples - int(batch.filtered.shape[1]))
+        return out
+
+    def metrics(self):
+        with self._lock:
+            return {
+                "queued_samples": int(self._queued_samples),
+                "output_samples": int(self._output_samples),
+                "peak_queued_samples": int(self.peak_queued_samples),
+                "batches_processed": int(self.batches_processed),
+                "errors": int(self.errors),
+                "display_dropped_samples": int(self.display_dropped_samples),
+                "last_error": str(self.last_error),
+            }
+
+    def shutdown(self, timeout: float = 3.0):
+        if not self._thread.is_alive():
+            return
+        self._in.put(self._STOP)
+        self._thread.join(max(0.1, float(timeout)))
+        self._running = False
+
+    def _reset_state(self):
+        self._zi_band = np.zeros((CHANNELS, self._sos_band.shape[0], 2), dtype=float)
+        self._zi_notch = np.zeros((CHANNELS, self._sos_notch.shape[0], 2), dtype=float)
+        self._last_input = np.zeros(CHANNELS, dtype=float)
+        self._have_input = np.zeros(CHANNELS, dtype=bool)
+
+    def _filter(self, values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        source = np.asarray(values, dtype=float)
+        # ``source`` may contain per-channel NaNs inserted for ADC saturation.
+        # Hold those samples only to evolve the IIR; keep a channel-specific
+        # mask so they remain display gaps instead of invented EEG.
+        channel_good_matrix = np.asarray(valid, dtype=bool)[None, :] & np.isfinite(source)
+        filled = source.copy()
+        for ch in range(CHANNELS):
+            channel_good = channel_good_matrix[ch]
+            if not self._have_input[ch]:
+                first_candidates = np.flatnonzero(channel_good)
+                if first_candidates.size:
+                    first_idx = int(first_candidates[0])
+                    first_value = float(filled[ch, first_idx])
+                    filled[ch, :first_idx] = first_value
+                    self._zi_band[ch] = signal.sosfilt_zi(self._sos_band) * first_value
+                    self._zi_notch[ch].fill(0.0)
+                    self._last_input[ch] = first_value
+                    self._have_input[ch] = True
+            n_samples = int(filled.shape[1])
+            if not n_samples:
+                continue
+            if channel_good.all():
+                self._last_input[ch] = float(filled[ch, -1])
+                self._have_input[ch] = True
+                continue
+            original = filled[ch].copy()
+            seed = float(self._last_input[ch]) if self._have_input[ch] else 0.0
+            last_good_index = np.where(channel_good, np.arange(n_samples, dtype=np.int64), -1)
+            np.maximum.accumulate(last_good_index, out=last_good_index)
+            has_previous = last_good_index >= 0
+            filled[ch, ~has_previous] = seed
+            if np.any(has_previous):
+                filled[ch, has_previous] = original[last_good_index[has_previous]]
+            good_indices = np.flatnonzero(channel_good)
+            if good_indices.size:
+                self._last_input[ch] = float(original[int(good_indices[-1])])
+                self._have_input[ch] = True
+
+        band_zi = np.transpose(self._zi_band, (1, 0, 2))
+        filtered, band_zf = signal.sosfilt(self._sos_band, filled, axis=1, zi=band_zi)
+        self._zi_band = np.transpose(band_zf, (1, 0, 2))
+        if self._use_notch:
+            notch_zi = np.transpose(self._zi_notch, (1, 0, 2))
+            filtered, notch_zf = signal.sosfilt(
+                self._sos_notch, filtered, axis=1, zi=notch_zi
+            )
+            self._zi_notch = np.transpose(notch_zf, (1, 0, 2))
+
+        bad_channels = np.flatnonzero(
+            ~np.all(np.isfinite(filtered), axis=1)
+            | ~np.all(np.isfinite(self._zi_band), axis=(1, 2))
+            | ~np.all(np.isfinite(self._zi_notch), axis=(1, 2))
+        )
+        for ch in bad_channels:
+            seed = float(self._last_input[ch]) if np.isfinite(self._last_input[ch]) else 0.0
+            self._zi_band[ch] = signal.sosfilt_zi(self._sos_band) * seed
+            self._zi_notch[ch].fill(0.0)
+            filtered[ch] = np.nan_to_num(filtered[ch], nan=seed, posinf=seed, neginf=seed)
+
+        # NaN gaps are much cheaper for pyqtgraph than thousands of alternating
+        # full-scale vertical segments, and they isolate only the bad channel.
+        filtered[~channel_good_matrix] = np.nan
+        return np.asarray(filtered, dtype=np.float32)
+
+    def _run(self):
+        while True:
+            item = self._in.get()
+            if item is self._STOP:
+                return
+            kind = item[0]
+            if kind == "config":
+                _, generation, band, notch, use_notch = item
+                self._generation = int(generation)
+                self._sos_band = band
+                self._sos_notch = notch
+                self._use_notch = bool(use_notch)
+                self._reset_state()
+                continue
+            _, generation, values, valid, sequence, modes = item
+            n = int(values.shape[1])
+            try:
+                if int(generation) != self._generation:
+                    continue
+                filtered = self._filter(values, valid)
+                batch = FilteredBatch(
+                    int(generation), filtered, valid, sequence, modes
+                )
+                try:
+                    self._out.put_nowait(batch)
+                except queue.Full:
+                    # Display results are bounded like a ring buffer. Raw BIN
+                    # bytes are already safe in the independent writer, so an
+                    # inactive/blocked Qt window must not grow memory forever.
+                    try:
+                        dropped = self._out.get_nowait()
+                        dropped_n = int(dropped.filtered.shape[1])
+                    except queue.Empty:
+                        dropped_n = 0
+                    with self._lock:
+                        self._output_samples = max(0, self._output_samples - dropped_n)
+                        self.display_dropped_samples += dropped_n
+                    self._out.put_nowait(batch)
+                with self._lock:
+                    self._output_samples += n
+                    self.batches_processed += 1
+            except Exception as exc:
+                with self._lock:
+                    self.errors += 1
+                    self.last_error = str(exc)
+                self._reset_state()
+            finally:
+                with self._lock:
+                    self._queued_samples = max(0, self._queued_samples - n)
+
+
+def expand_compact_ble_payload(payload: bytes, frame_count: int) -> bytes:
+    """Expand BLE V2 compact records back to the standard 48-byte BIN format."""
+    if len(payload) != int(frame_count) * BLE_COMPACT_FRAME_BYTES:
+        raise ValueError("BLE compact payload length mismatch")
+    out = bytearray()
+    for index in range(int(frame_count)):
+        record = payload[
+            index * BLE_COMPACT_FRAME_BYTES:(index + 1) * BLE_COMPACT_FRAME_BYTES
+        ]
+        sequence = record[0:4]
+        timestamp = record[4:8]
+        ads_raw = record[8:35]
+        flags = record[35]
+        frame = bytearray(FRAME_BYTES)
+        frame[0:4] = bytes((SYNC1, SYNC2, 1, 1))
+        frame[4:8] = sequence
+        frame[8:12] = timestamp
+        frame[12:15] = ads_raw[0:3]
+        frame[15] = flags
+        frame[16:40] = ads_raw[3:27]
+        frame[40:42] = b"\x00\x00"
+        frame[42] = 2 if (flags & 0x04) else 0
+        if flags & 0x08:
+            mode = 4
+        elif flags & 0x10:
+            mode = 3
+        elif flags & 0x40:
+            mode = 0
+        elif flags & 0x20:
+            mode = 1
+        else:
+            mode = 2
+        frame[43] = mode
+        frame[44] = 0
+        frame[45] = 0
+        struct.pack_into("<H", frame, 46, crc16_ccitt(frame[:46]))
+        out.extend(frame)
+    return bytes(out)
+
+
+class AsyncRawWriter:
+    """Lossless background writer with exact one-minute BIN rotation.
+
+    Transport/Qt only enqueue bytes.  File open/write/flush/rotation and JSON
+    metadata all happen in this worker, so restoring segmented BIN recording
+    does not put disk latency back on the UI thread.
+    """
+
+    _STOP = object()
+
+    def __init__(self):
+        self._queue = queue.Queue(maxsize=RAW_WRITER_QUEUE_CHUNKS)
+        self._thread: Optional[threading.Thread] = None
+        self._started = threading.Event()
+        self._lock = threading.Lock()
+        self._error: Optional[str] = None
+        self._queued_bytes = 0
+        self.peak_queued_bytes = 0
+        self.bytes_written = 0
+        self.dropped_bytes = 0
+        self._folder = ""
+        self._session_id = ""
+        self._session_prefix = ""
+        self._session_started_at = ""
+        self._manifest_path = ""
+        self._first_path = ""
+        self._current_path = ""
+        self._segment_index = 0
+        self._segment_bytes = 0
+        self._segments = []
+        self._configuration = {}
+
+    @property
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
+    @property
+    def queued_bytes(self) -> int:
+        with self._lock:
+            return int(self._queued_bytes)
+
+    @property
+    def current_path(self) -> str:
+        with self._lock:
+            return str(self._current_path)
+
+    @property
+    def first_path(self) -> str:
+        with self._lock:
+            return str(self._first_path)
+
+    @property
+    def manifest_path(self) -> str:
+        with self._lock:
+            return str(self._manifest_path)
+
+    @property
+    def session_id(self) -> str:
+        with self._lock:
+            return str(self._session_id)
+
+    @property
+    def segment_count(self) -> int:
+        with self._lock:
+            return int(len(self._segments))
+
+    @property
+    def segment_index(self) -> int:
+        with self._lock:
+            return int(self._segment_index)
+
+    @property
+    def segment_bytes(self) -> int:
+        with self._lock:
+            return int(self._segment_bytes)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "session_id": self._session_id,
+                "session_prefix": self._session_prefix,
+                "manifest_path": self._manifest_path,
+                "first_path": self._first_path,
+                "current_path": self._current_path,
+                "segment_index": int(self._segment_index),
+                "segment_bytes": int(self._segment_bytes),
+                "segment_count": int(len(self._segments)),
+                "bytes_written": int(self.bytes_written),
+                "queued_bytes": int(self._queued_bytes),
+            }
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: dict):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+
+    def start_session(self, folder: str, configuration: Optional[dict] = None):
+        self.stop(timeout=2.0)
+        target = Path(folder)
+        target.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        session_id = secrets.token_hex(3)
+        prefix = f"{now:%m%d_%H%M}_{session_id}"
+        first_path = target / f"{prefix}_minute01.bin"
+        manifest = target / f"{prefix}_manifest.json"
+        self._queue = queue.Queue(maxsize=RAW_WRITER_QUEUE_CHUNKS)
+        self._started.clear()
+        with self._lock:
+            self._error = None
+            self._queued_bytes = 0
+            self.peak_queued_bytes = 0
+            self.bytes_written = 0
+            self.dropped_bytes = 0
+            self._folder = str(target)
+            self._session_id = session_id
+            self._session_prefix = prefix
+            self._session_started_at = now.isoformat(timespec="seconds")
+            self._manifest_path = str(manifest)
+            self._first_path = str(first_path)
+            self._current_path = str(first_path)
+            self._segment_index = 0
+            self._segment_bytes = 0
+            self._segments = []
+            self._configuration = dict(configuration or {})
+        self._thread = threading.Thread(
+            target=self._run, name="OmniBCI-SegmentedRawWriter", daemon=True
+        )
+        self._thread.start()
+        if not self._started.wait(2.0):
+            raise RuntimeError("分包 BIN 写盘线程启动超时")
+        if self.error:
+            raise RuntimeError(self.error)
+
+    def submit(self, data: bytes) -> bool:
+        payload = bytes(data)
+        if not payload:
+            return True
+        thread = self._thread
+        if thread is None or not thread.is_alive() or self.error:
+            return False
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            with self._lock:
+                self.dropped_bytes += len(payload)
+                if self._error is None:
+                    self._error = "原始 BIN 写盘队列已满；实时显示继续，但本次 BIN 已停止保证完整"
+            return False
+        with self._lock:
+            self._queued_bytes += len(payload)
+            self.peak_queued_bytes = max(self.peak_queued_bytes, self._queued_bytes)
+        return True
+
+    def stop(self, timeout: float = 10.0):
+        thread = self._thread
+        if thread is None:
+            return
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while thread.is_alive():
+            try:
+                self._queue.put(self._STOP, timeout=0.05)
+                break
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    break
+        thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            with self._lock:
+                if self._error is None:
+                    self._error = "分包 BIN 写盘线程停止超时"
+        else:
+            self._thread = None
+
+    def _segment_path(self, index: int) -> Path:
+        return Path(self._folder) / f"{self._session_prefix}_minute{int(index):02d}.bin"
+
+    @staticmethod
+    def _sidecar_path(bin_path: Path) -> Path:
+        return Path(bin_path).with_suffix(".meta.json")
+
+    def _metadata_payload(self, status: str) -> dict:
+        with self._lock:
+            segments = [dict(item) for item in self._segments]
+            return {
+                "schema": RECORD_METADATA_SCHEMA,
+                "status": status,
+                "recording_id": self._session_id,
+                "session_prefix": self._session_prefix,
+                "session_started_at": self._session_started_at,
+                "segment_target_seconds": RECORD_SEGMENT_SECONDS,
+                "segment_target_bytes": RECORD_SEGMENT_BYTES,
+                "total_bytes": int(self.bytes_written),
+                "total_complete_frames": int(self.bytes_written // FRAME_BYTES),
+                "configuration_at_session_start": dict(self._configuration),
+                "segments": segments,
+            }
+
+    def _persist_metadata(self, status: str):
+        payload = self._metadata_payload(status)
+        manifest = self.manifest_path
+        if manifest:
+            self._write_json_atomic(Path(manifest), payload)
+        with self._lock:
+            segments = [dict(item) for item in self._segments]
+            session_id = self._session_id
+            prefix = self._session_prefix
+            started = self._session_started_at
+            manifest_name = Path(self._manifest_path).name if self._manifest_path else ""
+            configuration = dict(self._configuration)
+        for record in segments[-1:]:
+            sidecar = self._sidecar_path(Path(record["path"]))
+            self._write_json_atomic(
+                sidecar,
+                {
+                    "schema": RECORD_METADATA_SCHEMA,
+                    "status": record.get("status", status),
+                    "recording_id": session_id,
+                    "session_prefix": prefix,
+                    "session_started_at": started,
+                    "manifest_file": manifest_name,
+                    **record,
+                    "configuration": configuration,
+                },
+            )
+
+    def _open_segment(self):
+        with self._lock:
+            self._segment_index += 1
+            index = self._segment_index
+            path = self._segment_path(index)
+            self._current_path = str(path)
+            if not self._first_path:
+                self._first_path = str(path)
+            self._segment_bytes = 0
+            record = {
+                "segment_index": int(index),
+                "minute_label": f"minute{index:02d}",
+                "path": str(path),
+                "file": path.name,
+                "sidecar_file": self._sidecar_path(path).name,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "bytes": 0,
+                "complete_frames": 0,
+                "duration_seconds": 0.0,
+                "status": "recording",
+            }
+            self._segments.append(record)
+        return open(path, "wb", buffering=RAW_WRITER_BUFFER_BYTES)
+
+    def _update_current_record(self, status: str = "recording"):
+        with self._lock:
+            if not self._segments:
+                return
+            current = self._segments[-1]
+            current["bytes"] = int(self._segment_bytes)
+            current["complete_frames"] = int(self._segment_bytes // FRAME_BYTES)
+            current["duration_seconds"] = round(
+                self._segment_bytes / max(1, BYTES_PER_SECOND), 3
+            )
+            current["status"] = status
+            if status != "recording":
+                current["ended_at"] = datetime.now().isoformat(timespec="seconds")
+
+    def _write_payload(self, handle, payload: bytes):
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            if handle is None:
+                handle = self._open_segment()
+            with self._lock:
+                remaining = RECORD_SEGMENT_BYTES - self._segment_bytes
+            take = min(len(view) - offset, remaining)
+            written = handle.write(view[offset:offset + take])
+            if written != take:
+                raise OSError(f"BIN 写入不完整：请求 {take} 字节，实际 {written} 字节")
+            offset += written
+            with self._lock:
+                self._segment_bytes += written
+                self.bytes_written += written
+                self._queued_bytes = max(0, self._queued_bytes - written)
+                full = self._segment_bytes >= RECORD_SEGMENT_BYTES
+            self._update_current_record("recording")
+            if full:
+                handle.flush()
+                handle.close()
+                handle = None
+                self._update_current_record("complete")
+                self._persist_metadata("recording")
+        return handle
+
+    def _run(self):
+        handle = None
+        status = "complete"
+        try:
+            handle = self._open_segment()
+            self._persist_metadata("recording")
+            self._started.set()
+            last_flush = time.monotonic()
+            last_metadata = last_flush
+            while True:
+                try:
+                    item = self._queue.get(timeout=0.25)
+                except queue.Empty:
+                    item = None
+                if item is self._STOP:
+                    break
+                if item is not None:
+                    handle = self._write_payload(handle, item)
+                now = time.monotonic()
+                if handle is not None and now - last_flush >= RAW_WRITER_FLUSH_INTERVAL_S:
+                    handle.flush()
+                    last_flush = now
+                if now - last_metadata >= RECORD_METADATA_UPDATE_INTERVAL_S:
+                    self._update_current_record("recording")
+                    self._persist_metadata("recording")
+                    last_metadata = now
+            if handle is not None:
+                handle.flush()
+                handle.close()
+                handle = None
+            self._update_current_record("complete")
+        except Exception as exc:
+            status = "error"
+            with self._lock:
+                self._error = f"原始 BIN 写盘失败：{exc}"
+            self._update_current_record("error")
+        finally:
+            self._started.set()
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            try:
+                self._persist_metadata(status)
+            except Exception as meta_exc:
+                with self._lock:
+                    if self._error is None:
+                        self._error = f"BIN 元数据写入失败：{meta_exc}"
+
 class BleTransportWorker(QtCore.QThread):
     """Own a Bleak asyncio loop outside the Qt GUI thread.
 
@@ -558,7 +1233,7 @@ class BleTransportWorker(QtCore.QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.status_queue: "queue.Queue[bytes]" = queue.Queue()
+        self.status_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=64)
         # DATA notifications stay in the BLE worker thread.  A lock-protected
         # deque is drained by the GUI timer, avoiding one queued Qt event per
         # notification (a common cause of visible Windows GUI stalls).
@@ -573,9 +1248,11 @@ class BleTransportWorker(QtCore.QThread):
         self._manual_disconnect = False
         self._reconnect_task = None
         self._status_poll_task = None
+        self._reliable_watchdog_task = None
         self._connect_lock = None
         self._closing = False
         self._streaming_hint = False
+        self._streaming_hint_started_monotonic = 0.0
         self._last_notify_monotonic: Optional[float] = None
         self._notify_gap_last_s = 0.0
         self._notify_gap_max_s = 0.0
@@ -607,6 +1284,13 @@ class BleTransportWorker(QtCore.QThread):
         self._reliable_nack_sent = 0
         self._reliable_control_errors = 0
         self._reliable_max_pending = 0
+        self._reliable_gap_sequence = None
+        self._reliable_gap_first_seen = 0.0
+        self._reliable_watchdog_nacks = 0
+        self._reliable_forced_skips = 0
+        self._reliable_last_delivery_monotonic = 0.0
+        self._watchdog_reconnects = 0
+        self._watchdog_last_reconnect_monotonic = 0.0
         self._gatt_write_lock = None
 
     def run(self):
@@ -729,6 +1413,10 @@ class BleTransportWorker(QtCore.QThread):
                         self._reliable_accept_any_session = True
                 await client.start_notify(BLE_DATA_UUID, self._on_data)
                 await client.start_notify(BLE_STATUS_UUID, self._on_status)
+                # Give the resubscribed link a fresh stall deadline. Otherwise
+                # the watchdog can immediately disconnect again based on the
+                # timestamp from before the radio interruption.
+                self._last_notify_monotonic = time.monotonic()
                 try:
                     status = bytes(await client.read_gatt_char(BLE_STATUS_UUID))
                     self._publish_status(status)
@@ -742,6 +1430,11 @@ class BleTransportWorker(QtCore.QThread):
                 if self._status_poll_task is not None:
                     self._status_poll_task.cancel()
                 self._status_poll_task = asyncio.create_task(self._status_poll_loop(client))
+                if self._reliable_watchdog_task is not None:
+                    self._reliable_watchdog_task.cancel()
+                self._reliable_watchdog_task = asyncio.create_task(
+                    self._reliable_watchdog_loop(client)
+                )
             except Exception:
                 if self._client is client:
                     self._client = None
@@ -777,7 +1470,9 @@ class BleTransportWorker(QtCore.QThread):
             if lock is None:
                 return
             async with lock:
-                await client.write_gatt_char(BLE_CONTROL_UUID, packet, response=False)
+                await client.write_gatt_char(
+                    BLE_CONTROL_UUID, packet, response=(kind != "ack")
+                )
             with self._reliable_lock:
                 if kind == "ack":
                     self._reliable_ack_sent += 1
@@ -808,6 +1503,9 @@ class BleTransportWorker(QtCore.QThread):
             self._reliable_last_ack_sent = 0xFFFFFFFF
             self._reliable_last_ack_time = 0.0
             self._reliable_last_nack = None
+            self._reliable_gap_sequence = None
+            self._reliable_gap_first_seen = 0.0
+            self._reliable_last_delivery_monotonic = time.monotonic()
             if reset_metrics:
                 self._reliable_blocks_received = 0
                 self._reliable_blocks_delivered = 0
@@ -821,6 +1519,9 @@ class BleTransportWorker(QtCore.QThread):
                 self._reliable_nack_sent = 0
                 self._reliable_control_errors = 0
                 self._reliable_max_pending = 0
+                self._reliable_watchdog_nacks = 0
+                self._reliable_forced_skips = 0
+                self._watchdog_reconnects = 0
 
     def reliable_metrics(self):
         with self._reliable_lock:
@@ -839,6 +1540,9 @@ class BleTransportWorker(QtCore.QThread):
                 "pending_blocks": int(len(self._reliable_pending)),
                 "max_pending": int(self._reliable_max_pending),
                 "expected_block": int(self._reliable_expected_block),
+                "watchdog_nacks": int(self._reliable_watchdog_nacks),
+                "forced_skips": int(self._reliable_forced_skips),
+                "watchdog_reconnects": int(self._watchdog_reconnects),
                 "session_id": None if self._reliable_session_id is None else int(self._reliable_session_id),
             }
 
@@ -870,12 +1574,22 @@ class BleTransportWorker(QtCore.QThread):
             frame_count = self._reliable_rx_buf[16]
             payload_len = struct.unpack_from("<H", self._reliable_rx_buf, 18)[0]
             gap_marker = bool(flags & 0x04)
+            normal_v1 = (
+                version == BLE_BLOCK_VERSION_V1
+                and 1 <= frame_count <= BLE_V1_FRAMES_PER_BLOCK
+                and payload_len == frame_count * FRAME_BYTES
+            )
+            compact_v2 = (
+                version == BLE_BLOCK_VERSION_V2
+                and 1 <= frame_count <= BLE_V2_FRAMES_PER_BLOCK
+                and payload_len == frame_count * BLE_COMPACT_FRAME_BYTES
+            )
             valid_shape = (
-                version == BLE_BLOCK_VERSION
-                and payload_len <= BLE_BLOCK_MAX_PAYLOAD_BYTES
+                payload_len <= BLE_BLOCK_MAX_PAYLOAD_BYTES
                 and (
                     (gap_marker and frame_count == 0 and payload_len == 0)
-                    or (1 <= frame_count <= 4 and payload_len == frame_count * FRAME_BYTES)
+                    or normal_v1
+                    or compact_v2
                 )
             )
             if not valid_shape:
@@ -898,6 +1612,12 @@ class BleTransportWorker(QtCore.QThread):
             session_id = struct.unpack_from("<I", packet, 4)[0]
             block_seq = struct.unpack_from("<I", packet, 8)[0]
             payload = packet[BLE_BLOCK_HEADER_BYTES:BLE_BLOCK_HEADER_BYTES + payload_len]
+            if not gap_marker and version == BLE_BLOCK_VERSION_V2:
+                try:
+                    payload = expand_compact_ble_payload(payload, frame_count)
+                except Exception:
+                    self._reliable_sync_drop += payload_len
+                    continue
 
             if self._reliable_session_id is None:
                 self._reliable_session_id = session_id
@@ -914,6 +1634,8 @@ class BleTransportWorker(QtCore.QThread):
                     self._reliable_last_ack_sent = 0xFFFFFFFF
                     self._reliable_last_ack_time = 0.0
                     self._reliable_last_nack = None
+                    self._reliable_gap_sequence = None
+                    self._reliable_gap_first_seen = 0.0
                     self._reliable_accept_any_session = False
                 else:
                     self._reliable_duplicates += 1
@@ -947,6 +1669,9 @@ class BleTransportWorker(QtCore.QThread):
                 )
 
             if block_seq > expected:
+                if self._reliable_gap_sequence != expected:
+                    self._reliable_gap_sequence = expected
+                    self._reliable_gap_first_seen = time.monotonic()
                 first_missing = expected
                 last_missing = min(block_seq - 1, expected + 255)
                 now = time.monotonic()
@@ -986,6 +1711,22 @@ class BleTransportWorker(QtCore.QThread):
                 delivered_now += 1
 
             if delivered_now:
+                self._reliable_last_delivery_monotonic = time.monotonic()
+                if self._reliable_expected_block in self._reliable_pending:
+                    self._reliable_gap_sequence = None
+                    self._reliable_gap_first_seen = 0.0
+                elif self._reliable_pending:
+                    next_pending = min(self._reliable_pending)
+                    if next_pending > self._reliable_expected_block:
+                        if self._reliable_gap_sequence != self._reliable_expected_block:
+                            self._reliable_gap_sequence = self._reliable_expected_block
+                            self._reliable_gap_first_seen = time.monotonic()
+                    else:
+                        self._reliable_gap_sequence = None
+                        self._reliable_gap_first_seen = 0.0
+                else:
+                    self._reliable_gap_sequence = None
+                    self._reliable_gap_first_seen = 0.0
                 highest = self._reliable_expected_block - 1
                 now = time.monotonic()
                 ack_distance = (
@@ -1035,8 +1776,144 @@ class BleTransportWorker(QtCore.QThread):
         for packet, kind in control_packets:
             self._schedule_reliable_control(packet, kind)
 
+    async def _reliable_watchdog_loop(self, client):
+        """Repair a lost-block deadlock even when no new notification arrives."""
+        try:
+            while (
+                not self._closing
+                and client is self._client
+                and bool(getattr(client, "is_connected", False))
+            ):
+                await asyncio.sleep(BLE_RELIABLE_WATCHDOG_INTERVAL_S)
+                now = time.monotonic()
+                payloads = []
+                controls = []
+                force_reconnect = False
+                with self._reliable_lock:
+                    expected = int(self._reliable_expected_block)
+                    pending_keys = sorted(self._reliable_pending)
+                    has_hole = bool(pending_keys and pending_keys[0] > expected)
+                    if has_hole:
+                        if self._reliable_gap_sequence != expected:
+                            self._reliable_gap_sequence = expected
+                            self._reliable_gap_first_seen = now
+                        age = max(0.0, now - self._reliable_gap_first_seen)
+                        last_pending = min(pending_keys[-1] - 1, expected + 31)
+                        last_nack = self._reliable_last_nack
+                        if (
+                            last_nack is None
+                            or last_nack[0] != expected
+                            or (now - last_nack[2]) >= BLE_RELIABLE_NACK_REPEAT_S
+                        ):
+                            controls.append((
+                                self._make_reliable_control_packet(
+                                    BLE_CTRL_NACK_RANGE,
+                                    self._reliable_session_id or 0,
+                                    expected,
+                                    max(expected, last_pending),
+                                ),
+                                "nack",
+                            ))
+                            self._reliable_last_nack = (
+                                expected, max(expected, last_pending), now
+                            )
+                            self._reliable_watchdog_nacks += 1
+
+                        # A persistent ordered hole is repaired by reconnecting
+                        # before any block is skipped.  The ESP32 retains several
+                        # seconds of blocks, so resubscribing is normally lossless.
+                        if (
+                            age >= BLE_RELIABLE_HOLE_RECONNECT_S
+                            and (now - self._watchdog_last_reconnect_monotonic)
+                                >= BLE_RELIABLE_RECONNECT_COOLDOWN_S
+                        ):
+                            self._watchdog_last_reconnect_monotonic = now
+                            self._watchdog_reconnects += 1
+                            force_reconnect = True
+
+                        # Emergency fail-open only after a much longer wait.  In
+                        # normal operation the reconnect above or a firmware gap
+                        # marker resolves the hole first.
+                        # block only; the ADS sample sequence in the next payload
+                        # still records the exact missing sample count.
+                        if (
+                            age >= BLE_RELIABLE_HOLE_TIMEOUT_S
+                            or len(self._reliable_pending) >= BLE_RELIABLE_FORCE_SKIP_PENDING
+                        ):
+                            self._reliable_expected_block += 1
+                            self._reliable_forced_skips += 1
+                            self._reliable_gap_markers += 1
+                            self._reliable_gap_sequence = None
+                            self._reliable_gap_first_seen = 0.0
+                            while self._reliable_expected_block in self._reliable_pending:
+                                seq = self._reliable_expected_block
+                                block_payload, block_flags = self._reliable_pending.pop(seq)
+                                if block_flags & 0x04:
+                                    self._reliable_gap_markers += 1
+                                elif block_payload:
+                                    payloads.append(block_payload)
+                                    self._reliable_blocks_delivered += 1
+                                self._reliable_expected_block += 1
+                            highest = self._reliable_expected_block - 1
+                            controls.append((
+                                self._make_reliable_control_packet(
+                                    BLE_CTRL_ACK,
+                                    self._reliable_session_id or 0,
+                                    highest,
+                                ),
+                                "ack",
+                            ))
+                            self._reliable_last_ack_sent = highest
+                            self._reliable_last_ack_time = now
+                            self._reliable_last_delivery_monotonic = now
+
+                    # If Windows/Bleak stops delivering altogether, a reconnect
+                    # is safer than making the user stop and start acquisition.
+                    if (
+                        self._streaming_hint
+                        and (
+                            (
+                                self._last_notify_monotonic is not None
+                                and (now - self._last_notify_monotonic) >= BLE_RELIABLE_STALL_RECONNECT_S
+                            )
+                            or (
+                                self._last_notify_monotonic is None
+                                and self._streaming_hint_started_monotonic > 0.0
+                                and (now - self._streaming_hint_started_monotonic)
+                                    >= BLE_RELIABLE_STALL_RECONNECT_S
+                            )
+                        )
+                        and (now - self._watchdog_last_reconnect_monotonic)
+                            >= BLE_RELIABLE_RECONNECT_COOLDOWN_S
+                    ):
+                        self._watchdog_last_reconnect_monotonic = now
+                        self._watchdog_reconnects += 1
+                        force_reconnect = True
+
+                if payloads:
+                    joined = b"".join(payloads)
+                    with self._data_lock:
+                        self._data_chunks.append(joined)
+                        self._queued_data_bytes += len(joined)
+                for packet, kind in controls:
+                    await self._send_reliable_control(packet, kind)
+                if force_reconnect and client is self._client:
+                    self.info.emit("BLE 可靠流长时间无进展，正在自动重连并继续补传…")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    return
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.info.emit(f"BLE 看门狗异常：{exc}")
+
     def set_streaming_hint(self, active: bool):
         self._streaming_hint = bool(active)
+        self._streaming_hint_started_monotonic = (
+            time.monotonic() if self._streaming_hint else 0.0
+        )
 
     def timing_metrics(self) -> Tuple[float, float, int, int]:
         return (
@@ -1081,16 +1958,33 @@ class BleTransportWorker(QtCore.QThread):
             self._queued_data_bytes = max(0, self._queued_data_bytes - taken)
         return b"".join(parts)
 
-    def clear_data(self):
+    def clear_data(self, reset_reliable: bool = False):
+        """Clear GUI delivery bytes without silently discarding BLE protocol state.
+
+        Reliable block state is preserved by default.  Resetting it during a
+        mode change or automatic reconnect can turn already-retained blocks into
+        apparent frame loss.  A fresh recording explicitly requests a reset.
+        """
         with self._data_lock:
             self._data_chunks.clear()
             self._queued_data_bytes = 0
-        self.reset_reliable_state(reset_metrics=True)
+        if reset_reliable:
+            self.reset_reliable_state(reset_metrics=True)
 
     def _publish_status(self, payload: bytes):
         payload = bytes(payload)
         if len(payload) == 12 and payload[:1] == b"\xBC":
-            self.status_queue.put(payload)
+            try:
+                self.status_queue.put_nowait(payload)
+            except queue.Full:
+                try:
+                    self.status_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.status_queue.put_nowait(payload)
+                except queue.Full:
+                    pass
         self.status_received.emit(payload)
 
     def _on_status(self, _characteristic, data):
@@ -1129,6 +2023,9 @@ class BleTransportWorker(QtCore.QThread):
         if self._status_poll_task is not None:
             self._status_poll_task.cancel()
             self._status_poll_task = None
+        if self._reliable_watchdog_task is not None:
+            self._reliable_watchdog_task.cancel()
+            self._reliable_watchdog_task = None
         should_reconnect = (
             not self._closing
             and not self._manual_disconnect
@@ -1155,6 +2052,21 @@ class BleTransportWorker(QtCore.QThread):
         future = self._submit(self._write(bytes(data)))
         return future.result(timeout=max(0.5, float(timeout)))
 
+    def read_status_blocking(self, timeout: float = 1.0) -> bytes:
+        """Read STATUS directly when a notification was lost during setup."""
+        future = self._submit(self._read_status())
+        return bytes(future.result(timeout=max(0.5, float(timeout))))
+
+    async def _read_status(self) -> bytes:
+        client = self._client
+        if client is None or not bool(getattr(client, "is_connected", False)):
+            raise RuntimeError("BLE 尚未连接")
+        lock = self._gatt_write_lock
+        if lock is None:
+            raise RuntimeError("BLE GATT 锁未就绪")
+        async with lock:
+            return bytes(await client.read_gatt_char(BLE_STATUS_UUID))
+
     async def _write(self, data: bytes):
         client = self._client
         if client is None or not bool(getattr(client, "is_connected", False)):
@@ -1180,6 +2092,9 @@ class BleTransportWorker(QtCore.QThread):
         if self._status_poll_task is not None:
             self._status_poll_task.cancel()
             self._status_poll_task = None
+        if self._reliable_watchdog_task is not None:
+            self._reliable_watchdog_task.cancel()
+            self._reliable_watchdog_task = None
         client = self._client
         self._client = None
         if client is not None:
@@ -1214,7 +2129,7 @@ class BleTransportWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V11 Dual Scheduler | USB Stable + BLE Reliable")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V14 | OpenBCI-style buffered BLE + worker pipeline")
         self.resize(1500, 920)
 
         self.gain = 24  # legacy/global command value
@@ -1229,12 +2144,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ring = RingBuffer(CHANNELS, FS * 90)            # untouched input-referred uV
         self.filtered_ring = RingBuffer(CHANNELS, FS * 90)   # continuous causal display chain
         self.parser = AdsFrameParser(self.channel_lsb_uv)
+        self.filter_generation = 0
+        self.filter_worker: Optional[LiveFilterWorker] = None
+        self.filter_batches_applied = 0
+        self.filter_stale_batches = 0
         self.ser: Optional[serial.Serial] = None
         self.active_transport: Optional[str] = None
         self.transport_connecting = False
         self.ble_worker: Optional[BleTransportWorker] = None
         self.ble_connected = False
+        # Host-side BLE staging buffer.  Reliable blocks are already ordered
+        # in BleTransportWorker; this buffer only coalesces small frame groups so
+        # the GUI thread performs fewer parser/filter calls.
         self.ble_rx_buffer = bytearray()
+        self.ble_batch_started_monotonic: Optional[float] = None
+        self.ble_coalesced_batches = 0
+        self.ble_catchup_plot_skips = 0
+        self.ble_psd_skips = 0
         self.ble_device_name = ""
         self.ble_device_address = ""
         self.ble_peer_mtu = 23
@@ -1251,9 +2177,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.impedance_value_labels = []
         self.impedance_quality_labels = []
         self.impedance_series_spin: Optional[QtWidgets.QDoubleSpinBox] = None
-        self.raw_file = None
+        self.raw_file = None  # legacy compatibility; writes use AsyncRawWriter
+        self.raw_writer = AsyncRawWriter()
+        self.raw_recording_enabled = False
+        self.raw_write_errors = 0
         self.raw_path = ""
         self.raw_bytes = 0
+        self.recording_session_id = ""
+        self.recording_manifest_path = ""
+        self.recording_segment_index = 0
         self.offline_uv: Optional[np.ndarray] = None
         self.offline_valid: Optional[np.ndarray] = None
         self.offline_seq: Optional[np.ndarray] = None
@@ -1275,6 +2207,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backlog_events = 0
         self.queue_drop_hints = 0
         self.saturation_samples = 0
+        self.saturation_channel_samples = np.zeros(CHANNELS, dtype=np.int64)
+        self.last_visible_saturated_channels: Tuple[int, ...] = tuple()
         self.last_seq: Optional[int] = None
         self.last_queue_drop_low = 0
         self.first_seq: Optional[int] = None
@@ -1297,6 +2231,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport_peak_pending_bytes = 0
         self.serial_catchup_skips = 0
         self._plot_update_busy = False
+        self.plot_errors = 0
         self._last_live_plot_packet = -1
         # Live display playback is intentionally delayed by a small amount so
         # Windows BLE notification gaps are absorbed without touching raw data.
@@ -1308,6 +2243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.display_buffer_started = False
         self.display_buffer_state = "priming"
         self.display_buffer_underruns = 0  # event count, not paint-tick count
+        self.display_low_latency_resyncs = 0
         self.display_rebuffer_events = 0
         self.display_rebuffer_started_at: Optional[float] = None
         self.display_rebuffer_last_s = 0.0
@@ -1360,6 +2296,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.psd_request_id = 0
         self.psd_last_signature = None
         self._last_nav_update = 0.0
+        self.filter_worker = LiveFilterWorker(
+            self.sos_display_band, self.sos_notch, True
+        )
+        self.filter_worker.start()
         self.reset_processing_state()
 
         self._build_omni_ui()
@@ -1382,6 +2322,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_timer.timeout.connect(self.poll_transport)
         self.serial_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.serial_timer.start(SERIAL_POLL_INTERVAL_MS)
+
+        self.filter_result_timer = QtCore.QTimer(self)
+        self.filter_result_timer.timeout.connect(self.drain_filter_results)
+        self.filter_result_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.filter_result_timer.start(FILTER_RESULT_POLL_MS)
 
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.update_fast_plots)
@@ -1492,7 +2437,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row += 1
         controls.addWidget(QtWidgets.QLabel("bin名"), row, 0)
-        self.bin_name = QtWidgets.QLineEdit("eeg_%TIME%_gain%GAIN%.bin")
+        self.bin_name = QtWidgets.QLineEdit("MMDD_HHMM_ID_minuteNN.bin（自动）")
+        self.bin_name.setReadOnly(True)
+        self.bin_name.setToolTip("每 60 秒自动切片；完整配置写入 manifest 和 .meta.json")
         controls.addWidget(self.bin_name, row, 1, 1, 4)
         self.import_btn = QtWidgets.QPushButton("导入文件")
         self.import_btn.clicked.connect(self.import_file)
@@ -1579,7 +2526,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
         pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#424245")
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V11 Dual Scheduler | USB Stable + BLE Reliable")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V14 | OpenBCI-style buffered BLE + worker pipeline")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)
@@ -1987,7 +2934,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Compatibility widgets used by the existing acquisition/PSD code.
         # The serial widgets above are the real, visible controls; do not
         # recreate them here or the toolbar would lose its signal bindings.
-        self.bin_name = QtWidgets.QLineEdit("eeg_%TIME%_gain%GAIN%.bin")
+        self.bin_name = QtWidgets.QLineEdit("MMDD_HHMM_ID_minuteNN.bin（自动）")
+        self.bin_name.setReadOnly(True)
+        self.bin_name.setToolTip("每 60 秒自动切片；完整配置写入 manifest 和 .meta.json")
         self.mode_combo = QtWidgets.QComboBox()
         for name, _, _ in MODE_ITEMS: self.mode_combo.addItem(name)
         self.pga_combo = QtWidgets.QComboBox(); self.pga_combo.addItems([str(x) for x in VALID_GAINS]); self.pga_combo.setCurrentText("24")
@@ -2059,26 +3008,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # shrinking, clipping, or otherwise altering the waveform views.
         diagnostics_page = QtWidgets.QWidget()
         diagnostics_layout = QtWidgets.QVBoxLayout(diagnostics_page)
-        diagnostics_layout.setContentsMargins(10, 10, 10, 10)
-        diagnostics_layout.setSpacing(8)
+        diagnostics_layout.setContentsMargins(6, 6, 6, 6)
+        diagnostics_layout.setSpacing(4)
 
         diagnostics_header = QtWidgets.QHBoxLayout()
         diagnostics_title = QtWidgets.QLabel("传输与显示诊断")
-        diagnostics_title.setStyleSheet("font-size:16px; font-weight:700; color:#ff5a01;")
+        diagnostics_title.setStyleSheet("font-size:14px; font-weight:700; color:#ff5a01;")
         diagnostics_header.addWidget(diagnostics_title)
         diagnostics_header.addStretch(1)
+        self.diagnostics_pause_btn = QtWidgets.QPushButton("暂停刷新")
+        self.diagnostics_pause_btn.setCheckable(True)
+        self.diagnostics_pause_btn.setToolTip("暂停后数值和滚动位置保持不变，便于截图或抄录")
+        self.diagnostics_pause_btn.toggled.connect(
+            lambda checked: self.diagnostics_pause_btn.setText(
+                "继续刷新" if checked else "暂停刷新"
+            )
+        )
+        diagnostics_header.addWidget(self.diagnostics_pause_btn)
         diagnostics_copy_btn = QtWidgets.QPushButton("复制诊断信息")
         diagnostics_copy_btn.setToolTip("复制当前全部诊断字段，便于排查 BLE/GUI 卡顿")
         diagnostics_header.addWidget(diagnostics_copy_btn)
         diagnostics_layout.addLayout(diagnostics_header)
 
         diagnostics_note = QtWidgets.QLabel(
-            "这里显示 Display buffer、Display underrun、Render gap、Notify gap、"
-            "Notify burst、Sequence lost 等实时指标。该页面只展示诊断信息，"
-            "不会限幅、裁剪或丢弃 EEG 数据。"
+            "三栏紧凑显示；诊断每 0.5 秒刷新一次，不改变滚动位置，也不影响 EEG 数据。"
         )
-        diagnostics_note.setWordWrap(True)
-        diagnostics_note.setStyleSheet("color:#5b6168;")
+        diagnostics_note.setWordWrap(False)
+        diagnostics_note.setStyleSheet("color:#5b6168;font-size:11px;")
         diagnostics_layout.addWidget(diagnostics_note)
 
         self.info_text = QtWidgets.QPlainTextEdit()
@@ -2086,8 +3042,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info_text.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.info_text.setStyleSheet(
             "QPlainTextEdit{background:#ffffff;color:#242424;border:1px solid #d8dde3;"
-            "font-family:Consolas, 'Cascadia Mono', monospace;font-size:12px;padding:8px;}"
+            "font-family:Consolas, 'Cascadia Mono', monospace;font-size:10px;padding:4px;}"
         )
+        self.info_text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.info_text.document().setDocumentMargin(2)
         diagnostics_layout.addWidget(self.info_text, 1)
         diagnostics_copy_btn.clicked.connect(
             lambda: QtWidgets.QApplication.clipboard().setText(self.info_text.toPlainText())
@@ -2312,13 +3270,61 @@ class MainWindow(QtWidgets.QMainWindow):
             return "BIAS_SENSP+BIAS_SENSN"
         return "BIAS_SENSN" if self.reference_is_srb2() else "BIAS_SENSP"
 
-    def read_config_ack(self, expected_command: int, timeout: float = 1.2):
-        """Read and validate the firmware's 12-byte ADS register readback."""
+    @staticmethod
+    def _decode_config_ack_packet(
+        packet: bytes,
+        expected_command: int,
+        expected_argument: Optional[int] = None,
+    ):
+        packet = bytes(packet)
+        if len(packet) != 12 or packet[0] != 0xBC:
+            return None
+        if packet[1] != (int(expected_command) & 0xFF):
+            return None
+        if expected_argument is not None and packet[2] != (int(expected_argument) & 0xFF):
+            return None
+        checksum = 0
+        for value in packet[:11]:
+            checksum ^= value
+        if checksum != packet[11]:
+            return None
+        return {
+            "command": packet[1],
+            "argument": packet[2],
+            "channel_register": packet[3],
+            "bias_p": packet[4],
+            "bias_n": packet[5],
+            "misc1": packet[6],
+            "loff_p": packet[4],
+            "loff_n": packet[5],
+            "loff_config": packet[6],
+            "reference": packet[7],
+            "mode": packet[8],
+            "verified": bool(packet[9] & 0x01),
+            "enabled_mask": packet[10],
+        }
+
+    def read_config_ack(
+        self,
+        expected_command: int,
+        timeout: float = 1.8,
+        expected_argument: Optional[int] = None,
+    ):
+        """Read one matching ADS register ACK with GATT-read fallback.
+
+        STATUS notifications are not guaranteed to arrive on every Windows BLE
+        adapter.  The firmware also leaves the latest ACK as the current STATUS
+        characteristic value, so a direct GATT read recovers a lost notify.
+        """
         if not self.transport_connected():
             return None
         deadline = time.perf_counter() + timeout
         buffer = bytearray()
         marker = bytes((0xBC, expected_command & 0xFF))
+        wanted_argument = (
+            None if expected_argument is None else int(expected_argument) & 0xFF
+        )
+        next_direct_read = time.perf_counter() + 0.22
         while time.perf_counter() < deadline:
             chunk = b""
             if self.active_transport == "serial":
@@ -2330,36 +3336,44 @@ class MainWindow(QtWidgets.QMainWindow):
                     chunk = self.ble_worker.status_queue.get(timeout=0.02)
                 except queue.Empty:
                     chunk = b""
+                now = time.perf_counter()
+                if not chunk and now >= next_direct_read:
+                    next_direct_read = now + 0.30
+                    try:
+                        direct = self.ble_worker.read_status_blocking(timeout=0.65)
+                    except Exception:
+                        direct = b""
+                    parsed = self._decode_config_ack_packet(
+                        direct, expected_command, wanted_argument
+                    )
+                    if parsed is not None:
+                        return parsed
+
             if chunk:
                 buffer.extend(chunk)
+
+            while True:
                 start = buffer.find(marker)
-                if start >= 0 and len(buffer) >= start + 12:
-                    packet = bytes(buffer[start:start + 12])
-                    checksum = 0
-                    for value in packet[:11]:
-                        checksum ^= value
-                    if checksum != packet[11]:
-                        del buffer[:start + 2]
-                        continue
-                    return {
-                        "command": packet[1],
-                        "argument": packet[2],
-                        "channel_register": packet[3],
-                        "bias_p": packet[4],
-                        "bias_n": packet[5],
-                        "misc1": packet[6],
-                        "loff_p": packet[4],
-                        "loff_n": packet[5],
-                        "loff_config": packet[6],
-                        "reference": packet[7],
-                        "mode": packet[8],
-                        "verified": bool(packet[9] & 0x01),
-                        "enabled_mask": packet[10],
-                    }
-                if len(buffer) > 256:
-                    del buffer[:-32]
+                if start < 0:
+                    if len(buffer) > 1:
+                        del buffer[:-1]
+                    break
+                if len(buffer) < start + 12:
+                    if start:
+                        del buffer[:start]
+                    break
+                packet = bytes(buffer[start:start + 12])
+                del buffer[:start + 12]
+                parsed = self._decode_config_ack_packet(
+                    packet, expected_command, wanted_argument
+                )
+                if parsed is not None:
+                    return parsed
+
+            if len(buffer) > 256:
+                del buffer[:-32]
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 5)
-            time.sleep(0.005)
+            time.sleep(0.004)
         return None
 
     def refresh_channel_parameter_labels(self):
@@ -2476,7 +3490,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     time.sleep(0.12)
                 self.transport_reset_input_buffer()
                 self.transport_write(bytes([0xA7, ch & 0x07, gain & 0xFF, flags]))
-                ack = self.read_config_ack(0xA7)
+                ack = self.read_config_ack(0xA7, expected_argument=ch & 0x07)
                 if ack is None:
                     raise RuntimeError(
                         "固件未返回 A7 寄存器读回。请烧录带配置 ACK 的最新固件。"
@@ -2869,6 +3883,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def channel_lsb_uv(self) -> np.ndarray:
         return VREF / (self.channel_gains.astype(float) * (2**23 - 1)) * 1e6
 
+    def adc_saturation_limits_uv(self) -> np.ndarray:
+        """Per-channel input-referred rail guard in microvolts."""
+        return (
+            ADC_SATURATION_FRACTION
+            * (2**23 - 1)
+            * np.asarray(self.channel_lsb_uv(), dtype=float)
+        )
+
+    def saturation_mask_uv(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if values.ndim != 2 or values.shape[0] != CHANNELS:
+            return np.zeros_like(values, dtype=bool)
+        limits = self.adc_saturation_limits_uv()[:, None]
+        return np.isfinite(values) & (np.abs(values) >= limits)
+
     def set_status(self, text: str):
         self.status_label.setText(text)
 
@@ -3001,7 +4030,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.selected_transport() == "ble":
             key = self.port_combo.currentData()
             if not key:
-                QtWidgets.QMessageBox.warning(self, "BLE", "请先扫描蓝牙并选择 OmniBCI-C3-SRB1-V11、OmniBCI-C3-SRB2-V11 或兼容设备。")
+                QtWidgets.QMessageBox.warning(self, "BLE", "请先扫描蓝牙并选择 OmniBCI-C3-SRB1-V3、OmniBCI-C3-SRB2 或兼容设备。")
                 return
             if self.ble_worker is None:
                 QtWidgets.QMessageBox.critical(self, "BLE", "缺少 bleak，请运行 install_and_run.bat。")
@@ -3061,6 +4090,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _ble_write_channel_config(self, ch: int, reference_mode: int):
+        """Legacy A7 path kept for manual per-channel changes."""
         enabled = bool(self.channel_enabled[ch])
         flags = (
             (0x01 if enabled else 0)
@@ -3073,76 +4103,135 @@ class MainWindow(QtWidgets.QMainWindow):
                 else 0
             )
         )
-        self.transport_reset_input_buffer()
-        self.transport_write(bytes((0xA7, ch, int(self.channel_gains[ch]), flags)))
-        ack = self.read_config_ack(0xA7, timeout=0.9)
-        if ack is None or ack["argument"] != ch or not ack["verified"]:
-            raise RuntimeError(f"BLE 初始化时 CH{ch+1} 配置读回失败")
-        return ack
+        last_ack = None
+        for attempt in range(1, 4):
+            self.transport_reset_input_buffer(reset_reliable=False)
+            self.transport_write(bytes((0xA7, ch, int(self.channel_gains[ch]), flags)))
+            ack = self.read_config_ack(
+                0xA7,
+                timeout=1.8,
+                expected_argument=ch,
+            )
+            last_ack = ack
+            if ack is not None and ack["verified"]:
+                return ack
+            time.sleep(0.08 * attempt)
+
+        detail = "无 ACK"
+        if last_ack is not None:
+            detail = (
+                f"verified={int(bool(last_ack['verified']))}, "
+                f"CHnSET=0x{last_ack['channel_register']:02X}, "
+                f"P=0x{last_ack['bias_p']:02X}, N=0x{last_ack['bias_n']:02X}"
+            )
+        raise RuntimeError(
+            f"BLE 初始化时 CH{ch+1} 配置连续 3 次读回失败（{detail}）"
+        )
+
+    def _ble_write_bulk_config(self, reference_mode: int):
+        """Configure all eight channels in one ADS stop/write/verify transaction."""
+        enabled_mask = sum(
+            (1 << ch) for ch in range(CHANNELS) if self.channel_enabled[ch]
+        ) & 0xFF
+        bias_mask = sum(
+            (1 << ch)
+            for ch in range(CHANNELS)
+            if self.channel_enabled[ch] and self.channel_bias[ch]
+        ) & 0xFF
+        srb2_mask = sum(
+            (1 << ch)
+            for ch in range(CHANNELS)
+            if (
+                reference_mode == REFERENCE_SRB2
+                and self.channel_enabled[ch]
+                and self.channel_srb2[ch]
+            )
+        ) & 0xFF
+        gains = [int(v) & 0xFF for v in self.channel_gains]
+        packet = bytes((
+            0xA5,
+            int(reference_mode) & 0x01,
+            enabled_mask,
+            bias_mask,
+            srb2_mask,
+            *gains,
+        ))
+        last_ack = None
+        for attempt in range(1, 4):
+            self.transport_reset_input_buffer(reset_reliable=False)
+            self.transport_write(packet)
+            ack = self.read_config_ack(
+                0xA5,
+                timeout=2.8,
+                expected_argument=enabled_mask,
+            )
+            last_ack = ack
+            if (
+                ack is not None
+                and ack["verified"]
+                and int(ack.get("enabled_mask", -1)) == enabled_mask
+            ):
+                return ack
+            time.sleep(0.10 * attempt)
+
+        detail = "无 ACK"
+        if last_ack is not None:
+            detail = (
+                f"verified={int(bool(last_ack['verified']))}, "
+                f"enabled=0x{last_ack['enabled_mask']:02X}, "
+                f"P=0x{last_ack['bias_p']:02X}, N=0x{last_ack['bias_n']:02X}, "
+                f"reference={'SRB2' if last_ack.get('reference') else 'SRB1'}"
+            )
+        raise RuntimeError(
+            "BLE 批量通道初始化连续 3 次失败（"
+            + detail
+            + "）。请烧录 V14 配套固件。"
+        )
 
     def sync_ble_configuration(self, requested_reference=None, probe_capability: bool = True):
-        """Configure either fixed-SRB1 or dual-reference reliable BLE firmware.
-
-        Capability is determined from the firmware's A7 readback byte 7. This
-        deliberately avoids relying only on the advertised BLE name, so both
-        firmwares may use distinct names or a shared name without changing the
-        GUI protocol. A6 register 0x0D is the logical BIAS mask command for both
-        firmwares; the dual-reference firmware routes it to SENSP or SENSN.
-        """
+        """Apply one atomic A5 configuration instead of eight full A7 rewrites."""
         self.transport_write(b"s")
-        time.sleep(0.05)
-
-        supports_srb2 = bool(self.ble_supports_srb2)
-        if probe_capability:
-            # Harmless on the fixed SRB1 firmware: unsupported A8 is ignored.
-            # On the dual firmware this selects SRB2, which is then confirmed by
-            # the reference byte in the following A7 register readback.
-            self.transport_reset_input_buffer()
-            self.transport_write(bytes((0xA8, REFERENCE_SRB2)))
-            time.sleep(0.08)
-            self.transport_write(b"p")
-            time.sleep(0.08)
-            probe_ack = self._ble_write_channel_config(0, REFERENCE_SRB2)
-            supports_srb2 = int(probe_ack.get("reference", REFERENCE_SRB1)) == REFERENCE_SRB2
+        time.sleep(0.08)
 
         if requested_reference is None:
             hinted = self.ble_reference_hint_from_name(self.ble_device_name)
             requested_reference = self.reference_mode if hinted is None else hinted
         requested_reference = (
-            REFERENCE_SRB2 if int(requested_reference) == REFERENCE_SRB2 else REFERENCE_SRB1
+            REFERENCE_SRB2
+            if int(requested_reference) == REFERENCE_SRB2
+            else REFERENCE_SRB1
         )
+
+        supports_srb2 = bool(self.ble_supports_srb2)
+        if probe_capability:
+            self.transport_reset_input_buffer(reset_reliable=False)
+            self.transport_write(bytes((0xA8, REFERENCE_SRB2)))
+            time.sleep(0.06)
+            self.transport_write(b"p")
+            time.sleep(0.06)
+            probe_ack = self._ble_write_bulk_config(REFERENCE_SRB2)
+            supports_srb2 = (
+                int(probe_ack.get("reference", REFERENCE_SRB1)) == REFERENCE_SRB2
+            )
+
         actual_reference = (
             REFERENCE_SRB2
             if requested_reference == REFERENCE_SRB2 and supports_srb2
             else REFERENCE_SRB1
         )
-
-        self.transport_reset_input_buffer()
+        self.transport_reset_input_buffer(reset_reliable=False)
         self.transport_write(bytes((0xA8, actual_reference)))
-        time.sleep(0.08)
+        time.sleep(0.06)
         self.transport_write(b"p")
-        time.sleep(0.08)
-
-        for ch in range(CHANNELS):
-            ack = self._ble_write_channel_config(ch, actual_reference)
-            if int(ack.get("reference", REFERENCE_SRB1)) != actual_reference:
-                raise RuntimeError(
-                    f"BLE 参考模式读回不一致：请求 {('SRB2' if actual_reference else 'SRB1')}，"
-                    f"固件返回 {('SRB2' if ack.get('reference') else 'SRB1')}"
-                )
-
-        mask = sum(
-            (1 << i) for i in range(CHANNELS)
-            if self.channel_bias[i] and self.channel_enabled[i]
-        )
-        self.transport_reset_input_buffer()
-        self.transport_write(bytes((0xA6, 0x0D, mask & 0xFF)))
-        ack = self.read_config_ack(0xA6, timeout=0.9)
-        if ack is None or ack["argument"] != (mask & 0xFF) or not ack["verified"]:
-            raise RuntimeError("BLE 初始化时逻辑 BIAS mask 配置读回失败")
+        time.sleep(0.06)
+        ack = self._ble_write_bulk_config(actual_reference)
         if int(ack.get("reference", REFERENCE_SRB1)) != actual_reference:
-            raise RuntimeError("BLE BIAS 配置后的参考模式读回不一致")
-        self.transport_reset_input_buffer()
+            raise RuntimeError(
+                f"BLE 参考模式读回不一致：请求 "
+                f"{('SRB2' if actual_reference else 'SRB1')}，固件返回 "
+                f"{('SRB2' if ack.get('reference') else 'SRB1')}"
+            )
+        self.transport_reset_input_buffer(clear_status=True, reset_reliable=False)
         return actual_reference, supports_srb2
 
     def on_ble_connected(self, name: str, address: str, mtu: int, reconnected: bool):
@@ -3162,6 +4251,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.reference_combo.setEnabled(False)
         self.apply_reference_btn.setEnabled(False)
+
+        # During an active recording the ESP32 keeps sampling and retains BLE
+        # blocks across a radio disconnect.  Do not send s/A5/b here: doing so
+        # destroys the retained session and creates a real sequence gap exactly
+        # when the automatic reconnect was supposed to recover it.
+        if reconnected and self.streaming:
+            if self.ble_worker is not None:
+                self.ble_worker.set_streaming_hint(True)
+            self.reference_combo.setEnabled(bool(self.ble_supports_srb2))
+            self.apply_reference_btn.setEnabled(bool(self.ble_supports_srb2))
+            self.set_status(
+                f"BLE 已自动重连：{name}，MTU={mtu}；正在继续原可靠会话并补传断线期间数据。"
+            )
+            return
 
         hinted_reference = self.ble_reference_hint_from_name(name)
         requested_reference = (
@@ -3194,8 +4297,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mode_before_internal_short = 1
             self.mode_combo.setCurrentIndex(self._mode_index_from_code(1))
             self._sync_internal_short_button(False)
-            if reconnected and self.streaming:
-                self.transport_write(b"b")
             action = "已自动重连" if reconnected else "已连接"
             capability = "可切换 SRB1/SRB2" if supports_srb2 else "固定 SRB1"
             self.set_status(
@@ -3219,6 +4320,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.streaming = False
         self.close_raw_file()
         self.ble_rx_buffer.clear()
+        self.ble_batch_started_monotonic = None
         if self.ble_worker is not None:
             self.ble_worker.clear_data()
         self.connect_btn.setText("连接蓝牙")
@@ -3271,10 +4373,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ble_peer_mtu = self.ble_status["mtu"]
         self.current_mode = int(self.ble_status["mode"])
         self._sync_internal_short_button(self.current_mode == 3)
-        if (len(data) < 72 or data[2] != 0x03) and not self.ble_protocol_warned:
+        if (len(data) < 72 or data[2] not in (0x03, 0x04)) and not self.ble_protocol_warned:
             self.ble_protocol_warned = True
             self.set_status(
-                "BLE 固件协议不匹配：请烧录可靠传输协议 V3 的 SRB1 或 SRB2 固件。"
+                "BLE 固件协议不匹配：请烧录可靠传输协议 V3/V4 的 SRB1 或 SRB2 固件。"
             )
         if self.ble_peer_mtu >= BLE_MIN_STREAM_MTU:
             self.ble_low_mtu_warned = False
@@ -3356,14 +4458,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return len(payload)
         raise RuntimeError("设备未连接")
 
-    def transport_reset_input_buffer(self, clear_status: bool = True):
+    def transport_reset_input_buffer(
+        self, clear_status: bool = True, reset_reliable: bool = False
+    ):
         if self.active_transport == "serial":
             if self.ser and self.ser.is_open:
                 self.ser.reset_input_buffer()
         elif self.active_transport == "ble":
             self.ble_rx_buffer.clear()
+            self.ble_batch_started_monotonic = None
             if self.ble_worker is not None:
-                self.ble_worker.clear_data()
+                self.ble_worker.clear_data(reset_reliable=reset_reliable)
             if clear_status and self.ble_worker is not None:
                 while True:
                     try:
@@ -3372,17 +4477,38 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
         self.last_serial_waiting_bytes = 0
 
+    def _recording_folder(self) -> Path:
+        folder = Path(__file__).resolve().parent / "recordings" / "bin"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _recording_configuration_snapshot(self) -> dict:
+        reference = "SRB2" if self.reference_is_srb2() else "SRB1"
+        transport = self.transport_description() if self.transport_connected() else "disconnected"
+        return {
+            "sample_rate_hz": FS,
+            "frame_bytes": FRAME_BYTES,
+            "transport": transport,
+            "ble_device_name": self.ble_device_name or "",
+            "ble_device_address": self.ble_device_address or "",
+            "reference": reference,
+            "reference_code": int(self.reference_mode),
+            "mode_code": int(self.current_mode),
+            "mode_name": MODE_NAMES.get(int(self.current_mode), "UNKNOWN"),
+            "global_gain": int(self.gain),
+            "channel_gains": [int(value) for value in self.channel_gains.tolist()],
+            "channel_enabled": [bool(value) for value in self.channel_enabled.tolist()],
+            "channel_bias": [bool(value) for value in self.channel_bias.tolist()],
+            "channel_srb2": [bool(value) for value in self.channel_srb2.tolist()],
+            "bias_register": self.bias_register_name(),
+            "bias_mask": int(self.current_bias_mask()),
+            "bias_mask_hex": f"0x{self.current_bias_mask():02X}",
+        }
+
     def make_raw_path(self) -> str:
-        name = self.bin_name.text().strip() or "eeg_%TIME%_gain%GAIN%.bin"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name = name.replace("%TIME%", stamp).replace("%GAIN%", str(self.gain))
-        path = Path(name)
-        if not path.is_absolute():
-            folder = Path(__file__).resolve().parent / "recordings" / "bin"
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return str(path)
+        """Preview the next automatic one-minute segment name."""
+        now = datetime.now()
+        return str(self._recording_folder() / f"{now:%m%d_%H%M}_xxxxxx_minute01.bin")
 
     # ---------------- processing state/helpers ----------------
     def reset_processing_state(self):
@@ -3397,6 +4523,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.display_zi_notch = np.zeros((CHANNELS, self.sos_notch.shape[0], 2), dtype=float)
         self.last_filter_input = np.zeros(CHANNELS, dtype=float)
         self.have_filter_input = np.zeros(CHANNELS, dtype=bool)
+        self.filter_generation = int(getattr(self, "filter_generation", 0)) + 1
+        worker = getattr(self, "filter_worker", None)
+        if worker is not None:
+            use_notch = (
+                self.notch_check.isChecked()
+                if hasattr(self, "notch_check") else True
+            )
+            worker.configure(
+                self.filter_generation,
+                self.sos_display_band,
+                self.sos_notch,
+                use_notch,
+            )
         self.reset_psd_smoothing()
 
     def reset_psd_smoothing(self, *_args):
@@ -3532,9 +4671,14 @@ class MainWindow(QtWidgets.QMainWindow):
             sequence = np.array([fr.sequence for fr in frames], dtype=np.uint32)
         if modes is None:
             modes = np.array([fr.mode for fr in frames], dtype=np.uint8)
-        filled = values.copy()
+        source = np.asarray(values, dtype=float)
+        channel_good_matrix = np.asarray(valid, dtype=bool)[None, :] & np.isfinite(source)
+        filled = source.copy()
+        # Missing/saturated samples are forward-filled only for evolving the
+        # causal filter state. The corresponding channel output is restored to
+        # NaN below, so no EEG value is invented.
         for ch in range(CHANNELS):
-            channel_good = valid & np.isfinite(filled[ch])
+            channel_good = channel_good_matrix[ch]
             if not self.have_filter_input[ch]:
                 first_candidates = np.flatnonzero(channel_good)
                 if first_candidates.size:
@@ -3546,16 +4690,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.last_filter_input[ch] = first_value
                     self.have_filter_input[ch] = True
             if channel_good.all():
-                # Normal and saturated ADC codes are both finite, valid data.
-                # Process the entire vector at once; amplitude never changes the
-                # amount of Python work and is never clipped or substituted.
                 if filled.shape[1]:
                     self.last_filter_input[ch] = float(filled[ch, -1])
                     self.have_filter_input[ch] = True
             else:
-                # Vectorized forward-fill keeps large loss gaps cheap. Invalid
-                # columns remain invalid in the ring; held values are used only
-                # to evolve the causal filter state across missing sample time.
                 n_samples = int(filled.shape[1])
                 if n_samples:
                     original = filled[ch].copy()
@@ -3572,15 +4710,41 @@ class MainWindow(QtWidgets.QMainWindow):
                     if good_indices.size:
                         self.last_filter_input[ch] = float(original[int(good_indices[-1])])
                         self.have_filter_input[ch] = True
-            y, self.display_zi_band[ch] = signal.sosfilt(
-                self.sos_display_band, filled[ch], zi=self.display_zi_band[ch]
+
+        # SciPy accepts all eight channels in one call when the sample axis is 1.
+        # State is transposed from (channel, section, 2) to the required
+        # (section, channel, 2), cutting the hot path from 16 sosfilt calls per
+        # BLE batch to only two calls.
+        band_zi = np.transpose(self.display_zi_band, (1, 0, 2))
+        filtered, band_zf = signal.sosfilt(
+            self.sos_display_band, filled, axis=1, zi=band_zi
+        )
+        self.display_zi_band = np.transpose(band_zf, (1, 0, 2))
+        if not hasattr(self, "notch_check") or self.notch_check.isChecked():
+            notch_zi = np.transpose(self.display_zi_notch, (1, 0, 2))
+            filtered, notch_zf = signal.sosfilt(
+                self.sos_notch, filtered, axis=1, zi=notch_zi
             )
-            if not hasattr(self, "notch_check") or self.notch_check.isChecked():
-                y, self.display_zi_notch[ch] = signal.sosfilt(
-                    self.sos_notch, y, zi=self.display_zi_notch[ch]
-                )
-            filled[ch] = y
-        self.filtered_ring.append_batch(filled, valid, sequence, modes)
+            self.display_zi_notch = np.transpose(notch_zf, (1, 0, 2))
+
+        # One non-finite value must not poison an IIR state forever and make all
+        # later waveforms disappear.  Reset only the affected channel state and
+        # pass a finite fallback through this display batch; validity masks still
+        # preserve real packet gaps.
+        bad_channels = np.flatnonzero(
+            ~np.all(np.isfinite(filtered), axis=1)
+            | ~np.all(np.isfinite(self.display_zi_band), axis=(1, 2))
+            | ~np.all(np.isfinite(self.display_zi_notch), axis=(1, 2))
+        )
+        for ch in bad_channels:
+            seed = float(self.last_filter_input[ch]) if np.isfinite(self.last_filter_input[ch]) else 0.0
+            self.display_zi_band[ch] = signal.sosfilt_zi(self.sos_display_band) * seed
+            self.display_zi_notch[ch].fill(0.0)
+            filtered[ch] = np.nan_to_num(filtered[ch], nan=seed, posinf=seed, neginf=seed)
+        filtered[~channel_good_matrix] = np.nan
+        self.filtered_ring.append_batch(
+            np.asarray(filtered, dtype=np.float32), valid, sequence, modes
+        )
 
     def smooth_psd_db(self, f: np.ndarray, p: np.ndarray) -> np.ndarray:
         now_db = 10.0 * np.log10(np.asarray(p, dtype=float) + np.finfo(float).eps)
@@ -3886,7 +5050,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.transport_reset_input_buffer()
             self.parser.reset()
             self.transport_write(bytes((0xA9, mask & 0xFF)))
-            ack = self.read_config_ack(0xA9)
+            ack = self.read_config_ack(0xA9, expected_argument=mask & 0xFF)
             expected_p = 0 if self.reference_is_srb2() else mask
             expected_n = mask if self.reference_is_srb2() else 0
             if (
@@ -3939,7 +5103,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 time.sleep(0.08)
                 self.transport_reset_input_buffer()
                 self.transport_write(bytes((0xA9, 0x00)))
-                ack = self.read_config_ack(0xA9)
+                ack = self.read_config_ack(0xA9, expected_argument=mask & 0xFF)
                 if (
                     ack is None
                     or not ack["verified"]
@@ -4032,6 +5196,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backlog_events = 0
         self.queue_drop_hints = 0
         self.saturation_samples = 0
+        self.saturation_channel_samples = np.zeros(CHANNELS, dtype=np.int64)
+        self.last_visible_saturated_channels: Tuple[int, ...] = tuple()
         self.last_seq = None
         self.last_queue_drop_low = 0
         self.first_seq = None
@@ -4047,6 +5213,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_catchup_skips = 0
         self.transport_last_turn_ms = 0.0
         self.transport_max_turn_ms = 0.0
+        self.ble_coalesced_batches = 0
+        self.ble_catchup_plot_skips = 0
+        self.ble_psd_skips = 0
+        self.ble_batch_started_monotonic = None
+        self.raw_write_errors = 0
+        self.plot_errors = 0
         self._last_live_plot_packet = -1
         self.session_started_monotonic = time.monotonic()
         # Clear the locally displayed firmware counters immediately. The 'r'
@@ -4063,11 +5235,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_stream(self):
         if not self.require_transport():
             return
-        if self.active_transport == "ble" and int(self.ble_status.get("status_protocol", 0)) != 0x03:
+        if self.active_transport == "ble" and int(self.ble_status.get("status_protocol", 0)) not in (0x03, 0x04):
             QtWidgets.QMessageBox.warning(
                 self,
                 "BLE 固件不匹配",
-                "V11 BLE 模式需要配套 V11（或兼容 V8 协议 V3）可靠 BLE 固件。请检查烧录版本。",
+                "V15 BLE 模式需要配套 V13+ 可靠 BLE 固件。请检查烧录版本。",
             )
             return
         if (
@@ -4100,20 +5272,30 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.ble_worker is not None:
                 self.ble_worker.reset_timing_metrics()
                 self.ble_worker.set_streaming_hint(True)
-            self.raw_path = self.make_raw_path()
-            self.raw_file = open(self.raw_path, "wb")
+            self.raw_writer.start_session(
+                str(self._recording_folder()),
+                self._recording_configuration_snapshot(),
+            )
+            snap = self.raw_writer.snapshot()
+            self.raw_path = str(snap.get("current_path", ""))
+            self.recording_session_id = str(snap.get("session_id", ""))
+            self.recording_manifest_path = str(snap.get("manifest_path", ""))
+            self.recording_segment_index = int(snap.get("segment_index", 1))
+            self.raw_recording_enabled = True
+            self.raw_write_errors = 0
+            self.raw_file = True
             self.raw_bytes = 0
             self.transport_reset_input_buffer()
             if self.active_transport == "ble":
-                # Reliable BLE needs a fresh retained-block session and matching
-                # diagnostics.  USB deliberately follows the simpler P0P1 start
-                # path so no extra control/flush work competes with first frames.
                 self.transport_write(b"r")
                 time.sleep(0.05)
-                self.transport_reset_input_buffer(clear_status=False)
+                self.transport_reset_input_buffer(clear_status=False, reset_reliable=True)
             self.transport_write(b"b")
             self.streaming = True
-            self.set_status(f"实时采集中，raw bin 保存到：{self.raw_path}")
+            self.set_status(
+                f"实时采集中：ID {self.recording_session_id}，每 60 秒自动分包，"
+                f"当前 {Path(self.raw_path).name}"
+            )
         except Exception as exc:
             self.close_raw_file()
             QtWidgets.QMessageBox.critical(self, "开始失败", str(exc))
@@ -4123,7 +5305,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_impedance_detection(silent=True)
             return
         was_streaming = bool(self.streaming)
-        finished_path = self.raw_path
+        first_path = self.raw_writer.first_path or self.raw_path
         if self.transport_connected():
             try:
                 self.transport_write(b"s")
@@ -4133,30 +5315,64 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ble_worker is not None:
             self.ble_worker.set_streaming_hint(False)
         self.close_raw_file()
+        snap = self.raw_writer.snapshot()
+        segment_count = int(snap.get("segment_count", 0))
+        if was_streaming and self.recording_session_id:
+            manifest_name = (
+                Path(self.recording_manifest_path).name
+                if self.recording_manifest_path else "---"
+            )
+            self.set_status(
+                f"采集已停止：ID {self.recording_session_id}，"
+                f"共 {segment_count} 个一分钟 BIN；清单 {manifest_name}"
+            )
         if (
             offer_export
             and was_streaming
-            and finished_path
-            and Path(finished_path).exists()
-            and Path(finished_path).stat().st_size
+            and first_path
+            and Path(first_path).exists()
+            and Path(first_path).stat().st_size
         ):
-            self.set_status(f"采集已停止，原始 BIN：{finished_path}")
             if QtWidgets.QMessageBox.question(
                 self,
                 "采集完成",
-                "原始 BIN 已保存。是否现在转换为 BDF 或 MNE FIF？",
+                "分包 BIN 已保存。是否转换第一个一分钟文件为 BDF 或 MNE FIF？",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.Yes,
+                QtWidgets.QMessageBox.No,
             ) == QtWidgets.QMessageBox.Yes:
-                self.export_biosignal_formats(finished_path)
+                self.export_biosignal_formats(first_path)
+
+    def enqueue_raw_bytes(self, data: bytes):
+        """Queue raw bytes; rotation and metadata remain off the Qt thread."""
+        if not self.raw_recording_enabled or not data:
+            return
+        if self.raw_writer.submit(data):
+            self.raw_bytes += len(data)
+            snap = self.raw_writer.snapshot()
+            current_path = str(snap.get("current_path", ""))
+            if current_path:
+                self.raw_path = current_path
+            self.recording_segment_index = int(snap.get("segment_index", self.recording_segment_index))
+            return
+        self.raw_recording_enabled = False
+        self.raw_write_errors += 1
+        self.raw_file = None
+        error = self.raw_writer.error or "原始 BIN 写盘线程不可用"
+        self.set_status(f"{error}；实时波形和传输继续运行。")
 
     def close_raw_file(self):
-        if self.raw_file:
+        if self.raw_recording_enabled or self.raw_file is not None:
+            self.raw_recording_enabled = False
             try:
-                self.raw_file.flush()
-                self.raw_file.close()
+                self.raw_writer.stop(timeout=15.0)
             except Exception:
-                pass
+                self.raw_write_errors += 1
+        snap = self.raw_writer.snapshot()
+        current_path = str(snap.get("current_path", ""))
+        if current_path:
+            self.raw_path = current_path
+        self.recording_manifest_path = str(snap.get("manifest_path", self.recording_manifest_path))
+        self.recording_segment_index = int(snap.get("segment_index", self.recording_segment_index))
         self.raw_file = None
 
     def _mode_index_from_code(self, mode_code: int) -> int:
@@ -4336,9 +5552,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     data = self.ser.read(n)
                     if not data:
                         break
-                    if self.raw_file:
-                        self.raw_file.write(data)
-                        self.raw_bytes += len(data)
+                    self.enqueue_raw_bytes(data)
                     frames = self.parser.feed(data)
                     if frames:
                         self.process_frames(frames, live=True)
@@ -4347,31 +5561,54 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.transport_peak_pending_bytes = max(
                     self.transport_peak_pending_bytes, int(pending_before)
                 )
-                budget = (
-                    TRANSPORT_CATCHUP_BUDGET_S
-                    if pending_before > TRANSPORT_CATCHUP_THRESHOLD_BYTES
-                    else TRANSPORT_NORMAL_BUDGET_S
+
+                # First move ordered reliable payloads out of the BLE worker.
+                # This lock-held operation is tiny; parsing/filtering happens only
+                # after enough frames have been coalesced below.
+                drained = b""
+                if self.ble_worker is not None:
+                    drained = self.ble_worker.drain_data(BLE_MAX_PROCESS_BYTES)
+                if drained:
+                    if not self.ble_rx_buffer:
+                        self.ble_batch_started_monotonic = time.monotonic()
+                    self.ble_rx_buffer.extend(drained)
+                    self.enqueue_raw_bytes(drained)
+
+                staged = len(self.ble_rx_buffer)
+                worker_pending = 0
+                if self.ble_worker is not None:
+                    try:
+                        worker_pending = self.ble_worker.queued_data_bytes()
+                    except Exception:
+                        worker_pending = 0
+                held_s = (
+                    0.0 if self.ble_batch_started_monotonic is None
+                    else max(0.0, time.monotonic() - self.ble_batch_started_monotonic)
                 )
-                deadline = turn_started + budget
-                while time.perf_counter() < deadline:
-                    data = b""
-                    if self.ble_worker is not None:
-                        data = self.ble_worker.drain_data(TRANSPORT_MAX_BATCH_BYTES)
-                    if not data and self.ble_rx_buffer:
-                        take = min(len(self.ble_rx_buffer), TRANSPORT_MAX_BATCH_BYTES)
-                        data = bytes(self.ble_rx_buffer[:take])
-                        del self.ble_rx_buffer[:take]
-                    self.last_serial_waiting_bytes = self._ble_pending_bytes()
-                    if not data:
-                        break
-                    if self.raw_file:
-                        self.raw_file.write(data)
-                        self.raw_bytes += len(data)
+                should_process = bool(
+                    staged >= BLE_COALESCE_MIN_BYTES
+                    or (staged > 0 and held_s >= BLE_COALESCE_MAX_HOLD_S)
+                    or staged >= BLE_MAX_PROCESS_BYTES
+                )
+
+                # One matrix batch per Qt turn.  Do not loop until empty: a
+                # continuous 1-ms repoll chain was able to starve window events.
+                if should_process:
+                    take = min(staged, BLE_MAX_PROCESS_BYTES)
+                    data = bytes(self.ble_rx_buffer[:take])
+                    del self.ble_rx_buffer[:take]
+                    if self.ble_rx_buffer:
+                        self.ble_batch_started_monotonic = time.monotonic()
+                    else:
+                        self.ble_batch_started_monotonic = None
                     frames = self.parser.feed(data)
                     if frames:
+                        self.ble_coalesced_batches += 1
                         self.process_frames(frames, live=True)
-                    if time.perf_counter() >= deadline:
-                        break
+
+                self.last_serial_waiting_bytes = int(
+                    len(self.ble_rx_buffer) + worker_pending
+                )
         except Exception as exc:
             self.set_status(f"{self.transport_description()} 读取异常：{exc}")
         finally:
@@ -4404,10 +5641,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self._poll_serial_busy = False
 
         if remaining > 0 and self.transport_connected():
-            # BLE always yields between bounded batches.  USB normally catches
-            # up in one turn, but an immediate follow-up protects against a rare
-            # long Windows burst without waiting for the next paint cycle.
-            self._schedule_transport_repoll()
+            needs_repoll = True
+            if self.active_transport == "ble":
+                worker_pending = 0
+                if self.ble_worker is not None:
+                    try:
+                        worker_pending = self.ble_worker.queued_data_bytes()
+                    except Exception:
+                        worker_pending = 0
+                held_s = (
+                    0.0 if self.ble_batch_started_monotonic is None
+                    else max(0.0, time.monotonic() - self.ble_batch_started_monotonic)
+                )
+                # A small staged batch is intentionally waiting for coalescing;
+                # let the regular 8-ms timer wake it instead of creating an
+                # endless singleShot chain.
+                needs_repoll = bool(
+                    worker_pending > 0
+                    or len(self.ble_rx_buffer) >= BLE_COALESCE_MIN_BYTES
+                    or held_s >= BLE_COALESCE_MAX_HOLD_S
+                )
+            if needs_repoll:
+                self._schedule_transport_repoll()
     def poll_serial(self):
         """Backward-compatible alias used by older scripts/tests."""
         self.poll_transport()
@@ -4490,10 +5745,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     progressed = ((fr.sequence - self.first_seq) & 0xFFFFFFFF) + 1
                     self.fs_est = progressed / elapsed
 
-            enabled_counts = fr.raw_counts[self.channel_enabled]
-            self.saturation_samples += int(
-                np.sum(np.abs(enabled_counts) > 0.95 * (2**23 - 1))
+            frame_saturated = np.abs(fr.raw_counts) >= (
+                ADC_SATURATION_FRACTION * (2**23 - 1)
             )
+            enabled_saturated = frame_saturated & self.channel_enabled
+            self.saturation_samples += int(np.sum(enabled_saturated))
+            self.saturation_channel_samples += enabled_saturated.astype(np.int64)
             self.current_mode = fr.mode
             if fr.mode in (0, 1, 2):
                 detected_reference = (
@@ -4516,13 +5773,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ring.append_batch(
                 timeline_values, timeline_valid, timeline_sequence, timeline_modes
             )
-            self.append_live_filtered(
-                frames,
-                timeline_values,
-                timeline_valid,
-                timeline_sequence,
-                timeline_modes,
-            )
+            # Preserve raw data exactly. Only the live-filter copy masks rail
+            # samples, so saturation cannot poison the IIR or the Qt paint path.
+            filter_values = timeline_values
+            saturation_mask = self.saturation_mask_uv(timeline_values)
+            if np.any(saturation_mask):
+                filter_values = timeline_values.copy()
+                filter_values[saturation_mask] = np.nan
+            if self.filter_worker is not None:
+                self.filter_worker.submit(
+                    self.filter_generation,
+                    filter_values,
+                    timeline_valid,
+                    timeline_sequence,
+                    timeline_modes,
+                )
+            else:
+                self.append_live_filtered(
+                    frames,
+                    filter_values,
+                    timeline_valid,
+                    timeline_sequence,
+                    timeline_modes,
+                )
             if use_ble_timeline and large_discontinuities:
                 self.display_cursor_sample = None
                 self.display_buffer_started = False
@@ -4531,6 +5804,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if detected_reference is not None and detected_reference != self.reference_mode:
             self.set_reference_mode_local(detected_reference)
         self._sync_internal_short_button(self.current_mode == 3)
+    def drain_filter_results(self):
+        worker = self.filter_worker
+        if worker is None:
+            return
+        deadline = time.perf_counter() + FILTER_RESULT_BUDGET_S
+        for batch in worker.drain(max_batches=32):
+            if batch.generation != self.filter_generation:
+                self.filter_stale_batches += 1
+                continue
+            self.filtered_ring.append_batch(
+                batch.filtered, batch.valid, batch.sequence, batch.modes
+            )
+            self.filter_batches_applied += 1
+            if time.perf_counter() >= deadline:
+                break
+
+    def filter_worker_backlog_samples(self) -> int:
+        worker = self.filter_worker
+        if worker is None:
+            return 0
+        metrics = worker.metrics()
+        return int(metrics["queued_samples"] + metrics["output_samples"])
+
     def current_bias_mask(self) -> int:
         mask = 0
         for i, cb in enumerate(self.bias_checks):
@@ -4564,7 +5860,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 time.sleep(0.12)
             self.transport_reset_input_buffer()
             self.transport_write(bytes([0xA6, 0x0D, mask]))
-            ack = self.read_config_ack(0xA6)
+            ack = self.read_config_ack(0xA6, expected_argument=mask & 0xFF)
             if ack is None:
                 raise RuntimeError(
                     "固件未返回 A6 寄存器读回。请烧录带配置 ACK 的最新固件。"
@@ -4766,6 +6062,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.display_buffer_started = False
         self.display_buffer_state = "priming"
         self.display_buffer_underruns = 0
+        self.display_low_latency_resyncs = 0
         self.display_rebuffer_events = 0
         self.display_rebuffer_started_at = None
         self.display_rebuffer_last_s = 0.0
@@ -4782,8 +6079,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Grow the reserve when this Windows link demonstrates larger gaps.
 
         The target never shrinks during a recording, avoiding cursor jumps and
-        preserving every sample in display order. It is capped at 3 s so one OS
-        suspension cannot create unbounded latency.
+        preserving every sample in display order. It is capped at 1 s so one OS
+        suspension cannot create permanently growing live-view latency.
         """
         if self.active_transport != "ble" or self.ble_worker is None:
             return
@@ -4800,11 +6097,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.display_target_delay_samples = requested_samples
 
     def advance_live_display_cursor(self) -> int:
-        """Advance losslessly at sample-clock speed behind an adaptive reserve.
+        """Advance the live-only cursor behind an adaptive reserve.
 
-        If the reserve is ever exhausted, playback pauses once and rebuilds the
-        full reserve before resuming. It does not repeatedly consume each tiny
-        arriving chunk, which was the source of the visible stop-go behaviour.
+        Normal playback preserves order and can temporarily run faster than real
+        time to remove burst-induced lag. After an unusually long OS stall, only
+        stale screen history may be skipped; raw BIN and analysis rings remain
+        complete.
         """
         total = int(self.ring.total_appended)
         now = time.monotonic()
@@ -4838,7 +6136,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.display_rebuffer_started_at = None
             self.display_buffer_state = "playing"
 
+        # Keep the screen close to real time without touching the lossless raw
+        # and filtered rings. A delayed Windows notification burst can increase
+        # reserve abruptly; accelerate the playback cursor smoothly to remove
+        # that excess. Very stale screen history is skipped only on the display
+        # path so live latency never ratchets upward for the rest of a recording.
+        reserve = max(0.0, float(total) - cursor)
+        hard_max = int(round(DISPLAY_JITTER_HARD_MAX_S * FS))
+        hard_trigger = hard_max + int(round(DISPLAY_JITTER_HARD_HYSTERESIS_S * FS))
+        if reserve > hard_trigger:
+            cursor = float(max(0, total - target))
+            self.display_cursor_sample = cursor
+            self.display_low_latency_resyncs += 1
+            reserve = max(0.0, float(total) - cursor)
+
         desired_advance = dt * FS
+        excess = max(0.0, reserve - float(target))
+        catchup_trigger = DISPLAY_JITTER_CATCHUP_TRIGGER_S * FS
+        if excess > catchup_trigger and desired_advance > 0.0:
+            ramp_span = max(1.0, 0.50 * FS)
+            fraction = min(1.0, (excess - catchup_trigger) / ramp_span)
+            rate = 1.0 + (DISPLAY_JITTER_CATCHUP_MAX_RATE - 1.0) * fraction
+            desired_advance *= rate
+
         max_end = float(max(0, total - self.display_min_reserve_samples))
         available_advance = max(0.0, max_end - cursor)
         if desired_advance > 0.5 and available_advance + 1e-9 < desired_advance:
@@ -5005,20 +6325,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_render_monotonic = now
 
         is_live = self.offline_uv is None
+        filter_backlog_s = self.filter_worker_backlog_samples() / FS
         if is_live and self.active_transport == "serial":
-            # This is the important behavior restored from the no-suffix P0P1
-            # GUI: receive work wins over paint work, every time.
+            # Receive and raw recording always win. Filtering has its own FIFO;
+            # Qt paints only after that worker catches up.
             self.poll_transport()
             if (
                 self.sender() is getattr(self, "plot_timer", None)
                 and self.packet_count == self._last_live_plot_packet
             ):
                 return
-            if self.live_lag_s > LIVE_CATCHUP_THRESHOLD_S:
+            effective_lag_s = max(self.live_lag_s, filter_backlog_s)
+            if effective_lag_s > max(LIVE_CATCHUP_THRESHOLD_S, FILTER_BACKLOG_PAUSE_PLOT_S):
                 self.serial_catchup_skips += 1
                 if hasattr(self, "range_status"):
                     self.range_status.setText(
-                        f"USB 追帧中：积压约 {self.live_lag_s:.2f} s，暂缓绘图但继续保存原始数据"
+                        f"USB 后台追帧：接收/计算积压约 {effective_lag_s:.2f} s，"
+                        "暂缓绘图但继续接收和保存 BIN"
+                    )
+                return
+
+        if is_live and self.active_transport == "ble":
+            ble_backlog = self._ble_pending_bytes()
+            ble_backlog_s = ble_backlog / BYTES_PER_SECOND
+            effective_lag_s = max(ble_backlog_s, filter_backlog_s)
+            if (
+                self.sender() is getattr(self, "plot_timer", None)
+                and (
+                    ble_backlog >= BLE_PLOT_PAUSE_BACKLOG_BYTES
+                    or filter_backlog_s >= FILTER_BACKLOG_PAUSE_PLOT_S
+                )
+            ):
+                self.ble_catchup_plot_skips += 1
+                if hasattr(self, "range_status"):
+                    self.range_status.setText(
+                        f"BLE 后台追帧：传输/计算积压约 {effective_lag_s:.2f} s，"
+                        "暂缓绘图但继续接收和保存 BIN"
                     )
                 return
 
@@ -5055,6 +6397,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._last_live_plot_packet = self.packet_count
                 if use_jitter:
                     self.display_last_end_sample = int(display_end or 0)
+        except Exception as exc:
+            # A transient plotting/array error must not terminate the Qt timer
+            # callback chain and leave the window looking permanently frozen.
+            self.plot_errors += 1
+            self.set_status(f"绘图异常已隔离（采集和 BIN 保存继续）：{exc}")
         finally:
             self._plot_update_busy = False
     def _render_fast_plots(self, display_end_sample: Optional[int] = None):
@@ -5086,6 +6433,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.start_time_spin.blockSignals(False)
         if data.shape[1] < 2:
             return
+        raw_for_saturation = None
         if self.offline_uv is None and live_filtered:
             # The causal filter was already applied once when samples entered
             # filtered_ring. Never rerun zero-phase filtering on every repaint.
@@ -5093,12 +6441,21 @@ class MainWindow(QtWidgets.QMainWindow):
             if valid.size == arr.shape[1] and not np.all(valid):
                 arr = arr.copy()
                 arr[:, ~valid] = np.nan
+            raw_for_saturation, _rv, _rs, _rm = self.get_view_data(
+                seconds, filtered_live=False, live_end_sample=display_end_sample
+            )
         elif self.offline_uv is None:
             arr = np.asarray(data, dtype=float)
             if valid.size == arr.shape[1] and not np.all(valid):
                 arr = arr.copy()
                 arr[:, ~valid] = np.nan
-            arr -= np.nanmean(arr, axis=1, keepdims=True)
+            raw_for_saturation = np.asarray(data, dtype=float)
+            with np.errstate(invalid="ignore"):
+                channel_means = np.nanmean(arr, axis=1, keepdims=True)
+            channel_means = np.nan_to_num(
+                channel_means, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            arr = arr - channel_means
         else:
             if self.filter_check.isChecked():
                 arr = self.filter_offline_view(start, end)
@@ -5107,6 +6464,31 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.prepare_plot_signal(data[c], valid, False)
                     for c in range(CHANNELS)
                 ])
+            raw_for_saturation = np.asarray(data, dtype=float)
+
+        # Mask only the screen copy. Rail-to-rail toggling otherwise creates a
+        # dense vertical QPainter path like a solid rectangle and can starve the
+        # GUI event loop. Raw ring/BIN and sequence counters are untouched.
+        visible_saturation = np.zeros_like(arr, dtype=bool)
+        if raw_for_saturation is not None and arr.ndim == 2:
+            raw_for_saturation = np.asarray(raw_for_saturation, dtype=float)
+            if raw_for_saturation.shape[1] >= arr.shape[1]:
+                raw_for_saturation = raw_for_saturation[:, -arr.shape[1]:]
+            else:
+                pad = arr.shape[1] - raw_for_saturation.shape[1]
+                raw_for_saturation = np.pad(
+                    raw_for_saturation,
+                    ((0, 0), (pad, 0)),
+                    mode="constant",
+                    constant_values=np.nan,
+                )
+            visible_saturation = self.saturation_mask_uv(raw_for_saturation)
+            if np.any(visible_saturation):
+                arr = np.asarray(arr, dtype=float).copy()
+                arr[visible_saturation] = np.nan
+        self.last_visible_saturated_channels = tuple(
+            int(ch) for ch in np.flatnonzero(np.any(visible_saturation, axis=1))
+        )
         n_plot = int(data.shape[1])
         t_rel = self._plot_time_cache.get(n_plot)
         if t_rel is None:
@@ -5198,6 +6580,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         else:
             range_text = f"{start_s:.1f}–{min(total_s,start_s+seconds):.1f} s"
+        if self.last_visible_saturated_channels:
+            channel_text = "/".join(
+                f"CH{ch + 1}" for ch in self.last_visible_saturated_channels
+            )
+            range_text += f" | 饱和保护：{channel_text}（原始 BIN 保留）"
         if range_text != self._last_range_status_text:
             self.range_status.setText(range_text)
             self._last_range_status_text = range_text
@@ -5206,7 +6593,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_filter_status_text = mode
 
     def update_psd_and_info(self):
-        """Request PSD work without blocking serial reads or plot painting."""
+        """Request PSD work without blocking transport or plot painting."""
+        filter_backlog_s = self.filter_worker_backlog_samples() / FS
+        if (
+            self.offline_uv is None
+            and self.streaming
+            and (
+                filter_backlog_s >= FILTER_BACKLOG_PAUSE_PSD_S
+                or (
+                    self.active_transport == "ble"
+                    and self._ble_pending_bytes() >= BLE_PSD_PAUSE_BACKLOG_BYTES
+                )
+            )
+        ):
+            if self.active_transport == "ble":
+                self.ble_psd_skips += 1
+            self.update_info_text()
+            return
         data, valid, seq, mode, analysis_start, analysis_end = self.get_psd_data()
         if data.shape[1] < FS * 4:
             self.latest_window_good = False
@@ -5217,6 +6620,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         ch = self.channel_combo.currentIndex()
+        channel_saturation = self.saturation_mask_uv(data)[ch]
+        saturation_ratio = (
+            float(np.mean(channel_saturation)) if channel_saturation.size else 0.0
+        )
+        if saturation_ratio >= PSD_SATURATION_SKIP_RATIO:
+            self.latest_window_good = False
+            self.latest_window_reason = (
+                f"CH{ch + 1} 饱和样本 {saturation_ratio * 100:.1f}%，"
+                "暂停 PSD 以保护实时显示"
+            )
+            self.psd_curve.setData([], [])
+            self.psd_plot.setTitle("Welch PSD | 通道饱和，等待恢复")
+            self.update_info_text()
+            return
         signature = (
             bool(self.offline_uv is not None),
             int(analysis_start),
@@ -5396,6 +6813,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return float(np.median(values)), len(values), "ok"
 
     def update_info_text(self):
+        if (
+            hasattr(self, "diagnostics_pause_btn")
+            and self.diagnostics_pause_btn.isChecked()
+        ):
+            return
+        now_diag = time.monotonic()
+        if (
+            self.streaming
+            and (now_diag - getattr(self, "_last_diag_update_monotonic", 0.0)) < 0.50
+        ):
+            return
+        self._last_diag_update_monotonic = now_diag
         selected_ch = self.channel_combo.currentIndex()
         selected_config = (
             f"CH{selected_ch+1} {'ON' if self.channel_enabled[selected_ch] else 'OFF'}, "
@@ -5439,6 +6868,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "ack_sent": 0, "nack_sent": 0,
             "control_errors": 0, "pending_blocks": 0,
             "max_pending": 0, "expected_block": 0,
+            "watchdog_nacks": 0, "forced_skips": 0,
+            "watchdog_reconnects": 0,
         }
         if self.ble_worker is not None:
             try:
@@ -5447,79 +6878,101 @@ class MainWindow(QtWidgets.QMainWindow):
                 reliable.update(self.ble_worker.reliable_metrics())
             except Exception:
                 pass
-        self.info_text.setPlainText(
-            "\n".join([
-                f"Transport         : {self.transport_description()}",
-                f"Mode              : {mode}",
-                f"Selected channel  : {selected_config}",
-                f"Selected LSB      : {self.channel_lsb_uv()[selected_ch]:.6g} uV/code",
-                f"Streaming         : {int(self.streaming)}",
-                f"Offline bin       : {offline}",
-                f"Raw bin           : {raw_path}",
-                f"Raw bytes         : {self.raw_bytes}",
-                f"Frames received   : {self.packet_count}",
-                f"Timeline samples  : {self.live_timeline_sample_count}",
-                f"Estimated Fs      : {fs_text} Hz",
-                f"CRC bad           : {self.parser.crc_bad}",
-                f"Sync drop bytes   : {self.parser.sync_drop}",
-                f"ADS STATUS bad    : {self.status_bad}",
-                f"DRDY flag bad     : {self.drdy_bad}",
-                f"Sequence gaps     : {self.seq_lost} samples / {self.seq_gap_events} events",
-                f"Gap source est.   : MCU {self.seq_device_lost} / host {self.seq_host_lost} samples",
-                f"Timeline gap fill : {self.timeline_gap_samples} samples / {self.timeline_gap_events} events (BLE only)",
-                f"Large discontinu. : {self.timeline_large_discontinuities}",
-                f"Backlog events    : {self.backlog_events}",
-                f"Queue-drop hints  : {self.queue_drop_hints}",
-                f"SPI read last/max : {self.last_read_us} / {self.max_read_us} us",
-                f"Pending / Queue   : {self.last_pending} / {self.last_queue_depth}",
-                f"RX pending        : {self.last_serial_waiting_bytes} bytes",
-                f"RX peak pending   : {self.transport_peak_pending_bytes} bytes",
-                f"Transport turn    : {self.transport_last_turn_ms:.2f} / {self.transport_max_turn_ms:.2f} ms last/max",
-                f"Scheduler         : {'USB 2ms/6ms drain + 80ms plot' if self.active_transport == 'serial' else 'BLE 5ms bounded + 50ms plot'}",
-                f"USB paint skips   : {self.serial_catchup_skips}",
-                f"RX backlog est.   : {self.live_lag_s:.3f} s",
-                f"Display state     : {self.display_buffer_state}",
-                f"Display target    : {self.display_target_delay_samples/FS:.3f} s",
-                f"Display buffer    : {self.display_delay_s:.3f} s ({self.display_reserve_samples} samples)",
-                f"Display underrun  : {self.display_buffer_underruns} events",
-                f"Rebuffer last/max : {self.display_rebuffer_last_s:.3f} / {self.display_rebuffer_max_s:.3f} s",
-                f"Render gap last/max: {self.render_gap_last_ms:.1f} / {self.render_gap_max_ms:.1f} ms",
-                f"Render gap >100ms : {self.render_gap_over_100ms}",
-                f"Notify gap last/max: {1000*ble_notify_gap_last:.1f} / {1000*ble_notify_gap_max:.1f} ms",
-                f"Notify gap >100ms : {ble_notify_gap_over_100ms}",
-                f"Notify burst max  : {ble_notify_burst_max} bytes",
-                f"BLE MTU           : {self.ble_status.get('mtu', self.ble_peer_mtu) if self.active_transport == 'ble' else '---'}",
-                f"BLE queue/notify  : {self.ble_status.get('queue_drop', 0)} / {self.ble_status.get('notify_error', 0)}",
-                f"BLE cmd/MTU block : {self.ble_status.get('command_drop', 0)} / {self.ble_status.get('mtu_blocked', 0)}",
-                f"Reliable RX blocks: {reliable['blocks_received']} received / {reliable['blocks_delivered']} delivered",
-                f"Reliable pending  : {reliable['pending_blocks']} current / {reliable['max_pending']} max",
-                f"Reliable repair   : {reliable['retransmitted_received']} retrans RX / {reliable['gap_markers']} unrecoverable",
-                f"Reliable ACK/NACK : {reliable['ack_sent']} / {reliable['nack_sent']}",
-                f"Reliable dup/OOO  : {reliable['duplicates']} / {reliable['out_of_order']}",
-                f"Reliable CRC/sync : {reliable['block_crc_bad']} / {reliable['sync_drop']}",
-                f"Reliable ctrl err : {reliable['control_errors']}",
-                f"FW retained/inflight: {self.ble_status.get('reliable_stored', 0)} / {self.ble_status.get('reliable_outstanding', 0)}",
-                f"FW ACK/NACK       : {self.ble_status.get('reliable_ack_count', 0)} / {self.ble_status.get('reliable_nack_count', 0)}",
-                f"FW retrans/recover: {self.ble_status.get('reliable_retransmit', 0)} / {self.ble_status.get('reliable_recovered', 0)}",
-                f"FW overflow/unknown: {self.ble_status.get('reliable_overflow', 0)} / {self.ble_status.get('reliable_unknown_nack', 0)}",
-                f"FW protocol error : {self.ble_status.get('reliable_protocol_error', 0)}",
-                f"Logical BIAS mask: 0x{self.current_bias_mask():02X}",
-                "",
-                f"Raw RMS           : {raw_rms}",
-                f"Filtered RMS      : {filtered_rms}",
-                f"Raw peak-to-peak  : {raw_pp}",
-                f"Valid samples     : {valid_ratio}",
-                f"Quality window    : {quality}",
-                f"50Hz/raw ratio    : {line_ratio}",
-                f"Alpha peak        : {alpha_peak}",
-                f"Alpha relative    : {alpha_rel}",
-                f"Alpha capture     : {capture}",
-                f"Closed/Open Alpha : {comparison}",
-                f"Saturation        : {saturation:.4f}%",
-                "",
-                f"判断：{verdict}",
-            ])
-        )
+        raw_name = Path(raw_path).name if raw_path != "---" else "---"
+        filter_metrics = {
+            "queued_samples": 0, "output_samples": 0, "peak_queued_samples": 0,
+            "batches_processed": 0, "errors": 0, "display_dropped_samples": 0,
+            "last_error": "",
+        }
+        if self.filter_worker is not None:
+            try:
+                filter_metrics.update(self.filter_worker.metrics())
+            except Exception:
+                pass
+        entries = [
+            ("Transport", self.transport_description()),
+            ("Mode", mode),
+            ("Streaming", str(int(self.streaming))),
+            ("Channel", selected_config),
+            ("Estimated Fs", f"{fs_text} Hz"),
+            ("Frames", str(self.packet_count)),
+            ("Sequence gaps", f"{self.seq_lost} / {self.seq_gap_events} evt"),
+            ("Gap MCU/host", f"{self.seq_device_lost} / {self.seq_host_lost}"),
+            ("CRC / sync", f"{self.parser.crc_bad} / {self.parser.sync_drop}"),
+            ("Pending / queue", f"{self.last_pending} / {self.last_queue_depth}"),
+            ("Queue-drop hints", str(self.queue_drop_hints)),
+            ("Backlog events", str(self.backlog_events)),
+            ("RX now / peak", f"{self.last_serial_waiting_bytes} / {self.transport_peak_pending_bytes} B"),
+            ("Turn last/max", f"{self.transport_last_turn_ms:.2f}/{self.transport_max_turn_ms:.2f} ms"),
+            ("RX lag", f"{self.live_lag_s:.3f} s"),
+            ("Render gap", f"{self.render_gap_last_ms:.1f}/{self.render_gap_max_ms:.1f} ms"),
+            ("Notify gap", f"{1000*ble_notify_gap_last:.1f}/{1000*ble_notify_gap_max:.1f} ms"),
+            ("Notify burst", f"{ble_notify_burst_max} B"),
+            ("Display buffer", f"{self.display_delay_s:.3f} s"),
+            ("Underrun / resync", f"{self.display_buffer_underruns} / {self.display_low_latency_resyncs}"),
+            ("Paint / PSD skip", f"{self.ble_catchup_plot_skips} / {self.ble_psd_skips}"),
+            ("BLE MTU", str(self.ble_status.get('mtu', self.ble_peer_mtu) if self.active_transport == 'ble' else '---')),
+            ("FW queue/notify", f"{self.ble_status.get('queue_drop', 0)} / {self.ble_status.get('notify_error', 0)}"),
+            ("FW cmd/MTU", f"{self.ble_status.get('command_drop', 0)} / {self.ble_status.get('mtu_blocked', 0)}"),
+            ("Reliable RX", f"{reliable['blocks_received']} / {reliable['blocks_delivered']}"),
+            ("Reliable pending", f"{reliable['pending_blocks']} / max {reliable['max_pending']}"),
+            ("Retrans / gap", f"{reliable['retransmitted_received']} / {reliable['gap_markers']}"),
+            ("ACK / NACK", f"{reliable['ack_sent']} / {reliable['nack_sent']}"),
+            ("Watchdog N/S/R", f"{reliable['watchdog_nacks']}/{reliable['forced_skips']}/{reliable['watchdog_reconnects']}"),
+            ("Dup / OOO", f"{reliable['duplicates']} / {reliable['out_of_order']}"),
+            ("Reliable CRC/sync", f"{reliable['block_crc_bad']} / {reliable['sync_drop']}"),
+            ("Control errors", str(reliable['control_errors'])),
+            ("FW retained/flight", f"{self.ble_status.get('reliable_stored', 0)} / {self.ble_status.get('reliable_outstanding', 0)}"),
+            ("FW ACK / NACK", f"{self.ble_status.get('reliable_ack_count', 0)} / {self.ble_status.get('reliable_nack_count', 0)}"),
+            ("FW retrans/recover", f"{self.ble_status.get('reliable_retransmit', 0)} / {self.ble_status.get('reliable_recovered', 0)}"),
+            ("FW overflow/unknown", f"{self.ble_status.get('reliable_overflow', 0)} / {self.ble_status.get('reliable_unknown_nack', 0)}"),
+            ("Filter queue/out", f"{filter_metrics['queued_samples']} / {filter_metrics['output_samples']} smp"),
+            ("Filter peak/batch", f"{filter_metrics['peak_queued_samples']} / {filter_metrics['batches_processed']}"),
+            ("Filter error/drop", f"{filter_metrics['errors']} / {filter_metrics['display_dropped_samples']}"),
+            ("Raw queue", f"{self.raw_writer.queued_bytes} B"),
+            ("Write / plot err", f"{self.raw_write_errors} / {self.plot_errors}"),
+            ("Raw file", raw_name),
+            ("Raw / filt RMS", f"{raw_rms} / {filtered_rms}"),
+            ("Peak-to-peak", raw_pp),
+            ("Valid samples", valid_ratio),
+            ("50Hz ratio", line_ratio),
+            ("Alpha peak/rel", f"{alpha_peak} / {alpha_rel}"),
+            ("Saturation", f"{saturation:.4f}%"),
+            ("Quality", quality),
+            ("BIAS mask", f"0x{self.current_bias_mask():02X}"),
+            ("Alpha C/O", comparison),
+        ]
+
+        def compact_item(item):
+            label, value = item
+            value = str(value).replace("\n", " ")
+            if len(value) > 29:
+                value = value[:28] + "…"
+            return f"{label:<19}: {value:<29}"
+
+        columns = 3
+        rows = (len(entries) + columns - 1) // columns
+        lines = []
+        for row in range(rows):
+            cells = []
+            for col in range(columns):
+                idx = row + col * rows
+                cells.append(compact_item(entries[idx]) if idx < len(entries) else " " * 51)
+            lines.append(" | ".join(cells).rstrip())
+        lines.append("-" * 118)
+        lines.append(f"判断: {verdict}")
+        text = "\n".join(lines)
+
+        bar = self.info_text.verticalScrollBar()
+        previous_value = bar.value()
+        was_at_bottom = previous_value >= max(0, bar.maximum() - 2)
+        if text != self.info_text.toPlainText():
+            self.info_text.setPlainText(text)
+            bar = self.info_text.verticalScrollBar()
+            if was_at_bottom:
+                bar.setValue(bar.maximum())
+            else:
+                bar.setValue(min(previous_value, bar.maximum()))
 
     def make_verdict(self, saturation: float) -> str:
         if self.packet_count < FS * 2 and self.offline_uv is None:
@@ -5531,7 +6984,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.seq_device_lost > 0 or self.backlog_events > 0 or self.queue_drop_hints > 0:
             return "MCU/DRDY 或固件队列确有缺口：优先检查 SPI 实时性、任务积压和固件 queue drop。"
         if self.seq_host_lost > 0:
-            return "序号有缺口但 MCU 未报告 pending/queue drop：更像主机接收或解析积压；V11 已启用 USB 优先排空。"
+            return "序号有缺口但 MCU 未报告 pending/queue drop：更像主机接收或解析积压；V14 已启用 USB 优先排空。"
+        reliable = self.ble_worker.reliable_metrics() if self.ble_worker is not None else {}
+        if self.active_transport == "ble" and int(reliable.get("forced_skips", 0)) > 0:
+            return "BLE 曾出现永久 block 空洞，V14 紧急看门狗已跳洞并继续采集；对应 ADS sequence 缺口仍按真实时间显示。"
         if self.active_transport == "ble" and (
             int(self.ble_status.get("reliable_overflow", 0))
             or int(self.ble_status.get("reliable_unknown_nack", 0))
@@ -5593,6 +7049,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ser.close()
             if self.ble_worker is not None:
                 self.ble_worker.shutdown()
+            if self.filter_worker is not None:
+                self.filter_worker.shutdown()
         finally:
             event.accept()
 

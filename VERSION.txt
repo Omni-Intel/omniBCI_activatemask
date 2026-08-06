@@ -1,0 +1,2 @@
+V15-SPLITBIN-FIX
+GUI-only update; V13/V14 BLE firmware remains compatible.

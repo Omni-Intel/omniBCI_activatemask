@@ -1,44 +1,74 @@
 /*
-  ESP32-C3 + ADS1299：SRB2 公共参考 EEG 可靠 BLE 固件（软件 SPI）
+  ESP32-C3 + ADS1299：SRB1 EEG 可靠 BLE 数据流 V3（软件 SPI）
 
-  本文件由 ESP32C3_ADS1299_SRB2_REFERENCE.ino 适配而来，保留原有
-  SRB1/SRB2 双参考切换、通道/PGA/BIAS/阻抗控制和 48-byte 原始帧协议，
-  并加入与 V8 GUI 配套的可靠 BLE 传输：block sequence、CRC、ACK/NACK、
-  环形保留、滑动窗口和超时重传。
+  本固件目标是把采集链路状态完整、可验证地呈现出来：
+    1. 完全保留软件 SPI，不调用 SPI.begin()；
+    2. MCU 只发送 ADS1299 原始码，不在 MCU 上滤波；
+    3. 每帧包含 32-bit 序号、ADS STATUS、读取耗时、模式和 CRC16；
+    4. 上位机可以分别统计：串口 CRC 错、序号丢失、ADS STATUS 错位；
+    5. 提供 SRB1 配置，以及短路噪声和内部方波诊断模式；
+    6. 数据流中绝不插入状态文字，避免周期 impulse 和解析错位。
 
-  默认硬件与寄存器配置：
-    - EEG 测量电极接 IN1N～IN8N；公共参考电极接 SRB2；
-    - CH1～CH5 开启，CH6～CH8 关闭，PGA=24，250 SPS；
-    - 有效通道 CHnSET.SRB2=1，MISC1.SRB1=0；
-    - 默认 BIAS P+N：BIAS_SENSP=0x1F，BIAS_SENSN=0x1F；
-    - ADS 原始极性是 SRB2-INxN，固件不翻转原始数据；
-    - A8 00 可切换为 SRB1，A8 01 切回 SRB2。
-
-  BLE GATT：
-    设备名：OmniBCI-C3-SRB2
-    DATA：Notify；每 4 个原始 48-byte 帧组成一个可靠 block
-    CONTROL：Write / Write No Response；普通命令与 ACK/NACK 共用
-    STATUS：Read / Notify；配置 ACK 和诊断状态，不污染 EEG DATA
-    请求 MTU=247；单个完整可靠 block 为 214 bytes，可一次 Notify 发完。
+  默认上电配置：CH1-CH5 开启，CH6-CH8 禁用，SRB1 on，BIAS P-only：SENSP=0x1F, SENSN=0x00。
 
   Arduino IDE：
     Board = ESP32C3 Dev Module（或你的具体 C3 板型）
     USB CDC On Boot = Enabled
     波特率 = 921600
-    建议 Arduino-ESP32 Core 3.3.x
+    建议 Arduino-ESP32 Core 3.3.11 或同系列 3.x
+
+  BLE GATT：
+    设备名：OmniBCI-C3-SRB1-V3
+    DATA：Notify，4 帧组成一个带 block sequence/CRC 的可靠块；GUI 累计 ACK，缺块 NACK 重传
+    CONTROL：Write / Write No Response；命令字节与原串口完全相同
+    STATUS：Read / Notify；配置 ACK 与 BLE 状态走这里，不会污染 EEG DATA
+    本机请求 MTU=247；可靠发送窗口、环形缓存与重传均在固件内完成
 
   引脚：
     ADS_CS=GPIO2, SCLK=GPIO21, MOSI=GPIO0, MISO=GPIO20
     DRDY=GPIO10, START=GPIO3, RESET=GPIO1
-    TF_CS=GPIO4（始终拉高）, TF_DET=GPIO5, NSC_CLK=GPIO6
+    TF_CS=GPIO4（始终拉高）, TF_DET=GPIO5
+    NSC_CLK=GPIO6
 
-  命令（USB 或 BLE CONTROL）：
-    b/s：开始/停止；e/p/m/*：信号侧 BIAS；n：BIAS P+N；o：BIAS off
-    q：内部短路；t：内部方波；1/2/4/6/8/12/24：PGA；r：清诊断；?：诊断
-    A6 0D mask：逻辑 BIAS mask；A7 ch gain flags：通道配置
-    A8 mode：0=SRB1，1=SRB2；A9 mask：AC lead-off mask
+  串口命令：
+    b : 开始二进制数据流
+    s : 停止数据流
+    e : EEG 推荐模式，SRB1，BIAS 仅取 P 端（CH1-5，等同 p / m / *）
+    p : EEG 推荐模式别名，SRB1，BIAS 仅取 P 端（CH1-5）
+    m : EEG 推荐模式别名，SRB1，BIAS 仅取 P 端（CH1-5）
+    n : EEG P/N BIAS 模式，SRB1，BIAS 同时取 P/N（CH1-5）
+    o : EEG，SRB1，关闭 BIAS，用于判断 BIAS 环路是否引入问题
+    q : 所有通道输入内部短路，用于测板级底噪
+    t : 所有通道接 ADS1299 内部方波，用于验证 SPI/数字链路
+    * : 强制进入推荐 SRB1 BIAS 配置（P-only, N=0, SRB1 on，CH1-5）
+    1 / 2 / 4 / 6 / 8 / 12 / 24 : 修改 ADS1299 PGA 增益并重配当前模式
+    r : 清零诊断计数
+    ? : 停止数据流后打印诊断信息和寄存器读回
 
-  原始 ADS 数据帧仍固定 48 bytes，格式与参考固件和 V8 GUI 完全一致。
+  固定 48 字节数据帧（小端字段）：
+    [0]      0xA5
+    [1]      0x5A
+    [2]      协议版本 = 1
+    [3]      帧类型 = 1
+    [4..7]   uint32 sample sequence，little-endian
+    [8..11]  uint32 micros()，little-endian
+    [12..14] ADS1299 STATUS 原始 3 字节
+    [15]     flags
+               bit0: STATUS 高四位为 1100
+               bit1: 开始读取时 DRDY 为低
+               bit2: 本次唤醒积压了多个 DRDY
+               bit3: 当前为内部测试方波
+               bit4: 当前为内部短路
+               bit5: BIAS 已开启
+               bit6: BIAS 同时取 P/N（legacy）
+               bit7: SRB1 已开启
+    [16..39] 8 × 24-bit ADS1299 原始通道数据，MSB-first
+    [40..41] uint16 本帧软件 SPI 读取耗时 us
+    [42]     本次 pending DRDY 数（最大 255）
+    [43]     模式：0=legacy P+N, 1=EEG P-only, 2=BIAS off, 3=shorted, 4=test
+    [44]     发包前队列深度（最大 255）
+    [45]     队列累计丢包数低 8 bit
+    [46..47] CRC16-CCITT-FALSE，对 [0..45] 计算，little-endian
 */
 
 #include <Arduino.h>
@@ -50,19 +80,18 @@
 #endif
 
 /*
-  Dual-reference GUI firmware
+  SRB1-only reference variant
 
-  A8 00 selects SRB1:
-    signal electrodes -> INxP, common reference -> SRB1,
-    recommended BIAS side -> BIAS_SENSP.
+  Wiring:
+    EEG signal electrodes -> IN1P ... IN8P
+    common reference      -> SRB1
+    bias electrode        -> BIASOUT
 
-  A8 01 selects SRB2 (default):
-    signal electrodes -> INxN, common reference -> SRB2,
-    recommended BIAS side -> BIAS_SENSN.
-
-  A7 bit2 controls the per-channel SRB2 switch. SRB1 and SRB2 are
-  mutually exclusive in normal EEG modes. Both are disabled for internal
-  short and test modes.
+  Enforced configuration:
+    - CHnSET.SRB2 is always 0, even if host command A7 sets flag bit2.
+    - MISC1.SRB1 is enabled only in normal EEG modes.
+    - SRB1 is disabled in input-short and internal-test modes.
+    - The default EEG mode uses BIAS_SENSP only; BIAS_SENSN is 0.
 */
 
 #include "driver/gpio.h"
@@ -138,14 +167,14 @@
 constexpr uint32_t SERIAL_BAUD = 921600;
 constexpr size_t ADS_FRAME_BYTES = 27;
 constexpr size_t STREAM_FRAME_BYTES = 48;
-constexpr uint16_t FRAME_QUEUE_LENGTH = 160;
+constexpr uint16_t FRAME_QUEUE_LENGTH = 256;
 constexpr uint8_t SYNC_1 = 0xA5;
 constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
 
-// ============================ BLE reliable transport ============================
-constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB2-V11";
+// ============================ BLE reliable transport V4 / compact V2 ============================
+constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V3";
 constexpr char BLE_SERVICE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0001";
 constexpr char BLE_DATA_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0002";
 constexpr char BLE_CONTROL_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0003";
@@ -160,28 +189,30 @@ constexpr bool MIRROR_STREAM_TO_USB_WHILE_BLE = false;
 
 // Reliable DATA packet (little-endian):
 //   [0..1]   B1 4B
-//   [2]      protocol version = 1
+//   [2]      protocol version = 2
 //   [3]      flags (bit0 retransmission, bit1 partial block)
 //   [4..7]   uint32 stream session id
 //   [8..11]  uint32 block sequence
 //   [12..15] uint32 first ADS sample sequence
-//   [16]     frame count (1..4)
+//   [16]     frame count (1..6)
 //   [17]     reserved
 //   [18..19] uint16 payload bytes
-//   [20..]   original 48-byte ADS frames
+//   [20..]   compact 36-byte records: seq4 + timestamp4 + ADS27 + flags1
 //   [end-2]  CRC16-CCITT-FALSE over header+payload
 constexpr uint8_t BLE_BLOCK_MAGIC_0 = 0xB1;
 constexpr uint8_t BLE_BLOCK_MAGIC_1 = 0x4B;
-constexpr uint8_t BLE_RELIABLE_VERSION = 1;
-constexpr size_t BLE_RELIABLE_FRAMES_PER_BLOCK = 4;
-constexpr size_t BLE_RELIABLE_PAYLOAD_BYTES = STREAM_FRAME_BYTES * BLE_RELIABLE_FRAMES_PER_BLOCK;
+constexpr uint8_t BLE_RELIABLE_VERSION = 2;
+constexpr size_t BLE_COMPACT_FRAME_BYTES = 36;
+constexpr size_t BLE_RELIABLE_FRAMES_PER_BLOCK = 6;
+constexpr size_t BLE_RELIABLE_PAYLOAD_BYTES = BLE_COMPACT_FRAME_BYTES * BLE_RELIABLE_FRAMES_PER_BLOCK;
 constexpr size_t BLE_RELIABLE_HEADER_BYTES = 20;
 constexpr size_t BLE_RELIABLE_CRC_BYTES = 2;
 constexpr size_t BLE_RELIABLE_PACKET_MAX_BYTES = BLE_RELIABLE_HEADER_BYTES + BLE_RELIABLE_PAYLOAD_BYTES + BLE_RELIABLE_CRC_BYTES;
-constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 256;       // about 4.1 s at 250 SPS
-constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 32;      // at most 0.51 s unacked in flight
+static_assert(BLE_RELIABLE_PACKET_MAX_BYTES <= (BLE_REQUESTED_MTU - 3u), "compact BLE block must fit one MTU-247 notification");
+constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 320;       // about 7.68 s at 250 SPS
+constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 16;      // about 0.38 s unacked in flight
 constexpr uint32_t BLE_RELIABLE_TX_PACE_MS = 9;          // catch-up capable, avoids flooding host queue
-constexpr uint32_t BLE_RELIABLE_RETRY_TIMEOUT_MS = 300;
+constexpr uint32_t BLE_RELIABLE_RETRY_TIMEOUT_MS = 180;
 constexpr uint8_t BLE_RELIABLE_MAX_RETRIES = 20;
 
 // Reliable CONTROL packet:
@@ -225,19 +256,6 @@ enum FrontendMode : uint8_t {
   MODE_INTERNAL_TEST   = 4
 };
 
-enum ReferenceMode : uint8_t {
-  REFERENCE_SRB1 = 0,
-  REFERENCE_SRB2 = 1
-};
-
-#ifndef ADS_DEFAULT_REFERENCE_MODE
-#define ADS_DEFAULT_REFERENCE_MODE 1
-#endif
-
-#ifndef ADS_DEFAULT_FRONTEND_MODE
-#define ADS_DEFAULT_FRONTEND_MODE 0
-#endif
-
 enum RunPhase : uint8_t {
   PHASE_CONFIG = 0,
   PHASE_STREAMING = 1,
@@ -256,10 +274,7 @@ volatile bool streamingEnabled = false;
 volatile bool adsConversionsRunning = false;
 volatile bool configurationVerified = false;
 volatile RunPhase runPhase = PHASE_CONFIG;
-volatile FrontendMode currentMode =
-  static_cast<FrontendMode>(ADS_DEFAULT_FRONTEND_MODE);
-volatile ReferenceMode currentReferenceMode =
-  static_cast<ReferenceMode>(ADS_DEFAULT_REFERENCE_MODE);
+volatile FrontendMode currentMode = MODE_EEG_BIAS_P_ONLY;
 volatile uint32_t acquisitionSequence = 0;
 volatile uint32_t drdyCount = 0;
 volatile uint32_t missedDrdyCount = 0;
@@ -290,6 +305,9 @@ volatile uint16_t blePeerMtu = 23;
 volatile uint32_t bleNotifySuccessCount = 0;
 volatile uint32_t bleNotifyErrorCount = 0;
 volatile uint32_t bleCommandDropCount = 0;
+volatile uint32_t bleLastConfigAckMs = 0;
+static uint8_t bleLastConfigAck[12] = {0};
+volatile bool bleLastConfigAckValid = false;
 volatile uint32_t bleMtuBlockedFrameCount = 0;
 volatile uint32_t bleBlocksSent = 0;
 volatile uint32_t bleBytesSent = 0;
@@ -320,8 +338,8 @@ static uint32_t bleReliableBuildFirstSampleSequence = 0;
 volatile uint8_t currentGain = 24;
 volatile uint8_t currentGainCode = CH_GAIN_CODE_24;
 
-// GUI 可动态修改的逻辑 BIAS mask；默认 CH1-CH5。
-// SRB1 推荐模式路由到 BIAS_SENSP，SRB2 推荐模式路由到 BIAS_SENSN。
+// GUI 可动态修改的 BIAS_SENSP mask；默认 CH1-CH5。
+// 注意：这只控制 BIAS_SENSP(0x0D)，不会打开/关闭 CHnSET 通道。
 volatile uint8_t currentBiasSensPMask = ADS_ACTIVE_CH_MASK;
 volatile uint8_t currentLeadOffMask = 0x00;
 
@@ -329,19 +347,21 @@ volatile uint8_t currentLeadOffMask = 0x00;
 // Python/MATLAB GUI 用 0xA6 0x0D mask 来运行时修改 BIAS_SENSP。
 static uint8_t binaryControlState = 0;
 volatile uint8_t currentEnabledMask = ADS_ACTIVE_CH_MASK;
-volatile uint8_t currentSrb2Mask = ADS_ACTIVE_CH_MASK;
 volatile uint8_t channelGain[8] = {24, 24, 24, 24, 24, 24, 24, 24};
 volatile uint8_t channelGainCode[8] = {
   CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24,
   CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24, CH_GAIN_CODE_24
 };
 
-// Binary controls: A6 0D mask, A7 channel gain flags, A8 reference mode.
-// A7 channel is 0..7; flags: bit0 enabled, bit1 BIAS include, bit2 SRB2.
-// A8: 0=global SRB1, 1=per-channel SRB2. A9: AC lead-off mask.
+// Binary controls: A6 0D mask, or A7 channel gain flags.
+// A7 channel is 0..7; flags: bit0 enabled, bit1 BIAS_P.
+// bit2 (SRB2) is deliberately ignored in this SRB1-only firmware.
 static uint8_t binaryControlRegister = 0;
 static uint8_t binaryControlChannel = 0;
 static uint8_t binaryControlGain = 24;
+// A5 bulk config payload: reference, enabled mask, BIAS mask, SRB2 mask, gains[8].
+static uint8_t binaryBulkConfig[12] = {0};
+static uint8_t binaryBulkConfigIndex = 0;
 
 // 串口数字命令缓冲：支持发送 1/2/4/6/8/12/24 修改 PGA 增益。
 static char numericCommandBuffer[4] = {0};
@@ -367,6 +387,7 @@ void deselectAllSpi();
 void selectAds();
 void sendAdsCommand(uint8_t command);
 void writeAdsRegister(uint8_t address, uint8_t value);
+uint8_t readAdsRegisterOnce(uint8_t address);
 uint8_t readAdsRegister(uint8_t address);
 bool readAdsFrame(uint8_t *destination, bool &drdyWasLow);
 
@@ -378,10 +399,10 @@ void handleCommand(char command);
 void setGainByValue(uint8_t gain);
 void setBiasSensPMask(uint8_t mask);
 void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags);
-void setReferenceMode(uint8_t mode);
+bool setBulkChannelConfig(const uint8_t *payload);
 void setLeadOffMask(uint8_t mask);
 bool gainToCode(uint8_t gain, uint8_t &code);
-uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2 = false);
+uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux);
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode);
 void printHelpAndDiagnostics();
 void clearDiagnostics();
@@ -392,6 +413,7 @@ bool initBle();
 bool bleDataNotificationsEnabled();
 uint16_t refreshBlePeerMtu();
 bool sendBleBytes(const uint8_t *data, size_t length);
+void packBleCompactFrame(const StreamFrame &frame, uint8_t *destination);
 void transportFrame(const StreamFrame &frame);
 void flushReliableBuildBlock();
 void resetReliableTransport(bool resetSequence);
@@ -571,6 +593,12 @@ class EegBleStatusCallbacks : public BLECharacteristicCallbacks {
  public:
   void onRead(BLECharacteristic *characteristic) override {
     if (!characteristic) return;
+    // Keep the most recent configuration ACK readable for a short window.
+    // This lets the Windows GUI recover when the STATUS notify itself is lost.
+    if (bleLastConfigAckValid && (millis() - bleLastConfigAckMs) < 1500u) {
+      characteristic->setValue(bleLastConfigAck, sizeof(bleLastConfigAck));
+      return;
+    }
     uint8_t status[BLE_STATUS_BYTES] = {};
     buildBleStatus(status);
     characteristic->setValue(status, sizeof(status));
@@ -600,7 +628,7 @@ void setup() {
   initPins();
   startNscClock();
   hardwareResetAds();
-  configureFrontendLocked(currentMode);
+  configureFrontendLocked(MODE_EEG_BIAS_P_ONLY);
 
   frameQueue = xQueueCreate(FRAME_QUEUE_LENGTH, sizeof(StreamFrame));
   bleCommandQueue = xQueueCreate(BLE_COMMAND_QUEUE_LENGTH, sizeof(uint8_t));
@@ -642,13 +670,13 @@ void setup() {
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
-  Serial.println("ESP32C3 ADS1299 SRB2 + RELIABLE BLE V11 READY");
+  Serial.println("ESP32C3 ADS1299 SRB1 + RELIABLE BLE V14 READY");
   Serial.printf("BLE=%s name=%s requestedMTU=%u minStreamMTU=%u\n",
                 bleInitialized ? "READY" : "FAILED",
                 BLE_DEVICE_NAME,
                 (unsigned)BLE_REQUESTED_MTU,
                 (unsigned)BLE_MIN_STREAM_MTU);
-  Serial.println("Commands over USB or BLE CONTROL: b/s/e/p/m/*/n/o/q/t/1/2/4/6/8/12/24/r/? plus binary A6/A7/A8/A9");
+  Serial.println("Commands over USB or BLE CONTROL: b/s/e/p/m/*/n/o/q/t/1/2/4/6/8/12/24/r/? plus binary A6/A7/A9");
 }
 
 void loop() {
@@ -787,12 +815,15 @@ void transportTask(void *argument) {
       disconnectSeenAtMs = 0;
     }
 
-    if (bleInitialized && (millis() - lastStatusRefreshMs) >= 2000) {
+    const uint32_t statusRefreshIntervalMs = streamingEnabled ? 10000u : 2000u;
+    if (bleInitialized &&
+        (millis() - lastStatusRefreshMs) >= statusRefreshIntervalMs &&
+        (millis() - bleLastConfigAckMs) >= 1000u) {
       publishBleStatus(bleConnected);
       lastStatusRefreshMs = millis();
     }
 
-    // V11 USB fast path: when no BLE DATA subscription/session exists, run
+    // V14 USB fast path: when no BLE DATA subscription/session exists, run
     // the same simple queue -> Serial.write loop as the proven P0P1 firmware.
     // The reliable BLE path below is left unchanged once BLE streaming begins.
     const bool bleStreamPathActive =
@@ -808,10 +839,18 @@ void transportTask(void *argument) {
       continue;
     }
 
-    if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(1)) == pdTRUE) {
-      if (runPhase == PHASE_STREAMING) {
-        transportFrame(frame);
+    // When the retention ring is nearly full, stop draining new frames for a
+    // short time and use the 160-frame acquisition queue as an extra shock
+    // absorber.  This gives ACK/NACK repair a chance to free retained blocks
+    // instead of immediately discarding a complete four-frame BLE block.
+    if (bleReliableStoredBlocks < (BLE_RELIABLE_RING_BLOCKS - 1u)) {
+      if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(1)) == pdTRUE) {
+        if (runPhase == PHASE_STREAMING) {
+          transportFrame(frame);
+        }
       }
+    } else {
+      vTaskDelay(1);
     }
 
     // At most one reliable block is submitted per paced service call. This
@@ -824,8 +863,21 @@ void transportTask(void *argument) {
 void processSerialByte(char c) {
   const uint8_t byteValue = static_cast<uint8_t>(c);
 
-  // 二进制控制协议必须先于 ASCII 数字/命令解析：
-  // 0xA6 0x0D mask -> 根据 SRB1/SRB2 参考模式自动路由 BIAS P/N。
+  // 二进制控制协议必须先于 ASCII 数字/命令解析。
+  // A5 uses one atomic frontend reconfiguration for all eight channels.
+  if (binaryControlState == 40) {
+    binaryBulkConfig[binaryBulkConfigIndex++] = byteValue;
+    if (binaryBulkConfigIndex >= sizeof(binaryBulkConfig)) {
+      const bool applied = setBulkChannelConfig(binaryBulkConfig);
+      sendConfigAck(0xA5, binaryBulkConfig[1]);
+      (void)applied;
+      binaryBulkConfigIndex = 0;
+      binaryControlState = 0;
+    }
+    return;
+  }
+
+  // 0xA6 0x0D mask -> 修改逻辑 BIAS mask。
   if (binaryControlState == 1) {
     binaryControlRegister = byteValue;
     binaryControlState = 2;
@@ -861,16 +913,17 @@ void processSerialByte(char c) {
     return;
   }
 
-  if (binaryControlState == 20) {
-    setReferenceMode(byteValue);
-    binaryControlState = 0;
-    return;
-  }
-
   if (binaryControlState == 30) {
     setLeadOffMask(byteValue);
     sendConfigAck(0xA9, byteValue);
     binaryControlState = 0;
+    return;
+  }
+
+  if (byteValue == 0xA5) {
+    flushNumericCommand();
+    binaryBulkConfigIndex = 0;
+    binaryControlState = 40;
     return;
   }
 
@@ -883,12 +936,6 @@ void processSerialByte(char c) {
   if (byteValue == 0xA7) {
     flushNumericCommand();
     binaryControlState = 10;
-    return;
-  }
-
-  if (byteValue == 0xA8) {
-    flushNumericCommand();
-    binaryControlState = 20;
     return;
   }
 
@@ -955,7 +1002,7 @@ void handleCommand(char command) {
     case 'm':
     case 'M':
     case '*':
-      // 推荐模式：只把信号电极侧纳入 BIAS（SRB1->P，SRB2->N）。
+      // 推荐 SRB1 配置：只把实际测量 P 端纳入 BIAS，N/SRB1 参考端不纳入。
       configureFrontend(MODE_EEG_BIAS_P_ONLY);
       return;
 
@@ -1010,12 +1057,9 @@ bool gainToCode(uint8_t gain, uint8_t &code) {
   }
 }
 
-uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux, bool srb2) {
-  return static_cast<uint8_t>(
-    ((gainCode & 0x07u) << 4) |
-    (srb2 ? 0x08u : 0x00u) |
-    (mux & 0x07u)
-  );
+uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux) {
+  // SRB2 (CHnSET bit3) is intentionally never set in the SRB1-only variant.
+  return static_cast<uint8_t>(((gainCode & 0x07u) << 4) | (mux & 0x07u));
 }
 
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode) {
@@ -1076,18 +1120,36 @@ void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags) {
   if (flags & 0x01u) currentEnabledMask |= bit; else currentEnabledMask &= static_cast<uint8_t>(~bit);
   if ((flags & 0x02u) && (flags & 0x01u)) currentBiasSensPMask |= bit;
   else currentBiasSensPMask &= static_cast<uint8_t>(~bit);
-  if ((flags & 0x04u) && (flags & 0x01u)) currentSrb2Mask |= bit;
-  else currentSrb2Mask &= static_cast<uint8_t>(~bit);
   configureFrontend(static_cast<FrontendMode>(currentMode));
+  if (!streamingEnabled) {
+    Serial.printf("CH%u config: %s PGA=%ux BIAS_P=%u SRB1=GLOBAL SRB2=0\n",
+      (unsigned)(channel + 1), (flags & 0x01u) ? "ON" : "OFF", (unsigned)gain,
+      (unsigned)((flags >> 1) & 1u));
+  }
 }
 
-void setReferenceMode(uint8_t mode) {
-  if (runPhase == PHASE_STREAMING || mode > REFERENCE_SRB2) return;
-  currentReferenceMode = static_cast<ReferenceMode>(mode);
-  if (currentReferenceMode == REFERENCE_SRB2 && currentSrb2Mask == 0x00) {
-    currentSrb2Mask = currentEnabledMask;
+
+bool setBulkChannelConfig(const uint8_t *payload) {
+  if (!payload || runPhase == PHASE_STREAMING) return false;
+
+  uint8_t gainCodes[8] = {0};
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    if (!gainToCode(payload[4 + ch], gainCodes[ch])) return false;
   }
+
+  currentEnabledMask = payload[1];
+  currentBiasSensPMask = static_cast<uint8_t>(payload[2] & currentEnabledMask);
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    channelGain[ch] = payload[4 + ch];
+    channelGainCode[ch] = gainCodes[ch];
+  }
+  currentGain = channelGain[0];
+  currentGainCode = channelGainCode[0];
+
+  // SRB1-only firmware intentionally ignores payload[0] reference and
+  // payload[3] SRB2 mask, then performs one complete write/readback cycle.
   configureFrontend(static_cast<FrontendMode>(currentMode));
+  return configurationVerified;
 }
 
 void setLeadOffMask(uint8_t mask) {
@@ -1132,13 +1194,8 @@ void configureFrontendLocked(FrontendMode mode) {
 
     case MODE_EEG_BIAS_P_ONLY:
       config2 = CONFIG2_NORMAL;
-      if (currentReferenceMode == REFERENCE_SRB2) {
-        biasP = 0x00;
-        biasN = currentBiasSensPMask;
-      } else {
-        biasP = currentBiasSensPMask;
-        biasN = 0x00;
-      }
+      biasP = currentBiasSensPMask;
+      biasN = 0x00;
       break;
 
     case MODE_EEG_BIAS_OFF:
@@ -1165,28 +1222,18 @@ void configureFrontendLocked(FrontendMode mode) {
   uint8_t selectedMux = CH_MUX_NORMAL;
   if (mode == MODE_INPUT_SHORTED) selectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) selectedMux = CH_MUX_TEST;
-  const bool normalEegMode =
+  const bool srb1Enabled =
     mode == MODE_EEG_BIAS_PN ||
     mode == MODE_EEG_BIAS_P_ONLY ||
     mode == MODE_EEG_BIAS_OFF;
-  const bool srb1Enabled =
-    normalEegMode && currentReferenceMode == REFERENCE_SRB1;
   const uint8_t leadOffMask =
-    normalEegMode ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
-  const uint8_t leadOffP =
-    currentReferenceMode == REFERENCE_SRB1 ? leadOffMask : 0x00;
-  const uint8_t leadOffN =
-    currentReferenceMode == REFERENCE_SRB2 ? leadOffMask : 0x00;
+    srb1Enabled ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
   biasP &= currentEnabledMask;
   biasN &= currentEnabledMask;
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
     const uint8_t ch = static_cast<uint8_t>(address - ADS_FIRST_CH_REG);
     const bool channelIsActive = (currentEnabledMask & (1u << ch)) != 0;
-    const bool useSrb2 =
-      normalEegMode &&
-      currentReferenceMode == REFERENCE_SRB2 &&
-      ((currentSrb2Mask & (1u << ch)) != 0);
-    const uint8_t activeSetting = makeChannelSetting(channelGainCode[ch], selectedMux, useSrb2);
+    const uint8_t activeSetting = makeChannelSetting(channelGainCode[ch], selectedMux);
     const uint8_t poweredDownSetting = makePoweredDownChannelSetting(channelGainCode[ch]);
     writeAdsRegister(address, channelIsActive ? activeSetting : poweredDownSetting);
   }
@@ -1194,13 +1241,17 @@ void configureFrontendLocked(FrontendMode mode) {
   writeAdsRegister(0x0D, biasP);
   writeAdsRegister(0x0E, biasN);
   writeAdsRegister(0x04, leadOffMask ? LOFF_AC_6NA_31HZ : 0x00);
-  writeAdsRegister(0x0F, leadOffP);  // LOFF_SENSP
-  writeAdsRegister(0x10, leadOffN);  // LOFF_SENSN
-  writeAdsRegister(0x11, 0x00);      // LOFF_FLIP
+  writeAdsRegister(0x0F, leadOffMask);  // LOFF_SENSP
+  writeAdsRegister(0x10, 0x00);         // LOFF_SENSN
+  writeAdsRegister(0x11, 0x00);         // LOFF_FLIP
   writeAdsRegister(0x15, srb1Enabled ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
 
   currentMode = mode;
-  configurationVerified = verifyFrontendLocked(mode);
+  configurationVerified = false;
+  for (uint8_t attempt = 0; attempt < 3 && !configurationVerified; ++attempt) {
+    if (attempt) delay(3);
+    configurationVerified = verifyFrontendLocked(mode);
+  }
 }
 
 bool verifyFrontendLocked(FrontendMode mode) {
@@ -1208,27 +1259,16 @@ bool verifyFrontendLocked(FrontendMode mode) {
   uint8_t expectedMux = CH_MUX_NORMAL;
   uint8_t expectedBiasP = currentBiasSensPMask;
   uint8_t expectedBiasN = 0x00;
-  const bool normalEegMode =
+  const bool expectedSrb1 =
     mode == MODE_EEG_BIAS_PN ||
     mode == MODE_EEG_BIAS_P_ONLY ||
     mode == MODE_EEG_BIAS_OFF;
-  const bool expectedSrb1 =
-    normalEegMode && currentReferenceMode == REFERENCE_SRB1;
   const uint8_t expectedLeadOffMask =
-    normalEegMode ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
-  const uint8_t expectedLeadOffP =
-    currentReferenceMode == REFERENCE_SRB1 ? expectedLeadOffMask : 0x00;
-  const uint8_t expectedLeadOffN =
-    currentReferenceMode == REFERENCE_SRB2 ? expectedLeadOffMask : 0x00;
+    expectedSrb1 ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
 
   if (mode == MODE_INPUT_SHORTED) expectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) expectedMux = CH_MUX_TEST;
-  if (mode == MODE_EEG_BIAS_PN) {
-    expectedBiasN = currentBiasSensPMask;
-  } else if (mode == MODE_EEG_BIAS_P_ONLY && currentReferenceMode == REFERENCE_SRB2) {
-    expectedBiasP = 0x00;
-    expectedBiasN = currentBiasSensPMask;
-  }
+  if (mode == MODE_EEG_BIAS_PN) expectedBiasN = currentBiasSensPMask;
   if (mode == MODE_EEG_BIAS_OFF || mode == MODE_INPUT_SHORTED || mode == MODE_INTERNAL_TEST) {
     expectedBiasP = 0x00;
     expectedBiasN = 0x00;
@@ -1243,19 +1283,15 @@ bool verifyFrontendLocked(FrontendMode mode) {
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
     const uint8_t ch = static_cast<uint8_t>(address - ADS_FIRST_CH_REG);
     const bool enabled = (currentEnabledMask & (1u << ch)) != 0;
-    const bool useSrb2 =
-      normalEegMode &&
-      currentReferenceMode == REFERENCE_SRB2 &&
-      ((currentSrb2Mask & (1u << ch)) != 0);
-    const uint8_t expectedActive = makeChannelSetting(channelGainCode[ch], expectedMux, useSrb2);
+    const uint8_t expectedActive = makeChannelSetting(channelGainCode[ch], expectedMux);
     const uint8_t expectedDisabled = makePoweredDownChannelSetting(channelGainCode[ch]);
     ok &= readAdsRegister(address) == (enabled ? expectedActive : expectedDisabled);
   }
   ok &= readAdsRegister(0x0D) == expectedBiasP;
   ok &= readAdsRegister(0x0E) == expectedBiasN;
   ok &= readAdsRegister(0x04) == (expectedLeadOffMask ? LOFF_AC_6NA_31HZ : 0x00);
-  ok &= readAdsRegister(0x0F) == expectedLeadOffP;
-  ok &= readAdsRegister(0x10) == expectedLeadOffN;
+  ok &= readAdsRegister(0x0F) == expectedLeadOffMask;
+  ok &= readAdsRegister(0x10) == 0x00;
   ok &= readAdsRegister(0x11) == 0x00;
   ok &= readAdsRegister(0x15) == (expectedSrb1 ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
   return ok;
@@ -1479,14 +1515,19 @@ bool storeReliableBlock(
   if (!payload || payloadLength == 0 || frameCount == 0 ||
       payloadLength > BLE_RELIABLE_PAYLOAD_BYTES) return false;
 
-  const uint32_t blockSequence = bleReliableNextBlockSequence++;
+  const uint32_t blockSequence = bleReliableNextBlockSequence;
   ReliableBleBlock &slot = bleReliableRing[blockSequence % BLE_RELIABLE_RING_BLOCKS];
   if (slot.valid) {
-    // Never overwrite an unacknowledged block. Advancing the sequence makes the
-    // loss explicit to the GUI instead of silently corrupting block identity.
+    // The retention ring is full. Drop this ADS payload, but DO NOT consume a
+    // reliable block sequence number. Consuming it created a permanent protocol
+    // hole: the receiver waited for a block that never existed and both ends
+    // could deadlock once the transmit window filled. The next stored block
+    // keeps a contiguous block sequence; its ADS sample sequence still exposes
+    // the exact lost samples to the GUI.
     bleReliableOverflowBlocks++;
     return false;
   }
+  bleReliableNextBlockSequence++;
 
   memset(&slot, 0, sizeof(slot));
   slot.valid = true;
@@ -1689,6 +1730,19 @@ void serviceReliableBleTx() {
   }
 }
 
+void packBleCompactFrame(const StreamFrame &frame, uint8_t *destination) {
+  if (!destination) return;
+  // Preserve every EEG count and the sample identity, while removing fields
+  // that are only useful for USB diagnostics.  The host reconstructs the
+  // standard 48-byte BIN frame before parsing/writing, so file compatibility
+  // is unchanged.
+  memcpy(&destination[0], &frame.bytes[4], 4);    // ADS sample sequence
+  memcpy(&destination[4], &frame.bytes[8], 4);    // device timestamp
+  memcpy(&destination[8], &frame.bytes[12], 3);   // ADS status
+  memcpy(&destination[11], &frame.bytes[16], 24); // 8 x signed 24-bit EEG
+  destination[35] = frame.bytes[15];              // mode/reference flags
+}
+
 void transportFrame(const StreamFrame &frame) {
   const bool bleActive = bleDataNotificationsEnabled();
   if (bleActive) bleReliableSessionActive = true;
@@ -1706,16 +1760,15 @@ void transportFrame(const StreamFrame &frame) {
   if (bleReliableBuildFrameCount == 0) {
     bleReliableBuildFirstSampleSequence = readU32LE(&frame.bytes[4]);
   }
-  if (bleReliableBuildPayloadLength + STREAM_FRAME_BYTES > BLE_RELIABLE_PAYLOAD_BYTES) {
+  if (bleReliableBuildPayloadLength + BLE_COMPACT_FRAME_BYTES > BLE_RELIABLE_PAYLOAD_BYTES) {
     flushReliableBuildBlock();
     bleReliableBuildFirstSampleSequence = readU32LE(&frame.bytes[4]);
   }
-  memcpy(
-    &bleReliableBuildPayload[bleReliableBuildPayloadLength],
-    frame.bytes,
-    STREAM_FRAME_BYTES
+  packBleCompactFrame(
+    frame,
+    &bleReliableBuildPayload[bleReliableBuildPayloadLength]
   );
-  bleReliableBuildPayloadLength += STREAM_FRAME_BYTES;
+  bleReliableBuildPayloadLength += BLE_COMPACT_FRAME_BYTES;
   bleReliableBuildFrameCount++;
   if (bleReliableBuildFrameCount >= BLE_RELIABLE_FRAMES_PER_BLOCK) {
     flushReliableBuildBlock();
@@ -1727,7 +1780,7 @@ void buildBleStatus(uint8_t *destination) {
   memset(destination, 0, BLE_STATUS_BYTES);
   destination[0] = 0xBC;
   destination[1] = 0x53;  // 'S' = status
-  destination[2] = 0x03;  // reliable BLE status protocol version 3 (V8 GUI compatible)
+  destination[2] = 0x04;  // reliable BLE status protocol V4 / compact DATA V2
   destination[3] = static_cast<uint8_t>(runPhase);
   destination[4] = static_cast<uint8_t>(currentMode);
 
@@ -1811,9 +1864,7 @@ void buildStreamFrame(
   if (currentMode == MODE_EEG_BIAS_PN ||
       currentMode == MODE_EEG_BIAS_P_ONLY ||
       currentMode == MODE_EEG_BIAS_OFF) {
-    if (currentReferenceMode == REFERENCE_SRB1) {
-      flags |= (1u << 7); // SRB1 ON
-    }
+    flags |= (1u << 7); // SRB1 ON only for normal EEG input modes
   }
   p[15] = flags;
 
@@ -2017,7 +2068,7 @@ void writeAdsRegister(uint8_t address, uint8_t value) {
   delay(2);
 }
 
-uint8_t readAdsRegister(uint8_t address) {
+uint8_t readAdsRegisterOnce(uint8_t address) {
   uint8_t value = 0;
   deselectAllSpi();
   gpio_set_level(static_cast<gpio_num_t>(PIN_ADS_CS), 0);
@@ -2031,11 +2082,28 @@ uint8_t readAdsRegister(uint8_t address) {
   return value;
 }
 
+uint8_t readAdsRegister(uint8_t address) {
+  // Configuration is infrequent, so favor deterministic readback over speed.
+  // Return as soon as any value has appeared three times among at most five
+  // reads.  This tolerates two isolated software-SPI glitches.
+  uint8_t samples[5] = {0};
+  for (uint8_t i = 0; i < 5; ++i) {
+    samples[i] = readAdsRegisterOnce(address);
+    uint8_t matches = 0;
+    for (uint8_t j = 0; j <= i; ++j) {
+      if (samples[j] == samples[i]) matches++;
+    }
+    if (matches >= 3) return samples[i];
+    delay(1);
+  }
+  return samples[4];
+}
+
 // ============================ Diagnostics ============================
 void sendConfigAck(uint8_t command, uint8_t argument) {
   uint8_t reply[12] = {
     0xBC, command, argument, 0xFF, 0xFF, 0xFF,
-    0xFF, static_cast<uint8_t>(currentReferenceMode), static_cast<uint8_t>(currentMode), 0x00,
+    0xFF, 0x00, static_cast<uint8_t>(currentMode), 0x00,
     currentEnabledMask, 0x00
   };
 
@@ -2059,6 +2127,10 @@ void sendConfigAck(uint8_t command, uint8_t argument) {
   }
 
   for (uint8_t i = 0; i < 11; ++i) reply[11] ^= reply[i];
+  bleLastConfigAckValid = false;
+  memcpy(bleLastConfigAck, reply, sizeof(reply));
+  bleLastConfigAckValid = true;
+  bleLastConfigAckMs = millis();
   if (Serial) Serial.write(reply, sizeof(reply));
   if (bleInitialized && bleConnected && bleStatusCharacteristic) {
     // ACK is isolated on STATUS, never inserted into the EEG DATA byte stream.
@@ -2092,7 +2164,7 @@ void clearDiagnostics() {
 
 void printHelpAndDiagnostics() {
   Serial.println();
-  Serial.println("=== ADS1299 SRB2 reliable BLE diagnostic ===");
+  Serial.println("=== ADS1299 SRB1 diagnostic ===");
   Serial.printf("phase=%u mode=%u streaming=%u configVerified=%u\n",
                 (unsigned)runPhase,
                 (unsigned)currentMode,
@@ -2123,17 +2195,15 @@ void printHelpAndDiagnostics() {
                 (unsigned long)bleNotifyErrorCount,
                 (unsigned long)bleCommandDropCount,
                 (unsigned long)bleMtuBlockedFrameCount);
-  Serial.printf("reference=%s enabledMask=0x%02X biasMask=0x%02X srb2Mask=0x%02X\n",
-                currentReferenceMode == REFERENCE_SRB2 ? "SRB2" : "SRB1",
-                currentEnabledMask, currentBiasSensPMask, currentSrb2Mask);
+  Serial.printf("enabledMask=0x%02X biasPMask=0x%02X SRB2=FORCED_OFF\n",
+                currentEnabledMask, currentBiasSensPMask);
   for (uint8_t ch = 0; ch < 8; ++ch) {
-    Serial.printf("CH%u: %s PGA=%ux BIAS=%u SRB2=%u\n",
+    Serial.printf("CH%u: %s PGA=%ux BIAS_P=%u SRB2=0\n",
       (unsigned)(ch + 1), (currentEnabledMask & (1u << ch)) ? "ON" : "OFF",
       (unsigned)channelGain[ch],
-      (unsigned)((currentBiasSensPMask >> ch) & 1u),
-      (unsigned)((currentSrb2Mask >> ch) & 1u));
+      (unsigned)((currentBiasSensPMask >> ch) & 1u));
   }
-  Serial.println("commands: b s e/p/m/* n o q t 1/2/4/6/8/12/24 r ?; binary A6/A7/A8/A9");
+  Serial.println("commands: b s e/p/m/* n o q t 1/2/4/6/8/12/24 r ?");
   printRegisterReadback();
   Serial.println("===============================");
 }

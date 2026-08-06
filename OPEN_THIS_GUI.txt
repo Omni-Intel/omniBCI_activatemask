@@ -1,0 +1,3 @@
+Run: ads1299_eeg_gui_native.py
+Version: V15 saturation-safe GUI
+V13/V14 firmware is compatible; reflashing is not required.

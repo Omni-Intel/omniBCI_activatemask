@@ -1,4 +1,0 @@
-ads1299_eeg_gui_native.py
-
-推荐直接双击 install_and_run.bat 安装依赖并启动。
-V11 串口和 BLE 使用两套不同调度：USB 优先排空，BLE 保留 V8 可靠传输与平滑缓冲。
