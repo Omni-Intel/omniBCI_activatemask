@@ -1,0 +1,37 @@
+V14 STATIC / OFFLINE TEST REPORT
+================================
+
+Completed in the build container
+--------------------------------
+PASS  Python bytecode compilation of ads1299_eeg_gui_native.py.
+PASS  BLE scheduler constants: 4 ms receive poll, 25 ms maximum coalescing hold, 8-frame minimum coalescing, 50 ms paint interval.
+PASS  Live display constants: 0.65 s target, 0.55 s startup parameter, 1.00 s adaptive target cap.
+PASS  Display-only catch-up path is present with 1.75x maximum cursor rate.
+PASS  Display-only hard resynchronisation is present above approximately 1.12 s stale-screen history.
+PASS  Raw BIN writer and live filter worker remain separate from the Qt paint path.
+PASS  Compact reliable BLE V2 constants remain compatible with V13: six compact records per reliable block.
+PASS  SRB1, SRB2 and USB-only firmware directory/file names use V14.
+PASS  Firmware source brace balance and required setup/loop entry points checked.
+
+Deterministic 250-SPS display-cursor simulation
+----------------------------------------------
+Normal six-frame / 24 ms delivery:
+  steady live-display delay: approximately 0.626 to 0.650 s
+  mean steady delay: approximately 0.639 s
+  display resynchronisations: 0
+
+One 300 ms Windows delivery gap followed by a burst:
+  stream recovered without a hard display resynchronisation
+  final live-display delay returned to approximately 0.626 s
+
+One 1.2 s delivery gap followed by a burst:
+  one display-only resynchronisation occurred
+  final live-display delay returned below 0.60 s
+  raw BIN and reliable BLE queues are not modified by this display action
+
+Not tested in this environment
+------------------------------
+- Arduino-ESP32 compilation and physical flashing.
+- Physical ESP32-C3 RAM/Flash usage.
+- Windows BLE adapter timing and radio interference.
+- Long-duration acquisition from a real ADS1299 board.

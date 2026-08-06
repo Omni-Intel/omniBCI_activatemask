@@ -167,14 +167,14 @@
 constexpr uint32_t SERIAL_BAUD = 921600;
 constexpr size_t ADS_FRAME_BYTES = 27;
 constexpr size_t STREAM_FRAME_BYTES = 48;
-constexpr uint16_t FRAME_QUEUE_LENGTH = 160;
+constexpr uint16_t FRAME_QUEUE_LENGTH = 256;
 constexpr uint8_t SYNC_1 = 0xA5;
 constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
 
-// ============================ BLE reliable transport V3 ============================
-constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V11";
+// ============================ BLE reliable transport V4 / compact V2 ============================
+constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V3";
 constexpr char BLE_SERVICE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0001";
 constexpr char BLE_DATA_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0002";
 constexpr char BLE_CONTROL_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0003";
@@ -189,28 +189,30 @@ constexpr bool MIRROR_STREAM_TO_USB_WHILE_BLE = false;
 
 // Reliable DATA packet (little-endian):
 //   [0..1]   B1 4B
-//   [2]      protocol version = 1
+//   [2]      protocol version = 2
 //   [3]      flags (bit0 retransmission, bit1 partial block)
 //   [4..7]   uint32 stream session id
 //   [8..11]  uint32 block sequence
 //   [12..15] uint32 first ADS sample sequence
-//   [16]     frame count (1..4)
+//   [16]     frame count (1..6)
 //   [17]     reserved
 //   [18..19] uint16 payload bytes
-//   [20..]   original 48-byte ADS frames
+//   [20..]   compact 36-byte records: seq4 + timestamp4 + ADS27 + flags1
 //   [end-2]  CRC16-CCITT-FALSE over header+payload
 constexpr uint8_t BLE_BLOCK_MAGIC_0 = 0xB1;
 constexpr uint8_t BLE_BLOCK_MAGIC_1 = 0x4B;
-constexpr uint8_t BLE_RELIABLE_VERSION = 1;
-constexpr size_t BLE_RELIABLE_FRAMES_PER_BLOCK = 4;
-constexpr size_t BLE_RELIABLE_PAYLOAD_BYTES = STREAM_FRAME_BYTES * BLE_RELIABLE_FRAMES_PER_BLOCK;
+constexpr uint8_t BLE_RELIABLE_VERSION = 2;
+constexpr size_t BLE_COMPACT_FRAME_BYTES = 36;
+constexpr size_t BLE_RELIABLE_FRAMES_PER_BLOCK = 6;
+constexpr size_t BLE_RELIABLE_PAYLOAD_BYTES = BLE_COMPACT_FRAME_BYTES * BLE_RELIABLE_FRAMES_PER_BLOCK;
 constexpr size_t BLE_RELIABLE_HEADER_BYTES = 20;
 constexpr size_t BLE_RELIABLE_CRC_BYTES = 2;
 constexpr size_t BLE_RELIABLE_PACKET_MAX_BYTES = BLE_RELIABLE_HEADER_BYTES + BLE_RELIABLE_PAYLOAD_BYTES + BLE_RELIABLE_CRC_BYTES;
-constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 256;       // about 4.1 s at 250 SPS
-constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 32;      // at most 0.51 s unacked in flight
+static_assert(BLE_RELIABLE_PACKET_MAX_BYTES <= (BLE_REQUESTED_MTU - 3u), "compact BLE block must fit one MTU-247 notification");
+constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 320;       // about 7.68 s at 250 SPS
+constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 16;      // about 0.38 s unacked in flight
 constexpr uint32_t BLE_RELIABLE_TX_PACE_MS = 9;          // catch-up capable, avoids flooding host queue
-constexpr uint32_t BLE_RELIABLE_RETRY_TIMEOUT_MS = 300;
+constexpr uint32_t BLE_RELIABLE_RETRY_TIMEOUT_MS = 180;
 constexpr uint8_t BLE_RELIABLE_MAX_RETRIES = 20;
 
 // Reliable CONTROL packet:
@@ -303,6 +305,9 @@ volatile uint16_t blePeerMtu = 23;
 volatile uint32_t bleNotifySuccessCount = 0;
 volatile uint32_t bleNotifyErrorCount = 0;
 volatile uint32_t bleCommandDropCount = 0;
+volatile uint32_t bleLastConfigAckMs = 0;
+static uint8_t bleLastConfigAck[12] = {0};
+volatile bool bleLastConfigAckValid = false;
 volatile uint32_t bleMtuBlockedFrameCount = 0;
 volatile uint32_t bleBlocksSent = 0;
 volatile uint32_t bleBytesSent = 0;
@@ -354,6 +359,9 @@ volatile uint8_t channelGainCode[8] = {
 static uint8_t binaryControlRegister = 0;
 static uint8_t binaryControlChannel = 0;
 static uint8_t binaryControlGain = 24;
+// A5 bulk config payload: reference, enabled mask, BIAS mask, SRB2 mask, gains[8].
+static uint8_t binaryBulkConfig[12] = {0};
+static uint8_t binaryBulkConfigIndex = 0;
 
 // 串口数字命令缓冲：支持发送 1/2/4/6/8/12/24 修改 PGA 增益。
 static char numericCommandBuffer[4] = {0};
@@ -379,6 +387,7 @@ void deselectAllSpi();
 void selectAds();
 void sendAdsCommand(uint8_t command);
 void writeAdsRegister(uint8_t address, uint8_t value);
+uint8_t readAdsRegisterOnce(uint8_t address);
 uint8_t readAdsRegister(uint8_t address);
 bool readAdsFrame(uint8_t *destination, bool &drdyWasLow);
 
@@ -390,6 +399,7 @@ void handleCommand(char command);
 void setGainByValue(uint8_t gain);
 void setBiasSensPMask(uint8_t mask);
 void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags);
+bool setBulkChannelConfig(const uint8_t *payload);
 void setLeadOffMask(uint8_t mask);
 bool gainToCode(uint8_t gain, uint8_t &code);
 uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux);
@@ -403,6 +413,7 @@ bool initBle();
 bool bleDataNotificationsEnabled();
 uint16_t refreshBlePeerMtu();
 bool sendBleBytes(const uint8_t *data, size_t length);
+void packBleCompactFrame(const StreamFrame &frame, uint8_t *destination);
 void transportFrame(const StreamFrame &frame);
 void flushReliableBuildBlock();
 void resetReliableTransport(bool resetSequence);
@@ -582,6 +593,12 @@ class EegBleStatusCallbacks : public BLECharacteristicCallbacks {
  public:
   void onRead(BLECharacteristic *characteristic) override {
     if (!characteristic) return;
+    // Keep the most recent configuration ACK readable for a short window.
+    // This lets the Windows GUI recover when the STATUS notify itself is lost.
+    if (bleLastConfigAckValid && (millis() - bleLastConfigAckMs) < 1500u) {
+      characteristic->setValue(bleLastConfigAck, sizeof(bleLastConfigAck));
+      return;
+    }
     uint8_t status[BLE_STATUS_BYTES] = {};
     buildBleStatus(status);
     characteristic->setValue(status, sizeof(status));
@@ -653,7 +670,7 @@ void setup() {
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
-  Serial.println("ESP32C3 ADS1299 SRB1 + RELIABLE BLE V11 READY");
+  Serial.println("ESP32C3 ADS1299 SRB1 + RELIABLE BLE V14 READY");
   Serial.printf("BLE=%s name=%s requestedMTU=%u minStreamMTU=%u\n",
                 bleInitialized ? "READY" : "FAILED",
                 BLE_DEVICE_NAME,
@@ -798,12 +815,15 @@ void transportTask(void *argument) {
       disconnectSeenAtMs = 0;
     }
 
-    if (bleInitialized && (millis() - lastStatusRefreshMs) >= 2000) {
+    const uint32_t statusRefreshIntervalMs = streamingEnabled ? 10000u : 2000u;
+    if (bleInitialized &&
+        (millis() - lastStatusRefreshMs) >= statusRefreshIntervalMs &&
+        (millis() - bleLastConfigAckMs) >= 1000u) {
       publishBleStatus(bleConnected);
       lastStatusRefreshMs = millis();
     }
 
-    // V11 USB fast path: when no BLE DATA subscription/session exists, run
+    // V14 USB fast path: when no BLE DATA subscription/session exists, run
     // the same simple queue -> Serial.write loop as the proven P0P1 firmware.
     // The reliable BLE path below is left unchanged once BLE streaming begins.
     const bool bleStreamPathActive =
@@ -819,10 +839,18 @@ void transportTask(void *argument) {
       continue;
     }
 
-    if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(1)) == pdTRUE) {
-      if (runPhase == PHASE_STREAMING) {
-        transportFrame(frame);
+    // When the retention ring is nearly full, stop draining new frames for a
+    // short time and use the 160-frame acquisition queue as an extra shock
+    // absorber.  This gives ACK/NACK repair a chance to free retained blocks
+    // instead of immediately discarding a complete four-frame BLE block.
+    if (bleReliableStoredBlocks < (BLE_RELIABLE_RING_BLOCKS - 1u)) {
+      if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(1)) == pdTRUE) {
+        if (runPhase == PHASE_STREAMING) {
+          transportFrame(frame);
+        }
       }
+    } else {
+      vTaskDelay(1);
     }
 
     // At most one reliable block is submitted per paced service call. This
@@ -835,8 +863,21 @@ void transportTask(void *argument) {
 void processSerialByte(char c) {
   const uint8_t byteValue = static_cast<uint8_t>(c);
 
-  // 二进制控制协议必须先于 ASCII 数字/命令解析：
-  // 0xA6 0x0D mask -> 只修改 ADS1299 BIAS_SENSP(0x0D)，BIAS_SENSN 不变。
+  // 二进制控制协议必须先于 ASCII 数字/命令解析。
+  // A5 uses one atomic frontend reconfiguration for all eight channels.
+  if (binaryControlState == 40) {
+    binaryBulkConfig[binaryBulkConfigIndex++] = byteValue;
+    if (binaryBulkConfigIndex >= sizeof(binaryBulkConfig)) {
+      const bool applied = setBulkChannelConfig(binaryBulkConfig);
+      sendConfigAck(0xA5, binaryBulkConfig[1]);
+      (void)applied;
+      binaryBulkConfigIndex = 0;
+      binaryControlState = 0;
+    }
+    return;
+  }
+
+  // 0xA6 0x0D mask -> 修改逻辑 BIAS mask。
   if (binaryControlState == 1) {
     binaryControlRegister = byteValue;
     binaryControlState = 2;
@@ -876,6 +917,13 @@ void processSerialByte(char c) {
     setLeadOffMask(byteValue);
     sendConfigAck(0xA9, byteValue);
     binaryControlState = 0;
+    return;
+  }
+
+  if (byteValue == 0xA5) {
+    flushNumericCommand();
+    binaryBulkConfigIndex = 0;
+    binaryControlState = 40;
     return;
   }
 
@@ -1080,6 +1128,30 @@ void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags) {
   }
 }
 
+
+bool setBulkChannelConfig(const uint8_t *payload) {
+  if (!payload || runPhase == PHASE_STREAMING) return false;
+
+  uint8_t gainCodes[8] = {0};
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    if (!gainToCode(payload[4 + ch], gainCodes[ch])) return false;
+  }
+
+  currentEnabledMask = payload[1];
+  currentBiasSensPMask = static_cast<uint8_t>(payload[2] & currentEnabledMask);
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    channelGain[ch] = payload[4 + ch];
+    channelGainCode[ch] = gainCodes[ch];
+  }
+  currentGain = channelGain[0];
+  currentGainCode = channelGainCode[0];
+
+  // SRB1-only firmware intentionally ignores payload[0] reference and
+  // payload[3] SRB2 mask, then performs one complete write/readback cycle.
+  configureFrontend(static_cast<FrontendMode>(currentMode));
+  return configurationVerified;
+}
+
 void setLeadOffMask(uint8_t mask) {
   if (runPhase == PHASE_STREAMING) return;
   currentLeadOffMask = static_cast<uint8_t>(mask & currentEnabledMask);
@@ -1175,7 +1247,11 @@ void configureFrontendLocked(FrontendMode mode) {
   writeAdsRegister(0x15, srb1Enabled ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
 
   currentMode = mode;
-  configurationVerified = verifyFrontendLocked(mode);
+  configurationVerified = false;
+  for (uint8_t attempt = 0; attempt < 3 && !configurationVerified; ++attempt) {
+    if (attempt) delay(3);
+    configurationVerified = verifyFrontendLocked(mode);
+  }
 }
 
 bool verifyFrontendLocked(FrontendMode mode) {
@@ -1439,14 +1515,19 @@ bool storeReliableBlock(
   if (!payload || payloadLength == 0 || frameCount == 0 ||
       payloadLength > BLE_RELIABLE_PAYLOAD_BYTES) return false;
 
-  const uint32_t blockSequence = bleReliableNextBlockSequence++;
+  const uint32_t blockSequence = bleReliableNextBlockSequence;
   ReliableBleBlock &slot = bleReliableRing[blockSequence % BLE_RELIABLE_RING_BLOCKS];
   if (slot.valid) {
-    // Never overwrite an unacknowledged block. Advancing the sequence makes the
-    // loss explicit to the GUI instead of silently corrupting block identity.
+    // The retention ring is full. Drop this ADS payload, but DO NOT consume a
+    // reliable block sequence number. Consuming it created a permanent protocol
+    // hole: the receiver waited for a block that never existed and both ends
+    // could deadlock once the transmit window filled. The next stored block
+    // keeps a contiguous block sequence; its ADS sample sequence still exposes
+    // the exact lost samples to the GUI.
     bleReliableOverflowBlocks++;
     return false;
   }
+  bleReliableNextBlockSequence++;
 
   memset(&slot, 0, sizeof(slot));
   slot.valid = true;
@@ -1649,6 +1730,19 @@ void serviceReliableBleTx() {
   }
 }
 
+void packBleCompactFrame(const StreamFrame &frame, uint8_t *destination) {
+  if (!destination) return;
+  // Preserve every EEG count and the sample identity, while removing fields
+  // that are only useful for USB diagnostics.  The host reconstructs the
+  // standard 48-byte BIN frame before parsing/writing, so file compatibility
+  // is unchanged.
+  memcpy(&destination[0], &frame.bytes[4], 4);    // ADS sample sequence
+  memcpy(&destination[4], &frame.bytes[8], 4);    // device timestamp
+  memcpy(&destination[8], &frame.bytes[12], 3);   // ADS status
+  memcpy(&destination[11], &frame.bytes[16], 24); // 8 x signed 24-bit EEG
+  destination[35] = frame.bytes[15];              // mode/reference flags
+}
+
 void transportFrame(const StreamFrame &frame) {
   const bool bleActive = bleDataNotificationsEnabled();
   if (bleActive) bleReliableSessionActive = true;
@@ -1666,16 +1760,15 @@ void transportFrame(const StreamFrame &frame) {
   if (bleReliableBuildFrameCount == 0) {
     bleReliableBuildFirstSampleSequence = readU32LE(&frame.bytes[4]);
   }
-  if (bleReliableBuildPayloadLength + STREAM_FRAME_BYTES > BLE_RELIABLE_PAYLOAD_BYTES) {
+  if (bleReliableBuildPayloadLength + BLE_COMPACT_FRAME_BYTES > BLE_RELIABLE_PAYLOAD_BYTES) {
     flushReliableBuildBlock();
     bleReliableBuildFirstSampleSequence = readU32LE(&frame.bytes[4]);
   }
-  memcpy(
-    &bleReliableBuildPayload[bleReliableBuildPayloadLength],
-    frame.bytes,
-    STREAM_FRAME_BYTES
+  packBleCompactFrame(
+    frame,
+    &bleReliableBuildPayload[bleReliableBuildPayloadLength]
   );
-  bleReliableBuildPayloadLength += STREAM_FRAME_BYTES;
+  bleReliableBuildPayloadLength += BLE_COMPACT_FRAME_BYTES;
   bleReliableBuildFrameCount++;
   if (bleReliableBuildFrameCount >= BLE_RELIABLE_FRAMES_PER_BLOCK) {
     flushReliableBuildBlock();
@@ -1687,7 +1780,7 @@ void buildBleStatus(uint8_t *destination) {
   memset(destination, 0, BLE_STATUS_BYTES);
   destination[0] = 0xBC;
   destination[1] = 0x53;  // 'S' = status
-  destination[2] = 0x03;  // reliable BLE status protocol V3
+  destination[2] = 0x04;  // reliable BLE status protocol V4 / compact DATA V2
   destination[3] = static_cast<uint8_t>(runPhase);
   destination[4] = static_cast<uint8_t>(currentMode);
 
@@ -1975,7 +2068,7 @@ void writeAdsRegister(uint8_t address, uint8_t value) {
   delay(2);
 }
 
-uint8_t readAdsRegister(uint8_t address) {
+uint8_t readAdsRegisterOnce(uint8_t address) {
   uint8_t value = 0;
   deselectAllSpi();
   gpio_set_level(static_cast<gpio_num_t>(PIN_ADS_CS), 0);
@@ -1987,6 +2080,23 @@ uint8_t readAdsRegister(uint8_t address) {
   gpio_set_level(static_cast<gpio_num_t>(PIN_ADS_CS), 1);
   delay(2);
   return value;
+}
+
+uint8_t readAdsRegister(uint8_t address) {
+  // Configuration is infrequent, so favor deterministic readback over speed.
+  // Return as soon as any value has appeared three times among at most five
+  // reads.  This tolerates two isolated software-SPI glitches.
+  uint8_t samples[5] = {0};
+  for (uint8_t i = 0; i < 5; ++i) {
+    samples[i] = readAdsRegisterOnce(address);
+    uint8_t matches = 0;
+    for (uint8_t j = 0; j <= i; ++j) {
+      if (samples[j] == samples[i]) matches++;
+    }
+    if (matches >= 3) return samples[i];
+    delay(1);
+  }
+  return samples[4];
 }
 
 // ============================ Diagnostics ============================
@@ -2017,6 +2127,10 @@ void sendConfigAck(uint8_t command, uint8_t argument) {
   }
 
   for (uint8_t i = 0; i < 11; ++i) reply[11] ^= reply[i];
+  bleLastConfigAckValid = false;
+  memcpy(bleLastConfigAck, reply, sizeof(reply));
+  bleLastConfigAckValid = true;
+  bleLastConfigAckMs = millis();
   if (Serial) Serial.write(reply, sizeof(reply));
   if (bleInitialized && bleConnected && bleStatusCharacteristic) {
     // ACK is isolated on STATUS, never inserted into the EEG DATA byte stream.

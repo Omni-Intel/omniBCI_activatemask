@@ -1,8 +1,10 @@
-# ESP32C3 ADS1299 SRB2 BLE V11
+# ESP32C3_ADS1299_SRB2_BLE_V14
 
-- Default reference: SRB2; signal electrodes on INxN and common reference on SRB2.
-- Runtime A8/A7 SRB1/SRB2 controls are retained.
-- BLE name: `OmniBCI-C3-SRB2-V11`.
-- BLE data layer: unchanged V8 protocol V3 reliable blocks, 4 frames/block, ACK/NACK and retransmission.
-- USB path: when no BLE DATA subscription/session is active, frames go directly from the firmware queue to `Serial.write`, matching the proven P0P1 serial architecture.
-- BLE and USB are not mirrored simultaneously.
+- V14 compact reliable BLE protocol V2.
+- Six EEG samples per reliable block; packet size 238 bytes at a full block.
+- 320-block RAM retention: approximately 7.68 seconds at 250 SPS.
+- 16-block in-flight window with cumulative ACK/NACK retransmission.
+- 256-frame ADS acquisition queue.
+- USB still emits the original 48-byte frames when BLE has not started a DATA session.
+- Internal Flash is deliberately not used as a per-sample FIFO because erase/program stalls and wear can hurt real-time acquisition.
+- Requires the V14 GUI for compact-block reconstruction.
