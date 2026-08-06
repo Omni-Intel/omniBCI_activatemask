@@ -1,6 +1,0 @@
-运行：install_and_run.bat
-或：py -3 ads1299_eeg_gui_native.py
-窗口标题必须包含：BLE Reliable V8 | SRB1/SRB2
-
-连接 OmniBCI-C3-SRB1-V3：GUI 自动锁定 SRB1。
-连接 OmniBCI-C3-SRB2：GUI 自动选择 SRB2，并开放 SRB1/SRB2 切换。

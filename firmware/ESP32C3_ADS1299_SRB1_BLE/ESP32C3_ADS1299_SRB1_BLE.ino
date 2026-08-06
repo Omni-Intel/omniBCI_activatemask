@@ -174,7 +174,7 @@ constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
 
 // ============================ BLE reliable transport V3 ============================
-constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V3";
+constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V11";
 constexpr char BLE_SERVICE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0001";
 constexpr char BLE_DATA_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0002";
 constexpr char BLE_CONTROL_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0003";
@@ -653,7 +653,7 @@ void setup() {
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
-  Serial.println("ESP32C3 ADS1299 SRB1-ONLY + ROBUST BLE V2 READY");
+  Serial.println("ESP32C3 ADS1299 SRB1 + RELIABLE BLE V11 READY");
   Serial.printf("BLE=%s name=%s requestedMTU=%u minStreamMTU=%u\n",
                 bleInitialized ? "READY" : "FAILED",
                 BLE_DEVICE_NAME,
@@ -801,6 +801,22 @@ void transportTask(void *argument) {
     if (bleInitialized && (millis() - lastStatusRefreshMs) >= 2000) {
       publishBleStatus(bleConnected);
       lastStatusRefreshMs = millis();
+    }
+
+    // V11 USB fast path: when no BLE DATA subscription/session exists, run
+    // the same simple queue -> Serial.write loop as the proven P0P1 firmware.
+    // The reliable BLE path below is left unchanged once BLE streaming begins.
+    const bool bleStreamPathActive =
+      bleDataNotificationsEnabled() || bleReliableSessionActive;
+    if (!bleStreamPathActive) {
+      if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(2)) == pdTRUE) {
+        if (runPhase == PHASE_STREAMING && Serial) {
+          Serial.write(frame.bytes, STREAM_FRAME_BYTES);
+        }
+      } else {
+        taskYIELD();
+      }
+      continue;
     }
 
     if (xQueueReceive(frameQueue, &frame, pdMS_TO_TICKS(1)) == pdTRUE) {

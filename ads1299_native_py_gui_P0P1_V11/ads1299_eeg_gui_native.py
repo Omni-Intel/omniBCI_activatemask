@@ -3,7 +3,7 @@
 ADS1299 EEG Native Python GUI
 --------------------------------
 Fast PyQtGraph-based replacement for the MATLAB diagnostic GUI.
-Reliable BLE V8 transport: bytes delivered by Windows are kept losslessly in a worker-owned queue.
+Reliable BLE V11 transport: bytes delivered by Windows are kept losslessly in a worker-owned queue.
 Large Windows BLE delivery bursts are cooperatively parsed in bounded batches,
 while a delayed playback cursor absorbs notification jitter. Raw samples, signal
 amplitude, filtering options, and recording behavior remain unchanged.
@@ -102,18 +102,32 @@ BYTES_PER_SECOND = FRAME_BYTES * FS
 # Each transport turn handles only a bounded number of complete frames, then
 # yields back to Qt.  Unprocessed bytes remain in the worker queue: no sample is
 # clipped, rescaled, discarded, or replaced.
-SERIAL_POLL_INTERVAL_MS = 5
-PLOT_INTERVAL_MS = 50
+# V11 uses two independent host schedulers.  The proven P0P1 serial path
+# drains aggressively before paint work, while BLE keeps V8's bounded batches
+# and jitter buffer.  Sharing one compromise scheduler was the main reason the
+# V8/V9 GUI could report serial sequence gaps even when BLE looked smooth.
+SERIAL_POLL_INTERVAL_MS = 2
+BLE_POLL_INTERVAL_MS = 5
+SERIAL_PLOT_INTERVAL_MS = 80
+BLE_PLOT_INTERVAL_MS = 50
+SERIAL_DRAIN_BUDGET_S = 0.006
+SERIAL_RX_BUFFER_BYTES = 1024 * 1024
 TRANSPORT_MAX_BATCH_FRAMES = 24
 TRANSPORT_MAX_BATCH_BYTES = FRAME_BYTES * TRANSPORT_MAX_BATCH_FRAMES
 TRANSPORT_NORMAL_BUDGET_S = 0.0025
 TRANSPORT_CATCHUP_BUDGET_S = 0.0050
 TRANSPORT_REPOLL_DELAY_MS = 1
 TRANSPORT_CATCHUP_THRESHOLD_BYTES = FRAME_BYTES * 10
-BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V3"
-BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2"
+BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V11"
+BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2-V11"
 BLE_DEVICE_NAME_COMMON = "OmniBCI-C3-ADS1299"
-BLE_DEVICE_NAMES = (BLE_DEVICE_NAME_SRB1, BLE_DEVICE_NAME_SRB2, BLE_DEVICE_NAME_COMMON)
+BLE_DEVICE_NAMES = (
+    BLE_DEVICE_NAME_SRB1,
+    BLE_DEVICE_NAME_SRB2,
+    "OmniBCI-C3-SRB1-V3",
+    "OmniBCI-C3-SRB2",
+    BLE_DEVICE_NAME_COMMON,
+)
 # Fallback label only. Connection compatibility is verified from GATT UUIDs and
 # the A7 register-readback reference byte, not from the advertised name alone.
 BLE_DEVICE_NAME = BLE_DEVICE_NAME_COMMON
@@ -218,6 +232,14 @@ def crc16_ccitt(data: bytes) -> int:
     # Python bit loop was correct but became expensive when the GUI had to
     # catch up after a paint/analysis stall.
     return int(binascii.crc_hqx(data, 0xFFFF)) & 0xFFFF
+
+
+def sequence_gap_size(previous_sequence: Optional[int], current_sequence: int) -> int:
+    """Return a believable forward sequence gap, excluding resets/wrap artifacts."""
+    if previous_sequence is None:
+        return 0
+    delta = (int(current_sequence) - int(previous_sequence)) & 0xFFFFFFFF
+    return int(delta - 1) if 1 < delta < 1_000_000 else 0
 
 
 def expand_frames_to_timeline(
@@ -1192,7 +1214,7 @@ class BleTransportWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | BLE Reliable V8 | SRB1/SRB2")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V11 Dual Scheduler | USB Stable + BLE Reliable")
         self.resize(1500, 920)
 
         self.gain = 24  # legacy/global command value
@@ -1243,6 +1265,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_bad = 0
         self.drdy_bad = 0
         self.seq_lost = 0
+        self.seq_gap_events = 0
+        self.seq_device_lost = 0
+        self.seq_host_lost = 0
         self.timeline_gap_samples = 0
         self.timeline_gap_events = 0
         self.timeline_large_discontinuities = 0
@@ -1270,6 +1295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport_max_turn_ms = 0.0
         self.transport_last_turn_ms = 0.0
         self.transport_peak_pending_bytes = 0
+        self.serial_catchup_skips = 0
         self._plot_update_busy = False
         self._last_live_plot_packet = -1
         # Live display playback is intentionally delayed by a small amount so
@@ -1360,9 +1386,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.update_fast_plots)
         self.plot_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        # Painting stays at 20 FPS even while a BLE burst is being drained.
-        # Transport work is sliced into separate bounded event-loop turns.
-        self.plot_timer.start(PLOT_INTERVAL_MS)
+        # Start with the proven USB cadence. _apply_transport_timing switches
+        # to V8's 20 FPS cadence when BLE is selected/connected.
+        self.plot_timer.start(SERIAL_PLOT_INTERVAL_MS)
 
         self.psd_timer = QtCore.QTimer(self)
         self.psd_timer.timeout.connect(self.update_psd_and_info)
@@ -1553,7 +1579,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
         pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#424245")
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | BLE Reliable V8 | SRB1/SRB2")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V11 Dual Scheduler | USB Stable + BLE Reliable")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)
@@ -2874,9 +2900,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.serial_label.setText("蓝牙")
             self.refresh_btn.setText("扫描蓝牙")
             self.connect_btn.setText("连接蓝牙")
-            # Before connection the GUI does not guess from the advertised name.
-            # It probes A8/A7 readback after GATT connection and then locks or
-            # enables the selector according to the actual firmware capability.
             self.reference_combo.setEnabled(False)
             self.apply_reference_btn.setEnabled(False)
             self.reference_combo.setToolTip(
@@ -2892,8 +2915,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "SRB1：每通道信号接 INxP，参考接 SRB1；"
                 "SRB2：每通道信号接 INxN，参考接 SRB2。"
             )
+        self._apply_transport_timing(kind)
         self.refresh_ports()
 
+    def _apply_transport_timing(self, kind: Optional[str] = None):
+        """Apply the scheduler proven for each transport instead of one compromise."""
+        selected = str(kind or self.active_transport or self.selected_transport() or "serial")
+        poll_ms = BLE_POLL_INTERVAL_MS if selected == "ble" else SERIAL_POLL_INTERVAL_MS
+        plot_ms = BLE_PLOT_INTERVAL_MS if selected == "ble" else SERIAL_PLOT_INTERVAL_MS
+        if hasattr(self, "serial_timer"):
+            self.serial_timer.setInterval(int(poll_ms))
+        if hasattr(self, "plot_timer"):
+            self.plot_timer.setInterval(int(plot_ms))
     def refresh_ports(self):
         if self.transport_connected() or self.transport_connecting:
             return
@@ -2968,7 +3001,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.selected_transport() == "ble":
             key = self.port_combo.currentData()
             if not key:
-                QtWidgets.QMessageBox.warning(self, "BLE", "请先扫描蓝牙并选择 OmniBCI-C3-SRB1-V3、OmniBCI-C3-SRB2 或兼容设备。")
+                QtWidgets.QMessageBox.warning(self, "BLE", "请先扫描蓝牙并选择 OmniBCI-C3-SRB1-V11、OmniBCI-C3-SRB2-V11 或兼容设备。")
                 return
             if self.ble_worker is None:
                 QtWidgets.QMessageBox.critical(self, "BLE", "缺少 bleak，请运行 install_and_run.bat。")
@@ -2988,7 +3021,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self.ser = serial.Serial(port, BAUD, timeout=0, write_timeout=0)
+            try:
+                # pyserial exposes this on Windows.  A large driver buffer gives
+                # Qt/Python room to survive an occasional paint or OS scheduling stall.
+                self.ser.set_buffer_size(rx_size=SERIAL_RX_BUFFER_BYTES, tx_size=65536)
+            except Exception:
+                pass
             self.active_transport = "serial"
+            self._apply_transport_timing("serial")
             QtWidgets.QApplication.processEvents()
             time.sleep(0.7)
             self.transport_reset_input_buffer()
@@ -3108,6 +3148,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_ble_connected(self, name: str, address: str, mtu: int, reconnected: bool):
         self.transport_connecting = False
         self.active_transport = "ble"
+        self._apply_transport_timing("ble")
         self.ble_connected = True
         self.ble_device_name = name
         self.ble_device_address = address
@@ -3981,6 +4022,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_bad = 0
         self.drdy_bad = 0
         self.seq_lost = 0
+        self.seq_gap_events = 0
+        self.seq_device_lost = 0
+        self.seq_host_lost = 0
         self.timeline_gap_samples = 0
         self.timeline_gap_events = 0
         self.timeline_large_discontinuities = 0
@@ -4000,6 +4044,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_serial_waiting_bytes = 0
         self.live_lag_s = 0.0
         self.transport_peak_pending_bytes = 0
+        self.serial_catchup_skips = 0
         self.transport_last_turn_ms = 0.0
         self.transport_max_turn_ms = 0.0
         self._last_live_plot_packet = -1
@@ -4022,7 +4067,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self,
                 "BLE 固件不匹配",
-                "V8 GUI 必须配套 ESP32C3_ADS1299_SRB1_BLE_V3 固件。请先重新烧录。",
+                "V11 BLE 模式需要配套 V11（或兼容 V8 协议 V3）可靠 BLE 固件。请检查烧录版本。",
             )
             return
         if (
@@ -4048,6 +4093,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reset_processing_state()
             self.reset_live_session_metrics()
             self.reset_display_jitter_buffer()
+            if self.active_transport == "serial":
+                self.display_buffer_state = "direct"
+                self.display_target_delay_samples = 0
+                self.display_startup_samples = 0
             if self.ble_worker is not None:
                 self.ble_worker.reset_timing_metrics()
                 self.ble_worker.set_streaming_hint(True)
@@ -4055,11 +4104,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.raw_file = open(self.raw_path, "wb")
             self.raw_bytes = 0
             self.transport_reset_input_buffer()
-            # Reset C3 diagnostics before each recording so BLE queue/notify
-            # values on the diagnostics page belong to this session only.
-            self.transport_write(b"r")
-            time.sleep(0.05)
-            self.transport_reset_input_buffer(clear_status=False)
+            if self.active_transport == "ble":
+                # Reliable BLE needs a fresh retained-block session and matching
+                # diagnostics.  USB deliberately follows the simpler P0P1 start
+                # path so no extra control/flush work competes with first frames.
+                self.transport_write(b"r")
+                time.sleep(0.05)
+                self.transport_reset_input_buffer(clear_status=False)
             self.transport_write(b"b")
             self.streaming = True
             self.set_status(f"实时采集中，raw bin 保存到：{self.raw_path}")
@@ -4259,12 +4310,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.poll_transport()
 
     def poll_transport(self):
-        """Ingest bytes cooperatively; never parse a huge BLE burst in one turn.
+        """Drain USB aggressively, but keep BLE work sliced into short turns.
 
-        The BLE worker queue is intentionally lossless/unbounded for short OS
-        delivery bursts.  This method removes only a small, frame-aligned slice
-        per iteration and yields after a strict time budget.  Remaining bytes
-        stay queued and are handled by a 1 ms follow-up callback.
+        USB uses the exact scheduling idea from the no-suffix P0P1 GUI: 2 ms
+        polling, read everything already in the driver, and continue for up to
+        6 ms.  BLE retains V8's bounded batches so a large Windows notification
+        burst cannot freeze the Qt event loop.
         """
         if self._poll_serial_busy or not self.transport_connected():
             return
@@ -4272,28 +4323,37 @@ class MainWindow(QtWidgets.QMainWindow):
         turn_started = time.perf_counter()
         remaining = 0
         try:
-            pending_before = (
-                int(self.ser.in_waiting)
-                if self.active_transport == "serial" and self.ser and self.ser.is_open
-                else self._ble_pending_bytes() if self.active_transport == "ble" else 0
-            )
-            self.transport_peak_pending_bytes = max(
-                self.transport_peak_pending_bytes, int(pending_before)
-            )
-            budget = (
-                TRANSPORT_CATCHUP_BUDGET_S
-                if pending_before > TRANSPORT_CATCHUP_THRESHOLD_BYTES
-                else TRANSPORT_NORMAL_BUDGET_S
-            )
-            deadline = turn_started + budget
-            while time.perf_counter() < deadline:
-                if self.active_transport == "serial":
+            if self.active_transport == "serial":
+                deadline = turn_started + SERIAL_DRAIN_BUDGET_S
+                while time.perf_counter() < deadline:
                     n = int(self.ser.in_waiting) if self.ser and self.ser.is_open else 0
                     self.last_serial_waiting_bytes = n
+                    self.transport_peak_pending_bytes = max(
+                        self.transport_peak_pending_bytes, n
+                    )
                     if n <= 0:
                         break
-                    data = self.ser.read(min(n, TRANSPORT_MAX_BATCH_BYTES))
-                else:
+                    data = self.ser.read(n)
+                    if not data:
+                        break
+                    if self.raw_file:
+                        self.raw_file.write(data)
+                        self.raw_bytes += len(data)
+                    frames = self.parser.feed(data)
+                    if frames:
+                        self.process_frames(frames, live=True)
+            else:
+                pending_before = self._ble_pending_bytes()
+                self.transport_peak_pending_bytes = max(
+                    self.transport_peak_pending_bytes, int(pending_before)
+                )
+                budget = (
+                    TRANSPORT_CATCHUP_BUDGET_S
+                    if pending_before > TRANSPORT_CATCHUP_THRESHOLD_BYTES
+                    else TRANSPORT_NORMAL_BUDGET_S
+                )
+                deadline = turn_started + budget
+                while time.perf_counter() < deadline:
                     data = b""
                     if self.ble_worker is not None:
                         data = self.ble_worker.drain_data(TRANSPORT_MAX_BATCH_BYTES)
@@ -4304,20 +4364,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.last_serial_waiting_bytes = self._ble_pending_bytes()
                     if not data:
                         break
-
-                if self.raw_file and data:
-                    self.raw_file.write(data)
-                    self.raw_bytes += len(data)
-
-                frames = self.parser.feed(data)
-                if frames:
-                    self.process_frames(frames, live=True)
-
-                # The time check happens after every small batch.  A single
-                # Windows BLE burst therefore cannot hold the GUI for hundreds
-                # of milliseconds, regardless of signal amplitude.
-                if time.perf_counter() >= deadline:
-                    break
+                    if self.raw_file:
+                        self.raw_file.write(data)
+                        self.raw_bytes += len(data)
+                    frames = self.parser.feed(data)
+                    if frames:
+                        self.process_frames(frames, live=True)
+                    if time.perf_counter() >= deadline:
+                        break
         except Exception as exc:
             self.set_status(f"{self.transport_description()} 读取异常：{exc}")
         finally:
@@ -4350,25 +4404,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._poll_serial_busy = False
 
         if remaining > 0 and self.transport_connected():
+            # BLE always yields between bounded batches.  USB normally catches
+            # up in one turn, but an immediate follow-up protects against a rare
+            # long Windows burst without waiting for the next paint cycle.
             self._schedule_transport_repoll()
-
     def poll_serial(self):
         """Backward-compatible alias used by older scripts/tests."""
         self.poll_transport()
 
     def process_frames(self, frames: List[Frame], live: bool):
+        if not frames:
+            return
         now = time.perf_counter()
         detected_reference = None
         previous_sequence = self.last_seq
         previous_mode = int(self.current_mode)
+        use_ble_timeline = bool(live and self.active_transport == "ble")
 
-        if live:
+        if use_ble_timeline:
             (
                 timeline_values,
                 timeline_valid,
                 timeline_sequence,
                 timeline_modes,
-                lost_samples,
+                _lost_samples,
                 filled_samples,
                 gap_events,
                 large_discontinuities,
@@ -4379,12 +4438,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 previous_sequence=previous_sequence,
                 previous_mode=previous_mode,
             )
-            self.seq_lost += int(lost_samples)
             self.timeline_gap_samples += int(filled_samples)
             self.timeline_gap_events += int(gap_events)
             self.timeline_large_discontinuities += int(large_discontinuities)
+        elif live:
+            # Proven serial behavior: append only bytes actually received.  Do
+            # not allocate NaN columns on the hot USB path; sequence accounting
+            # remains exact in the loop below.
+            timeline_values = np.stack([fr.uv for fr in frames], axis=1).astype(np.float32)
+            timeline_valid = np.array([fr.valid for fr in frames], dtype=bool)
+            timeline_sequence = np.array([fr.sequence for fr in frames], dtype=np.uint32)
+            timeline_modes = np.array([fr.mode for fr in frames], dtype=np.uint8)
+            large_discontinuities = 0
         else:
             timeline_values = timeline_valid = timeline_sequence = timeline_modes = None
+            large_discontinuities = 0
 
         for fr in frames:
             self.packet_count += 1
@@ -4394,6 +4462,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.drdy_bad += 1
             if (fr.flags & 0x04) or fr.pending > 1:
                 self.backlog_events += 1
+
+            drop_delta = (fr.queue_drop_low - self.last_queue_drop_low) & 0xFF
+            if self.packet_count > 1 and 0 < drop_delta < 128:
+                self.queue_drop_hints += drop_delta
+            self.last_queue_drop_low = fr.queue_drop_low
+
+            gap = sequence_gap_size(self.last_seq, fr.sequence)
+            if gap:
+                self.seq_lost += gap
+                self.seq_gap_events += 1
+                # pending/backlog and queue-drop counters are generated inside
+                # the C3.  Without either hint, the most likely loss point is
+                # host USB/BLE reception or parser resynchronisation.
+                if fr.pending > 1 or bool(fr.flags & 0x04) or (0 < drop_delta < 128):
+                    self.seq_device_lost += gap
+                else:
+                    self.seq_host_lost += gap
 
             if self.last_seq is None:
                 self.first_seq = fr.sequence
@@ -4405,10 +4490,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     progressed = ((fr.sequence - self.first_seq) & 0xFFFFFFFF) + 1
                     self.fs_est = progressed / elapsed
 
-            drop_delta = (fr.queue_drop_low - self.last_queue_drop_low) & 0xFF
-            if self.packet_count > 1 and 0 < drop_delta < 128:
-                self.queue_drop_hints += drop_delta
-            self.last_queue_drop_low = fr.queue_drop_low
             enabled_counts = fr.raw_counts[self.channel_enabled]
             self.saturation_samples += int(
                 np.sum(np.abs(enabled_counts) > 0.95 * (2**23 - 1))
@@ -4423,8 +4504,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.last_pending = fr.pending
             self.last_queue_depth = fr.queue_depth
 
-        if live and frames:
-            self.live_sample_count += len(frames)  # physically received frames
+        if live:
+            self.live_sample_count += len(frames)
             timeline_count = int(timeline_values.shape[1])
             self.live_timeline_sample_count += timeline_count
             self.live_lag_s = max(
@@ -4442,10 +4523,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 timeline_sequence,
                 timeline_modes,
             )
-
-            # A discontinuity too large to materialize safely is treated as a
-            # new live epoch rather than allocating an unbounded NaN block.
-            if self.timeline_large_discontinuities and large_discontinuities:
+            if use_ble_timeline and large_discontinuities:
                 self.display_cursor_sample = None
                 self.display_buffer_started = False
                 self.display_buffer_state = "priming"
@@ -4453,8 +4531,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if detected_reference is not None and detected_reference != self.reference_mode:
             self.set_reference_mode_local(detected_reference)
         self._sync_internal_short_button(self.current_mode == 3)
-
-    # ---------------- BIAS_SENSP ----------------
     def current_bias_mask(self) -> int:
         mask = 0
         for i, cb in enumerate(self.bias_checks):
@@ -4915,7 +4991,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack_plot.getAxis("left").setTicks([ticks])
 
     def update_fast_plots(self, *_args):
-        """Paint at a fixed rate from a sample-clocked jitter-buffer cursor."""
+        """Paint from the newest USB data or BLE's delayed jitter cursor."""
         if self._plot_update_busy:
             return
 
@@ -4929,14 +5005,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_render_monotonic = now
 
         is_live = self.offline_uv is None
+        if is_live and self.active_transport == "serial":
+            # This is the important behavior restored from the no-suffix P0P1
+            # GUI: receive work wins over paint work, every time.
+            self.poll_transport()
+            if (
+                self.sender() is getattr(self, "plot_timer", None)
+                and self.packet_count == self._last_live_plot_packet
+            ):
+                return
+            if self.live_lag_s > LIVE_CATCHUP_THRESHOLD_S:
+                self.serial_catchup_skips += 1
+                if hasattr(self, "range_status"):
+                    self.range_status.setText(
+                        f"USB 追帧中：积压约 {self.live_lag_s:.2f} s，暂缓绘图但继续保存原始数据"
+                    )
+                return
+
         use_jitter = bool(
             is_live and self.streaming and self.active_transport == "ble"
         )
         display_end = None
         if use_jitter:
             display_end = self.advance_live_display_cursor()
-            # Before the startup reserve is available, keep collecting rather
-            # than exposing Windows' bursty delivery rhythm to the plot.
             if not self.display_buffer_started:
                 if hasattr(self, "range_status"):
                     self.range_status.setText(
@@ -4966,7 +5057,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.display_last_end_sample = int(display_end or 0)
         finally:
             self._plot_update_busy = False
-
     def _render_fast_plots(self, display_end_sample: Optional[int] = None):
         """Render eight independent channel plots with per-channel y-scales."""
         seconds = float(self.win_spin.value())
@@ -5374,8 +5464,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Sync drop bytes   : {self.parser.sync_drop}",
                 f"ADS STATUS bad    : {self.status_bad}",
                 f"DRDY flag bad     : {self.drdy_bad}",
-                f"Sequence lost     : {self.seq_lost}",
-                f"Timeline gap fill : {self.timeline_gap_samples} samples / {self.timeline_gap_events} events",
+                f"Sequence gaps     : {self.seq_lost} samples / {self.seq_gap_events} events",
+                f"Gap source est.   : MCU {self.seq_device_lost} / host {self.seq_host_lost} samples",
+                f"Timeline gap fill : {self.timeline_gap_samples} samples / {self.timeline_gap_events} events (BLE only)",
                 f"Large discontinu. : {self.timeline_large_discontinuities}",
                 f"Backlog events    : {self.backlog_events}",
                 f"Queue-drop hints  : {self.queue_drop_hints}",
@@ -5384,6 +5475,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"RX pending        : {self.last_serial_waiting_bytes} bytes",
                 f"RX peak pending   : {self.transport_peak_pending_bytes} bytes",
                 f"Transport turn    : {self.transport_last_turn_ms:.2f} / {self.transport_max_turn_ms:.2f} ms last/max",
+                f"Scheduler         : {'USB 2ms/6ms drain + 80ms plot' if self.active_transport == 'serial' else 'BLE 5ms bounded + 50ms plot'}",
+                f"USB paint skips   : {self.serial_catchup_skips}",
                 f"RX backlog est.   : {self.live_lag_s:.3f} s",
                 f"Display state     : {self.display_buffer_state}",
                 f"Display target    : {self.display_target_delay_samples/FS:.3f} s",
@@ -5435,8 +5528,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return "有 CRC 错：先查传输缓存、帧格式以及 USB/BLE 链路。"
         if self.status_bad > 0:
             return "ADS STATUS 异常：怀疑 SPI 位/字节错位。"
-        if self.seq_lost > 0 or self.backlog_events > 0 or self.queue_drop_hints > 0:
-            return "序号/DRDY backlog 异常：Alpha 坏窗会被丢弃，仍应先修 MCU 实时链路。"
+        if self.seq_device_lost > 0 or self.backlog_events > 0 or self.queue_drop_hints > 0:
+            return "MCU/DRDY 或固件队列确有缺口：优先检查 SPI 实时性、任务积压和固件 queue drop。"
+        if self.seq_host_lost > 0:
+            return "序号有缺口但 MCU 未报告 pending/queue drop：更像主机接收或解析积压；V11 已启用 USB 优先排空。"
         if self.active_transport == "ble" and (
             int(self.ble_status.get("reliable_overflow", 0))
             or int(self.ble_status.get("reliable_unknown_nack", 0))

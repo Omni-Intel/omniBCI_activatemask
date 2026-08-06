@@ -1,0 +1,15 @@
+V11 推荐固件（支持稳定 USB + V8 可靠 BLE）：
+
+SRB1 PCB：
+firmware\ESP32C3_ADS1299_SRB1_BLE_V11\ESP32C3_ADS1299_SRB1_BLE.ino
+广播名：OmniBCI-C3-SRB1-V11
+
+SRB2 PCB：
+firmware\ESP32C3_ADS1299_SRB2_BLE_V11\ESP32C3_ADS1299_SRB2_BLE.ino
+广播名：OmniBCI-C3-SRB2-V11
+
+串口对照固件（无 BLE，来自无后缀 P0P1 的稳定逻辑）：
+firmware\ESP32C3_ADS1299_SERIAL_STABLE_V11\ESP32C3_ADS1299_SERIAL_STABLE.ino
+
+重要：请解压到不含括号的短英文路径，例如 C:\OmniBCI\V11。
+不要放在 “V11 (1)” 这种目录，否则 Arduino/ESP32 Windows 构建可能报乱码 bootloader.bin 错误。
