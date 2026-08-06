@@ -1,0 +1,19 @@
+V11 static and logic test report
+
+PASS: Python py_compile
+PASS: MainWindow method uniqueness / AST structure
+PASS: sequence gap helper, reset/wrap rejection
+PASS: USB path appends only received frames (no hot-path NaN expansion)
+PASS: BLE path preserves timeline gaps
+PASS: host-vs-MCU gap classification synthetic test
+PASS: all V11 Arduino folder names match .ino filenames
+PASS: firmware brace-balance structural check
+PASS: V8 reliable BLE constants retained (4 frames/block, 256 retained blocks, 32-block window, 9 ms pace)
+PASS: V11 USB firmware fast path present in SRB1 and SRB2 builds
+PASS: serial control firmware is byte-identical to no-suffix P0P1 except banner
+
+Not performed in this container:
+- Arduino-ESP32 compilation (arduino-cli/toolchain unavailable)
+- Physical ESP32-C3 burn
+- Windows COM-port soak test
+- Windows BLE hardware soak test

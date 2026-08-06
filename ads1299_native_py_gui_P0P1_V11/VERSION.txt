@@ -1,0 +1,5 @@
+ads1299_native_py_gui_P0P1_V11
+
+Base USB: no-suffix P0P1
+Base BLE: V8 Reliable BLE protocol V3
+Main change: transport-specific GUI scheduler and USB firmware fast path
