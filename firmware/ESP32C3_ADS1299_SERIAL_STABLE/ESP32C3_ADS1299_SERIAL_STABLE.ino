@@ -185,7 +185,7 @@ enum ReferenceMode : uint8_t {
 #endif
 
 #ifndef ADS_FIRMWARE_BANNER
-#define ADS_FIRMWARE_BANNER "ESP32C3 ADS1299 SERIAL STABLE V14 READY"
+#define ADS_FIRMWARE_BANNER "ESP32C3 ADS1299 SERIAL STABLE V16 READY"
 #endif
 
 enum RunPhase : uint8_t {

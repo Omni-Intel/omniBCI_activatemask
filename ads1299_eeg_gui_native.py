@@ -3,7 +3,7 @@
 ADS1299 EEG Native Python GUI
 --------------------------------
 Fast PyQtGraph-based replacement for the MATLAB diagnostic GUI.
-Reliable BLE V15 saturation-safe transport with asynchronous one-minute BIN segmentation: bytes delivered by Windows are kept losslessly in a worker-owned queue.
+Reliable BLE V16 cross-PC adaptive transport with asynchronous one-minute BIN segmentation: bytes delivered by Windows are kept losslessly in a worker-owned queue.
 Large Windows BLE delivery bursts are cooperatively parsed in bounded batches,
 while a delayed playback cursor absorbs notification jitter. Raw samples, signal
 amplitude, filtering options, and recording behavior remain unchanged.
@@ -107,19 +107,28 @@ BYTES_PER_SECOND = FRAME_BYTES * FS
 # Each transport turn handles only a bounded number of complete frames, then
 # yields back to Qt.  Unprocessed bytes remain in the worker queue: no sample is
 # clipped, rescaled, discarded, or replaced.
-# V15 keeps two independent host schedulers.  The proven P0P1 serial path
+# V16 keeps two independent host schedulers.  The proven P0P1 serial path
 # drains aggressively before paint work, while BLE keeps V8's bounded batches
 # and jitter buffer.  Sharing one compromise scheduler was the main reason the
 # V8/V9 GUI could report serial sequence gaps even when BLE looked smooth.
-SERIAL_POLL_INTERVAL_MS = 2
+SERIAL_POLL_INTERVAL_MS = 4
 BLE_POLL_INTERVAL_MS = 4
 SERIAL_PLOT_INTERVAL_MS = 80
 # Twenty visual updates per second keep the live cursor responsive while the
 # receive, filtering and BIN writer remain isolated from Qt. Backlog guards
 # still pause painting before the receive path can be starved.
 BLE_PLOT_INTERVAL_MS = 50
-SERIAL_DRAIN_BUDGET_S = 0.006
+# V16: the OS serial driver is drained by a dedicated reader thread.  Qt only
+# consumes a RAM queue, so Windows timer jitter, window dragging, PSD work or a
+# slow GPU cannot overflow the USB driver.  The timer therefore no longer has
+# to hit a fragile 2 ms deadline.
 SERIAL_RX_BUFFER_BYTES = 1024 * 1024
+SERIAL_READER_TIMEOUT_S = 0.025
+SERIAL_READER_MAX_READ_BYTES = 64 * 1024
+SERIAL_HOST_MAX_QUEUE_BYTES = 8 * 1024 * 1024
+SERIAL_MAX_PROCESS_FRAMES = 128
+SERIAL_MAX_PROCESS_BYTES = FRAME_BYTES * SERIAL_MAX_PROCESS_FRAMES
+SERIAL_REPOLL_DELAY_MS = 1
 # BLE notifications normally contain four ADS frames.  Do not run the complete
 # parser/timeline/filter pipeline once per notification.  Coalesce roughly
 # 24-32 ms of EEG, or flush after the hold timeout, then process one matrix.
@@ -175,6 +184,19 @@ BLE_RELIABLE_ACK_EVERY_BLOCKS = 3
 BLE_RELIABLE_ACK_MAX_INTERVAL_S = 0.08
 BLE_RELIABLE_NACK_REPEAT_S = 0.10
 BLE_RELIABLE_MAX_PENDING_BLOCKS = 320
+# Cross-PC adaptive reliable timing.  Windows Bluetooth stacks vary widely:
+# some deliver notifications every ~25 ms, others batch them for hundreds of
+# milliseconds.  Fixed 100/180 ms repair timers can misclassify delivery jitter
+# as packet loss and create a retransmission storm.  V16 learns the recent DATA
+# notify-gap distribution and stretches ACK/NACK/reconnect timing only when the
+# adapter actually needs it.
+BLE_ADAPTIVE_GAP_SAMPLES = 256
+BLE_ADAPTIVE_LEARN_MAX_GAP_S = 1.50
+BLE_ADAPTIVE_ACK_MAX_S = 0.35
+BLE_ADAPTIVE_NACK_MAX_S = 0.80
+BLE_ADAPTIVE_HOLE_RECONNECT_MAX_S = 8.0
+BLE_ADAPTIVE_STALL_RECONNECT_MAX_S = 12.0
+BLE_ADAPTIVE_HOLE_TIMEOUT_MAX_S = 30.0
 # A lost protocol block must not stop the stream forever.  NACKs are repeated
 # independently of new DATA notifications; after a bounded wait the host skips
 # only the missing protocol block.  The next ADS frame sequence still exposes
@@ -219,7 +241,7 @@ LIVE_CATCHUP_THRESHOLD_S = 0.20
 # Display-only adaptive jitter buffer. Raw parsing/saving and the filtered
 # history remain complete. The live cursor may skip stale screen history only
 # after a large OS delivery stall, keeping the visible delay within its budget.
-# V15 retains the V14 0.65 s target and caps the live screen near 1 s; raw BIN is independent.
+# V16 retains the 0.65 s target and caps the live screen near 1 s; raw BIN is independent.
 DISPLAY_JITTER_BASE_TARGET_S = 0.65
 DISPLAY_JITTER_STARTUP_S = 0.55
 DISPLAY_JITTER_MARGIN_S = 0.18
@@ -268,7 +290,15 @@ MODE_NAMES = {
     3: "SHORTED",
     4: "TEST",
 }
-ASSET_DIR = Path(__file__).resolve().parent / "assets"
+# PyInstaller-safe paths.  Bundled resources live under sys._MEIPASS, while
+# user recordings must stay next to the executable instead of inside the
+# temporary extraction/_internal directory.
+SOURCE_DIR = Path(__file__).resolve().parent
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_DIR)).resolve()
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else SOURCE_DIR
+ASSET_DIR = RESOURCE_DIR / "assets"
+RECORDINGS_DIR = APP_DIR / "recordings"
 LOGO_PATH = ASSET_DIR / "omni_logo_cnen.png"
 APP_ICON_PATH = ASSET_DIR / "omni_logo_mark.png"
 OMNI_ORANGE = "#ff5a01"
@@ -866,6 +896,138 @@ def expand_compact_ble_payload(payload: bytes, frame_count: int) -> bytes:
     return bytes(out)
 
 
+class SerialTransportWorker:
+    """Continuously drain pyserial outside the Qt event loop.
+
+    The worker owns *reads* and an in-memory byte deque.  GUI/command writes may
+    still use the same full-duplex serial handle.  reset_input_buffer() is
+    serialized with reads so configuration ACKs and EEG bytes cannot race an OS
+    buffer reset.  No Qt signal is emitted per read.
+    """
+
+    def __init__(self, ser_handle):
+        self.ser = ser_handle
+        self._chunks = deque()
+        self._data_lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="OmniBCI-SerialReader", daemon=True
+        )
+        self._queued_bytes = 0
+        self._peak_queued_bytes = 0
+        self._read_calls = 0
+        self._read_errors = 0
+        self._overflow_events = 0
+        self._last_gap_s = 0.0
+        self._max_gap_s = 0.0
+        self._last_rx_monotonic = None
+        self.buffer_configured = False
+        self.buffer_error = ""
+
+    def start(self):
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                if self.ser is None or not self.ser.is_open:
+                    break
+                with self._read_lock:
+                    waiting = int(self.ser.in_waiting)
+                    want = min(
+                        SERIAL_READER_MAX_READ_BYTES,
+                        max(1, waiting),
+                    )
+                    payload = self.ser.read(want)
+                if not payload:
+                    continue
+                now = time.monotonic()
+                if self._last_rx_monotonic is not None:
+                    gap = max(0.0, now - self._last_rx_monotonic)
+                    self._last_gap_s = gap
+                    self._max_gap_s = max(self._max_gap_s, gap)
+                self._last_rx_monotonic = now
+                with self._data_lock:
+                    self._chunks.append(bytes(payload))
+                    self._queued_bytes += len(payload)
+                    self._peak_queued_bytes = max(
+                        self._peak_queued_bytes, self._queued_bytes
+                    )
+                    if self._queued_bytes > SERIAL_HOST_MAX_QUEUE_BYTES:
+                        # Do not silently discard EEG.  Count pressure and keep
+                        # the queue lossless; diagnostics will expose the host
+                        # processing stall while RAM acts as the absorber.
+                        self._overflow_events += 1
+                self._read_calls += 1
+            except Exception:
+                self._read_errors += 1
+                if self._stop.wait(0.02):
+                    break
+
+    def queued_data_bytes(self) -> int:
+        with self._data_lock:
+            return int(self._queued_bytes)
+
+    def drain_data(self, max_bytes: int = SERIAL_MAX_PROCESS_BYTES) -> bytes:
+        max_bytes = max(1, int(max_bytes))
+        parts = []
+        total = 0
+        with self._data_lock:
+            while self._chunks and total < max_bytes:
+                chunk = self._chunks[0]
+                remaining = max_bytes - total
+                if len(chunk) <= remaining:
+                    parts.append(self._chunks.popleft())
+                    total += len(chunk)
+                else:
+                    parts.append(chunk[:remaining])
+                    self._chunks[0] = chunk[remaining:]
+                    total += remaining
+                    break
+            self._queued_bytes = max(0, self._queued_bytes - total)
+        return b"".join(parts)
+
+    def clear_data(self, clear_driver: bool = True):
+        with self._data_lock:
+            self._chunks.clear()
+            self._queued_bytes = 0
+        if clear_driver and self.ser is not None and self.ser.is_open:
+            try:
+                with self._read_lock:
+                    self.ser.reset_input_buffer()
+            except Exception:
+                pass
+
+    def metrics(self) -> dict:
+        with self._data_lock:
+            queued = int(self._queued_bytes)
+            peak = int(self._peak_queued_bytes)
+        return {
+            "queued_bytes": queued,
+            "peak_queued_bytes": peak,
+            "read_calls": int(self._read_calls),
+            "read_errors": int(self._read_errors),
+            "overflow_events": int(self._overflow_events),
+            "last_gap_s": float(self._last_gap_s),
+            "max_gap_s": float(self._max_gap_s),
+            "buffer_configured": bool(self.buffer_configured),
+            "buffer_error": str(self.buffer_error),
+        }
+
+    def stop(self, timeout: float = 2.0, close_port: bool = False):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(0.1, float(timeout)))
+        if close_port and self.ser is not None:
+            try:
+                if self.ser.is_open:
+                    self.ser.close()
+            except Exception:
+                pass
+
+
 class AsyncRawWriter:
     """Lossless background writer with exact one-minute BIN rotation.
 
@@ -1253,12 +1415,16 @@ class BleTransportWorker(QtCore.QThread):
         self._closing = False
         self._streaming_hint = False
         self._streaming_hint_started_monotonic = 0.0
+        self._timing_lock = threading.Lock()
         self._last_notify_monotonic: Optional[float] = None
         self._notify_gap_last_s = 0.0
         self._notify_gap_max_s = 0.0
         self._notify_burst_max_bytes = 0
         self._notify_gap_over_100ms = 0
         self._notify_gap_events = deque(maxlen=32)
+        self._notify_gap_samples = deque(maxlen=BLE_ADAPTIVE_GAP_SAMPLES)
+        self._notify_gap_ewma_s = 0.0
+        self._adaptive_profile = "learning"
 
         # Reliable BLE block reassembly/ACK state. The DATA characteristic is
         # decoded here, inside the BLE worker, so the GUI only ever receives
@@ -1546,6 +1712,67 @@ class BleTransportWorker(QtCore.QThread):
                 "session_id": None if self._reliable_session_id is None else int(self._reliable_session_id),
             }
 
+    @staticmethod
+    def _percentile(values, q: float) -> float:
+        values = sorted(float(v) for v in values if np.isfinite(v) and v >= 0.0)
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        pos = (len(values) - 1) * float(np.clip(q, 0.0, 1.0))
+        lo = int(pos)
+        hi = min(len(values) - 1, lo + 1)
+        frac = pos - lo
+        return values[lo] * (1.0 - frac) + values[hi] * frac
+
+    def adaptive_timing(self) -> dict:
+        with self._timing_lock:
+            gaps = list(self._notify_gap_samples)
+            ewma = float(self._notify_gap_ewma_s)
+        p95 = self._percentile(gaps, 0.95)
+        # Before enough samples are learned, retain V15-like behavior but avoid
+        # a 100 ms NACK loop that can overwhelm a slow Windows adapter.
+        learned = len(gaps) >= 12
+        base = max(0.024, p95, ewma * 1.20)
+        ack_interval = min(BLE_ADAPTIVE_ACK_MAX_S, max(0.08, base * 1.25))
+        nack_repeat = min(BLE_ADAPTIVE_NACK_MAX_S, max(0.15, base * 2.0))
+        hole_reconnect = min(
+            BLE_ADAPTIVE_HOLE_RECONNECT_MAX_S,
+            max(3.0, 1.0 + base * 10.0),
+        )
+        stall_reconnect = min(
+            BLE_ADAPTIVE_STALL_RECONNECT_MAX_S,
+            max(4.0, 1.5 + base * 14.0),
+        )
+        hole_timeout = min(
+            BLE_ADAPTIVE_HOLE_TIMEOUT_MAX_S,
+            max(12.0, hole_reconnect * 2.5),
+        )
+        reconnect_cooldown = min(15.0, max(6.0, hole_reconnect * 1.5))
+        if not learned:
+            profile = "learning"
+        elif p95 < 0.08:
+            profile = "fast"
+        elif p95 < 0.18:
+            profile = "normal"
+        else:
+            profile = "batched"
+        self._adaptive_profile = profile
+        ack_every = 3 if profile in ("learning", "fast") else (5 if profile == "normal" else 7)
+        return {
+            "profile": profile,
+            "samples": len(gaps),
+            "p95_s": float(p95),
+            "ewma_s": float(ewma),
+            "ack_interval_s": float(ack_interval),
+            "ack_every_blocks": int(ack_every),
+            "nack_repeat_s": float(nack_repeat),
+            "hole_reconnect_s": float(hole_reconnect),
+            "stall_reconnect_s": float(stall_reconnect),
+            "hole_timeout_s": float(hole_timeout),
+            "reconnect_cooldown_s": float(reconnect_cooldown),
+        }
+
     def _decode_reliable_bytes_locked(self, incoming: bytes):
         """Return ordered original ADS payloads plus ACK/NACK control packets."""
         if incoming:
@@ -1650,7 +1877,7 @@ class BleTransportWorker(QtCore.QThread):
             if block_seq < expected:
                 self._reliable_duplicates += 1
                 now = time.monotonic()
-                if expected > 0 and (now - self._reliable_last_ack_time) >= 0.05:
+                if expected > 0 and (now - self._reliable_last_ack_time) >= self.adaptive_timing()["ack_interval_s"]:
                     ack_seq = expected - 1
                     control_packets.append((
                         self._make_reliable_control_packet(BLE_CTRL_ACK, self._reliable_session_id or 0, ack_seq),
@@ -1679,7 +1906,7 @@ class BleTransportWorker(QtCore.QThread):
                 should_send_nack = (
                     last_nack is None
                     or last_nack[0] != first_missing
-                    or (now - last_nack[2]) >= BLE_RELIABLE_NACK_REPEAT_S
+                    or (now - last_nack[2]) >= self.adaptive_timing()["nack_repeat_s"]
                 )
                 if should_send_nack:
                     # The first out-of-order block already defines the complete
@@ -1735,8 +1962,8 @@ class BleTransportWorker(QtCore.QThread):
                     else highest - self._reliable_last_ack_sent
                 )
                 if (
-                    ack_distance >= BLE_RELIABLE_ACK_EVERY_BLOCKS
-                    or (now - self._reliable_last_ack_time) >= BLE_RELIABLE_ACK_MAX_INTERVAL_S
+                    ack_distance >= self.adaptive_timing()["ack_every_blocks"]
+                    or (now - self._reliable_last_ack_time) >= self.adaptive_timing()["ack_interval_s"]
                     or gap_marker
                 ):
                     control_packets.append((
@@ -1754,15 +1981,22 @@ class BleTransportWorker(QtCore.QThread):
         if not payload:
             return
         now = time.monotonic()
-        if self._last_notify_monotonic is not None:
-            gap = max(0.0, now - self._last_notify_monotonic)
-            self._notify_gap_last_s = gap
-            self._notify_gap_max_s = max(self._notify_gap_max_s, gap)
-            if gap >= DISPLAY_JITTER_LONG_GAP_S:
-                self._notify_gap_over_100ms += 1
-                self._notify_gap_events.append((now, gap))
-        self._last_notify_monotonic = now
-        self._notify_burst_max_bytes = max(self._notify_burst_max_bytes, len(payload))
+        with self._timing_lock:
+            if self._last_notify_monotonic is not None:
+                gap = max(0.0, now - self._last_notify_monotonic)
+                self._notify_gap_last_s = gap
+                self._notify_gap_max_s = max(self._notify_gap_max_s, gap)
+                if 0.0 < gap <= BLE_ADAPTIVE_LEARN_MAX_GAP_S:
+                    self._notify_gap_samples.append(gap)
+                    if self._notify_gap_ewma_s <= 0.0:
+                        self._notify_gap_ewma_s = gap
+                    else:
+                        self._notify_gap_ewma_s = 0.90 * self._notify_gap_ewma_s + 0.10 * gap
+                if gap >= DISPLAY_JITTER_LONG_GAP_S:
+                    self._notify_gap_over_100ms += 1
+                    self._notify_gap_events.append((now, gap))
+            self._last_notify_monotonic = now
+            self._notify_burst_max_bytes = max(self._notify_burst_max_bytes, len(payload))
 
         with self._reliable_lock:
             ordered_payloads, control_packets = self._decode_reliable_bytes_locked(payload)
@@ -1803,7 +2037,7 @@ class BleTransportWorker(QtCore.QThread):
                         if (
                             last_nack is None
                             or last_nack[0] != expected
-                            or (now - last_nack[2]) >= BLE_RELIABLE_NACK_REPEAT_S
+                            or (now - last_nack[2]) >= self.adaptive_timing()["nack_repeat_s"]
                         ):
                             controls.append((
                                 self._make_reliable_control_packet(
@@ -1823,9 +2057,9 @@ class BleTransportWorker(QtCore.QThread):
                         # before any block is skipped.  The ESP32 retains several
                         # seconds of blocks, so resubscribing is normally lossless.
                         if (
-                            age >= BLE_RELIABLE_HOLE_RECONNECT_S
+                            age >= self.adaptive_timing()["hole_reconnect_s"]
                             and (now - self._watchdog_last_reconnect_monotonic)
-                                >= BLE_RELIABLE_RECONNECT_COOLDOWN_S
+                                >= self.adaptive_timing()["reconnect_cooldown_s"]
                         ):
                             self._watchdog_last_reconnect_monotonic = now
                             self._watchdog_reconnects += 1
@@ -1837,7 +2071,7 @@ class BleTransportWorker(QtCore.QThread):
                         # block only; the ADS sample sequence in the next payload
                         # still records the exact missing sample count.
                         if (
-                            age >= BLE_RELIABLE_HOLE_TIMEOUT_S
+                            age >= self.adaptive_timing()["hole_timeout_s"]
                             or len(self._reliable_pending) >= BLE_RELIABLE_FORCE_SKIP_PENDING
                         ):
                             self._reliable_expected_block += 1
@@ -1874,17 +2108,17 @@ class BleTransportWorker(QtCore.QThread):
                         and (
                             (
                                 self._last_notify_monotonic is not None
-                                and (now - self._last_notify_monotonic) >= BLE_RELIABLE_STALL_RECONNECT_S
+                                and (now - self._last_notify_monotonic) >= self.adaptive_timing()["stall_reconnect_s"]
                             )
                             or (
                                 self._last_notify_monotonic is None
                                 and self._streaming_hint_started_monotonic > 0.0
                                 and (now - self._streaming_hint_started_monotonic)
-                                    >= BLE_RELIABLE_STALL_RECONNECT_S
+                                    >= self.adaptive_timing()["stall_reconnect_s"]
                             )
                         )
                         and (now - self._watchdog_last_reconnect_monotonic)
-                            >= BLE_RELIABLE_RECONNECT_COOLDOWN_S
+                            >= self.adaptive_timing()["reconnect_cooldown_s"]
                     ):
                         self._watchdog_last_reconnect_monotonic = now
                         self._watchdog_reconnects += 1
@@ -1916,23 +2150,29 @@ class BleTransportWorker(QtCore.QThread):
         )
 
     def timing_metrics(self) -> Tuple[float, float, int, int]:
-        return (
-            float(self._notify_gap_last_s),
-            float(self._notify_gap_max_s),
-            int(self._notify_burst_max_bytes),
-            int(self._notify_gap_over_100ms),
-        )
+        with self._timing_lock:
+            return (
+                float(self._notify_gap_last_s),
+                float(self._notify_gap_max_s),
+                int(self._notify_burst_max_bytes),
+                int(self._notify_gap_over_100ms),
+            )
 
     def recent_gap_events(self):
-        return list(self._notify_gap_events)
+        with self._timing_lock:
+            return list(self._notify_gap_events)
 
     def reset_timing_metrics(self):
-        self._last_notify_monotonic = None
-        self._notify_gap_last_s = 0.0
-        self._notify_gap_max_s = 0.0
-        self._notify_burst_max_bytes = 0
-        self._notify_gap_over_100ms = 0
-        self._notify_gap_events.clear()
+        with self._timing_lock:
+            self._last_notify_monotonic = None
+            self._notify_gap_last_s = 0.0
+            self._notify_gap_max_s = 0.0
+            self._notify_burst_max_bytes = 0
+            self._notify_gap_over_100ms = 0
+            self._notify_gap_events.clear()
+            self._notify_gap_samples.clear()
+            self._notify_gap_ewma_s = 0.0
+            self._adaptive_profile = "learning"
 
     def queued_data_bytes(self) -> int:
         with self._data_lock:
@@ -2129,7 +2369,7 @@ class BleTransportWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V14 | OpenBCI-style buffered BLE + worker pipeline")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V16 | cross-PC adaptive USB/BLE pipeline")
         self.resize(1500, 920)
 
         self.gain = 24  # legacy/global command value
@@ -2149,6 +2389,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_batches_applied = 0
         self.filter_stale_batches = 0
         self.ser: Optional[serial.Serial] = None
+        self.serial_worker: Optional[SerialTransportWorker] = None
+        self.serial_control_read_active = False
+        self.serial_buffer_configured = False
+        self.serial_buffer_error = ""
         self.active_transport: Optional[str] = None
         self.transport_connecting = False
         self.ble_worker: Optional[BleTransportWorker] = None
@@ -2526,7 +2770,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
         pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#424245")
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V14 | OpenBCI-style buffered BLE + worker pipeline")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V16 | cross-PC adaptive USB/BLE pipeline")
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)
@@ -3312,9 +3556,9 @@ class MainWindow(QtWidgets.QMainWindow):
     ):
         """Read one matching ADS register ACK with GATT-read fallback.
 
-        STATUS notifications are not guaranteed to arrive on every Windows BLE
-        adapter.  The firmware also leaves the latest ACK as the current STATUS
-        characteristic value, so a direct GATT read recovers a lost notify.
+        V16 serial ACKs are drained from the dedicated reader queue while the
+        normal serial parser is temporarily paused.  This removes the race where
+        a Qt timer consumed a 12-byte configuration ACK as if it were EEG.
         """
         if not self.transport_connected():
             return None
@@ -3325,56 +3569,62 @@ class MainWindow(QtWidgets.QMainWindow):
             None if expected_argument is None else int(expected_argument) & 0xFF
         )
         next_direct_read = time.perf_counter() + 0.22
-        while time.perf_counter() < deadline:
-            chunk = b""
-            if self.active_transport == "serial":
-                waiting = int(self.ser.in_waiting) if self.ser and self.ser.is_open else 0
-                if waiting:
-                    chunk = self.ser.read(waiting)
-            elif self.active_transport == "ble" and self.ble_worker is not None:
-                try:
-                    chunk = self.ble_worker.status_queue.get(timeout=0.02)
-                except queue.Empty:
-                    chunk = b""
-                now = time.perf_counter()
-                if not chunk and now >= next_direct_read:
-                    next_direct_read = now + 0.30
+        serial_mode = self.active_transport == "serial"
+        if serial_mode:
+            self.serial_control_read_active = True
+        try:
+            while time.perf_counter() < deadline:
+                chunk = b""
+                if self.active_transport == "serial":
+                    if self.serial_worker is not None:
+                        chunk = self.serial_worker.drain_data(4096)
+                elif self.active_transport == "ble" and self.ble_worker is not None:
                     try:
-                        direct = self.ble_worker.read_status_blocking(timeout=0.65)
-                    except Exception:
-                        direct = b""
+                        chunk = self.ble_worker.status_queue.get(timeout=0.02)
+                    except queue.Empty:
+                        chunk = b""
+                    now = time.perf_counter()
+                    if not chunk and now >= next_direct_read:
+                        next_direct_read = now + 0.30
+                        try:
+                            direct = self.ble_worker.read_status_blocking(timeout=0.65)
+                        except Exception:
+                            direct = b""
+                        parsed = self._decode_config_ack_packet(
+                            direct, expected_command, wanted_argument
+                        )
+                        if parsed is not None:
+                            return parsed
+
+                if chunk:
+                    buffer.extend(chunk)
+
+                while True:
+                    start = buffer.find(marker)
+                    if start < 0:
+                        if len(buffer) > 1:
+                            del buffer[:-1]
+                        break
+                    if len(buffer) < start + 12:
+                        if start:
+                            del buffer[:start]
+                        break
+                    packet = bytes(buffer[start:start + 12])
+                    del buffer[:start + 12]
                     parsed = self._decode_config_ack_packet(
-                        direct, expected_command, wanted_argument
+                        packet, expected_command, wanted_argument
                     )
                     if parsed is not None:
                         return parsed
 
-            if chunk:
-                buffer.extend(chunk)
-
-            while True:
-                start = buffer.find(marker)
-                if start < 0:
-                    if len(buffer) > 1:
-                        del buffer[:-1]
-                    break
-                if len(buffer) < start + 12:
-                    if start:
-                        del buffer[:start]
-                    break
-                packet = bytes(buffer[start:start + 12])
-                del buffer[:start + 12]
-                parsed = self._decode_config_ack_packet(
-                    packet, expected_command, wanted_argument
-                )
-                if parsed is not None:
-                    return parsed
-
-            if len(buffer) > 256:
-                del buffer[:-32]
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 5)
-            time.sleep(0.004)
-        return None
+                if len(buffer) > 256:
+                    del buffer[:-32]
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 5)
+                time.sleep(0.004)
+            return None
+        finally:
+            if serial_mode:
+                self.serial_control_read_active = False
 
     def refresh_channel_parameter_labels(self):
         """Keep the per-channel hardware state visible without opening a dialog."""
@@ -3655,7 +3905,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.offline_uv is None:
             QtWidgets.QMessageBox.information(self, "导出 CSV", "请先导入一个 BIN 或 BDF 文件。")
             return
-        recordings_dir = Path(__file__).resolve().parent / "recordings"
+        recordings_dir = RECORDINGS_DIR
         mne_dir = recordings_dir / "mne"
         mne_dir.mkdir(parents=True, exist_ok=True)
         source = Path(getattr(self, "loaded_path", self.raw_path or "ADS1299"))
@@ -3700,7 +3950,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not ok:
                 return
             source = Path(getattr(self, "loaded_path", self.raw_path or "ADS1299.bin"))
-            recordings_dir = Path(__file__).resolve().parent / "recordings"
+            recordings_dir = RECORDINGS_DIR
             bdf_dir = recordings_dir / "bdf"
             fif_dir = recordings_dir / "fif"
             bdf_dir.mkdir(parents=True, exist_ok=True)
@@ -3833,7 +4083,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.offline_uv is None:
             raise RuntimeError("请先导入一个 BIN 或 BDF 文件。")
 
-        recordings_dir = Path(__file__).resolve().parent / "recordings"
+        recordings_dir = RECORDINGS_DIR
         mne_dir = recordings_dir / "mne"
         fif_dir = recordings_dir / "fif"
         mne_dir.mkdir(parents=True, exist_ok=True)
@@ -4049,13 +4299,25 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "串口", "请先点击“扫描串口”，并选择一个设备。")
             return
         try:
-            self.ser = serial.Serial(port, BAUD, timeout=0, write_timeout=0)
+            self.ser = serial.Serial(
+                port,
+                BAUD,
+                timeout=SERIAL_READER_TIMEOUT_S,
+                write_timeout=0.5,
+            )
+            self.serial_buffer_configured = False
+            self.serial_buffer_error = ""
             try:
-                # pyserial exposes this on Windows.  A large driver buffer gives
-                # Qt/Python room to survive an occasional paint or OS scheduling stall.
+                # Best-effort Windows driver buffer.  Unlike V15, failure is
+                # visible in diagnostics instead of silently ignored.
                 self.ser.set_buffer_size(rx_size=SERIAL_RX_BUFFER_BYTES, tx_size=65536)
-            except Exception:
-                pass
+                self.serial_buffer_configured = True
+            except Exception as buffer_exc:
+                self.serial_buffer_error = str(buffer_exc)
+            self.serial_worker = SerialTransportWorker(self.ser)
+            self.serial_worker.buffer_configured = self.serial_buffer_configured
+            self.serial_worker.buffer_error = self.serial_buffer_error
+            self.serial_worker.start()
             self.active_transport = "serial"
             self._apply_transport_timing("serial")
             QtWidgets.QApplication.processEvents()
@@ -4185,7 +4447,7 @@ class MainWindow(QtWidgets.QMainWindow):
         raise RuntimeError(
             "BLE 批量通道初始化连续 3 次失败（"
             + detail
-            + "）。请烧录 V14 配套固件。"
+            + "）。请烧录 V16 配套固件。"
         )
 
     def sync_ble_configuration(self, requested_reference=None, probe_capability: bool = True):
@@ -4405,6 +4667,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def disconnect_transport(self):
         if self.active_transport == "serial":
             self.stop_stream()
+            if self.serial_worker is not None:
+                try:
+                    self.serial_worker.stop(timeout=2.0, close_port=False)
+                except Exception:
+                    pass
+                self.serial_worker = None
             if self.ser:
                 try:
                     self.ser.close()
@@ -4462,7 +4730,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self, clear_status: bool = True, reset_reliable: bool = False
     ):
         if self.active_transport == "serial":
-            if self.ser and self.ser.is_open:
+            if self.serial_worker is not None:
+                self.serial_worker.clear_data(clear_driver=True)
+            elif self.ser and self.ser.is_open:
                 self.ser.reset_input_buffer()
         elif self.active_transport == "ble":
             self.ble_rx_buffer.clear()
@@ -4478,7 +4748,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_serial_waiting_bytes = 0
 
     def _recording_folder(self) -> Path:
-        folder = Path(__file__).resolve().parent / "recordings" / "bin"
+        folder = RECORDINGS_DIR / "bin"
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
@@ -5239,7 +5509,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self,
                 "BLE 固件不匹配",
-                "V15 BLE 模式需要配套 V13+ 可靠 BLE 固件。请检查烧录版本。",
+                "V16 BLE 模式建议配套 V16 自适应可靠 BLE 固件。旧 V13/V14 可连接，但跨电脑重传修正需要 V16 固件。",
             )
             return
         if (
@@ -5515,56 +5785,56 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(queued)
 
     def _schedule_transport_repoll(self):
-        """Continue draining a burst without monopolizing the Qt event loop."""
+        """Continue draining a RAM backlog without monopolizing Qt."""
         if self._transport_repoll_pending or not self.transport_connected():
             return
         self._transport_repoll_pending = True
-        QtCore.QTimer.singleShot(TRANSPORT_REPOLL_DELAY_MS, self._run_transport_repoll)
+        delay = SERIAL_REPOLL_DELAY_MS if self.active_transport == "serial" else TRANSPORT_REPOLL_DELAY_MS
+        QtCore.QTimer.singleShot(int(delay), self._run_transport_repoll)
 
     def _run_transport_repoll(self):
         self._transport_repoll_pending = False
         self.poll_transport()
 
     def poll_transport(self):
-        """Drain USB aggressively, but keep BLE work sliced into short turns.
+        """Consume host-side queues; OS I/O itself never runs on the Qt thread.
 
-        USB uses the exact scheduling idea from the no-suffix P0P1 GUI: 2 ms
-        polling, read everything already in the driver, and continue for up to
-        6 ms.  BLE retains V8's bounded batches so a large Windows notification
-        burst cannot freeze the Qt event loop.
+        USB bytes are continuously drained by SerialTransportWorker. BLE bytes
+        are continuously reassembled by BleTransportWorker. This method only
+        performs bounded parser/timeline work, then yields back to Qt.
         """
         if self._poll_serial_busy or not self.transport_connected():
+            return
+        if self.active_transport == "serial" and self.serial_control_read_active:
             return
         self._poll_serial_busy = True
         turn_started = time.perf_counter()
         remaining = 0
         try:
             if self.active_transport == "serial":
-                deadline = turn_started + SERIAL_DRAIN_BUDGET_S
-                while time.perf_counter() < deadline:
-                    n = int(self.ser.in_waiting) if self.ser and self.ser.is_open else 0
-                    self.last_serial_waiting_bytes = n
+                data = b""
+                if self.serial_worker is not None:
+                    queued_before = self.serial_worker.queued_data_bytes()
                     self.transport_peak_pending_bytes = max(
-                        self.transport_peak_pending_bytes, n
+                        self.transport_peak_pending_bytes, int(queued_before)
                     )
-                    if n <= 0:
-                        break
-                    data = self.ser.read(n)
-                    if not data:
-                        break
+                    data = self.serial_worker.drain_data(SERIAL_MAX_PROCESS_BYTES)
+                if data:
                     self.enqueue_raw_bytes(data)
                     frames = self.parser.feed(data)
                     if frames:
                         self.process_frames(frames, live=True)
+                remaining = (
+                    self.serial_worker.queued_data_bytes()
+                    if self.serial_worker is not None else 0
+                )
+                self.last_serial_waiting_bytes = int(remaining)
             else:
                 pending_before = self._ble_pending_bytes()
                 self.transport_peak_pending_bytes = max(
                     self.transport_peak_pending_bytes, int(pending_before)
                 )
 
-                # First move ordered reliable payloads out of the BLE worker.
-                # This lock-held operation is tiny; parsing/filtering happens only
-                # after enough frames have been coalesced below.
                 drained = b""
                 if self.ble_worker is not None:
                     drained = self.ble_worker.drain_data(BLE_MAX_PROCESS_BYTES)
@@ -5591,8 +5861,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     or staged >= BLE_MAX_PROCESS_BYTES
                 )
 
-                # One matrix batch per Qt turn.  Do not loop until empty: a
-                # continuous 1-ms repoll chain was able to starve window events.
                 if should_process:
                     take = min(staged, BLE_MAX_PROCESS_BYTES)
                     data = bytes(self.ble_rx_buffer[:take])
@@ -5606,25 +5874,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.ble_coalesced_batches += 1
                         self.process_frames(frames, live=True)
 
-                self.last_serial_waiting_bytes = int(
-                    len(self.ble_rx_buffer) + worker_pending
-                )
+                remaining = int(len(self.ble_rx_buffer) + worker_pending)
+                self.last_serial_waiting_bytes = remaining
         except Exception as exc:
             self.set_status(f"{self.transport_description()} 读取异常：{exc}")
         finally:
-            try:
-                if self.active_transport == "serial":
-                    remaining = (
-                        int(self.ser.in_waiting)
-                        if self.ser is not None and self.ser.is_open
-                        else 0
-                    )
-                elif self.active_transport == "ble":
-                    remaining = self._ble_pending_bytes()
-                else:
-                    remaining = 0
-            except Exception:
-                remaining = self.last_serial_waiting_bytes
+            if self.active_transport == "serial" and self.serial_worker is not None:
+                remaining = self.serial_worker.queued_data_bytes()
+            elif self.active_transport == "ble":
+                remaining = self._ble_pending_bytes()
             self.last_serial_waiting_bytes = int(remaining)
             self.transport_peak_pending_bytes = max(
                 self.transport_peak_pending_bytes, int(remaining)
@@ -5653,9 +5911,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     0.0 if self.ble_batch_started_monotonic is None
                     else max(0.0, time.monotonic() - self.ble_batch_started_monotonic)
                 )
-                # A small staged batch is intentionally waiting for coalescing;
-                # let the regular 8-ms timer wake it instead of creating an
-                # endless singleShot chain.
                 needs_repoll = bool(
                     worker_pending > 0
                     or len(self.ble_rx_buffer) >= BLE_COALESCE_MIN_BYTES
@@ -6878,6 +7133,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 reliable.update(self.ble_worker.reliable_metrics())
             except Exception:
                 pass
+        serial_metrics = {
+            "queued_bytes": 0, "peak_queued_bytes": 0, "read_calls": 0,
+            "read_errors": 0, "overflow_events": 0, "last_gap_s": 0.0,
+            "max_gap_s": 0.0, "buffer_configured": False, "buffer_error": "",
+        }
+        if self.serial_worker is not None:
+            try:
+                serial_metrics.update(self.serial_worker.metrics())
+            except Exception:
+                pass
+        adaptive_ble = {
+            "profile": "---", "samples": 0, "p95_s": 0.0, "ack_interval_s": 0.0,
+            "nack_repeat_s": 0.0, "stall_reconnect_s": 0.0,
+        }
+        if self.ble_worker is not None:
+            try:
+                adaptive_ble.update(self.ble_worker.adaptive_timing())
+            except Exception:
+                pass
         raw_name = Path(raw_path).name if raw_path != "---" else "---"
         filter_metrics = {
             "queued_samples": 0, "output_samples": 0, "peak_queued_samples": 0,
@@ -6903,10 +7177,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Queue-drop hints", str(self.queue_drop_hints)),
             ("Backlog events", str(self.backlog_events)),
             ("RX now / peak", f"{self.last_serial_waiting_bytes} / {self.transport_peak_pending_bytes} B"),
+            ("Serial worker", f"{serial_metrics['queued_bytes']}/{serial_metrics['peak_queued_bytes']} B"),
+            ("Serial gap/err", f"{1000*serial_metrics['max_gap_s']:.0f} ms / {serial_metrics['read_errors']}"),
+            ("Serial OS buffer", "1MB" if serial_metrics['buffer_configured'] else "driver default"),
             ("Turn last/max", f"{self.transport_last_turn_ms:.2f}/{self.transport_max_turn_ms:.2f} ms"),
             ("RX lag", f"{self.live_lag_s:.3f} s"),
             ("Render gap", f"{self.render_gap_last_ms:.1f}/{self.render_gap_max_ms:.1f} ms"),
             ("Notify gap", f"{1000*ble_notify_gap_last:.1f}/{1000*ble_notify_gap_max:.1f} ms"),
+            ("BLE adapt", f"{adaptive_ble['profile']} p95={1000*adaptive_ble['p95_s']:.0f}ms"),
+            ("BLE repair", f"N{1000*adaptive_ble['nack_repeat_s']:.0f}/S{adaptive_ble['stall_reconnect_s']:.1f}s"),
             ("Notify burst", f"{ble_notify_burst_max} B"),
             ("Display buffer", f"{self.display_delay_s:.3f} s"),
             ("Underrun / resync", f"{self.display_buffer_underruns} / {self.display_low_latency_resyncs}"),
@@ -6984,10 +7263,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.seq_device_lost > 0 or self.backlog_events > 0 or self.queue_drop_hints > 0:
             return "MCU/DRDY 或固件队列确有缺口：优先检查 SPI 实时性、任务积压和固件 queue drop。"
         if self.seq_host_lost > 0:
-            return "序号有缺口但 MCU 未报告 pending/queue drop：更像主机接收或解析积压；V14 已启用 USB 优先排空。"
+            return "序号有缺口但 MCU 未报告 pending/queue drop：更像主机接收或解析积压；V16 已使用独立串口接收线程；若仍有缺口请看 Serial worker/OS buffer 诊断。"
         reliable = self.ble_worker.reliable_metrics() if self.ble_worker is not None else {}
         if self.active_transport == "ble" and int(reliable.get("forced_skips", 0)) > 0:
-            return "BLE 曾出现永久 block 空洞，V14 紧急看门狗已跳洞并继续采集；对应 ADS sequence 缺口仍按真实时间显示。"
+            return "BLE 曾出现永久 block 空洞，V16 自适应看门狗已跳洞并继续采集；对应 ADS sequence 缺口仍按真实时间显示。"
         if self.active_transport == "ble" and (
             int(self.ble_status.get("reliable_overflow", 0))
             or int(self.ble_status.get("reliable_unknown_nack", 0))
@@ -7045,6 +7324,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):  # noqa: N802
         try:
             self.stop_stream()
+            if self.serial_worker is not None:
+                self.serial_worker.stop(timeout=2.0, close_port=False)
+                self.serial_worker = None
             if self.active_transport == "serial" and self.ser and self.ser.is_open:
                 self.ser.close()
             if self.ble_worker is not None:

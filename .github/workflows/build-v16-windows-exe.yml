@@ -1,0 +1,51 @@
+name: Build OmniBCI V16 Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ads1299_eeg_gui_native.py'
+      - 'requirements.txt'
+      - 'OmniBCI_V16.spec'
+      - 'assets/**'
+      - 'firmware/**'
+      - '.github/workflows/build-v16-windows-exe.yml'
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.10,<7"
+
+      - name: Build ONEDIR EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean OmniBCI_V16.spec
+          New-Item -ItemType Directory -Force dist\OmniBCI_V16\recordings | Out-Null
+          Copy-Item -Recurse -Force firmware dist\OmniBCI_V16\firmware
+          Copy-Item VERSION.txt dist\OmniBCI_V16\VERSION.txt
+          Copy-Item FIRMWARE_COMPATIBILITY.txt dist\OmniBCI_V16\FIRMWARE_COMPATIBILITY.txt
+          Copy-Item EXE_BUILD_NOTES.txt dist\OmniBCI_V16\EXE_BUILD_NOTES.txt
+          Compress-Archive -Path dist\OmniBCI_V16 -DestinationPath OmniBCI_V16_Windows.zip -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniBCI_V16_Windows
+          path: OmniBCI_V16_Windows.zip
+          if-no-files-found: error

@@ -1,3 +1,5 @@
-Run: ads1299_eeg_gui_native.py
-Version: V15 saturation-safe GUI
-V13/V14 firmware is compatible; reflashing is not required.
+ads1299_eeg_gui_native.py
+Version: V16 cross-PC adaptive USB/BLE GUI
+
+On a new PC, run install_and_run.bat once. Then use run.bat.
+Do not install pyserial/scipy one-by-one into random Python installations.

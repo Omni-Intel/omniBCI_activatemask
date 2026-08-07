@@ -182,8 +182,12 @@ constexpr size_t BLE_RELIABLE_PACKET_MAX_BYTES = BLE_RELIABLE_HEADER_BYTES + BLE
 static_assert(BLE_RELIABLE_PACKET_MAX_BYTES <= (BLE_REQUESTED_MTU - 3u), "compact BLE block must fit one MTU-247 notification");
 constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 320;       // about 7.68 s at 250 SPS
 constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 16;      // about 0.38 s unacked in flight
-constexpr uint32_t BLE_RELIABLE_TX_PACE_MS = 9;          // catch-up capable, avoids flooding host queue
-constexpr uint32_t BLE_RELIABLE_RETRY_TIMEOUT_MS = 180;
+constexpr uint32_t BLE_RELIABLE_TX_PACE_FAST_MS = 9;     // fast adapter / low in-flight occupancy
+constexpr uint32_t BLE_RELIABLE_TX_PACE_NORMAL_MS = 14;  // moderate Windows batching
+constexpr uint32_t BLE_RELIABLE_TX_PACE_SLOW_MS = 20;    // near-full in-flight window
+constexpr uint32_t BLE_RELIABLE_RETRY_MIN_MS = 800;
+constexpr uint32_t BLE_RELIABLE_RETRY_MAX_MS = 3000;
+constexpr uint32_t BLE_RELIABLE_RETRY_INITIAL_MS = 1200;
 constexpr uint8_t BLE_RELIABLE_MAX_RETRIES = 20;
 
 // Reliable CONTROL packet:
@@ -310,6 +314,9 @@ volatile uint32_t bleReliableHighestAcked = 0xFFFFFFFFu;
 volatile uint32_t bleReliableNextBlockSequence = 0;
 volatile uint32_t bleReliableNextNewTxSequence = 0;
 volatile uint32_t bleReliableLastTxMs = 0;
+volatile uint32_t bleReliableLastAckRxMs = 0;
+volatile uint32_t bleReliableAckIntervalEwmaMs = 120;
+volatile uint32_t bleReliableAdaptiveRetryTimeoutMs = BLE_RELIABLE_RETRY_INITIAL_MS;
 volatile bool bleReliableSessionActive = false;
 volatile uint32_t bleReliableNackFirst = 0;
 volatile uint32_t bleReliableNackLast = 0;
@@ -413,6 +420,9 @@ ReliableBleBlock *findReliableBlock(uint32_t blockSequence);
 bool sendReliableBlock(ReliableBleBlock &block, bool retransmission);
 void releaseAckedBlocks(uint32_t highestContiguousBlock);
 uint16_t reliableOutstandingBlocks();
+uint16_t reliableInFlightBlocks();
+uint32_t reliableAdaptiveTxPaceMs();
+void updateReliableAckTiming();
 void buildBleStatus(uint8_t *destination);
 void publishBleStatus(bool notifyClient);
 
@@ -659,7 +669,7 @@ void setup() {
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
-  Serial.println("ESP32C3 ADS1299 SRB2 + RELIABLE BLE V14 READY");
+  Serial.println("ESP32C3 ADS1299 SRB2 + RELIABLE BLE V16 ADAPTIVE READY");
   Serial.printf("BLE=%s name=%s requestedMTU=%u minStreamMTU=%u\n",
                 bleInitialized ? "READY" : "FAILED",
                 BLE_DEVICE_NAME,
@@ -1524,6 +1534,38 @@ uint16_t reliableOutstandingBlocks() {
   return bleReliableStoredBlocks;
 }
 
+uint16_t reliableInFlightBlocks() {
+  uint16_t count = 0;
+  for (uint16_t i = 0; i < BLE_RELIABLE_RING_BLOCKS; ++i) {
+    const ReliableBleBlock &slot = bleReliableRing[i];
+    if (slot.valid && slot.sent) count++;
+  }
+  return count;
+}
+
+uint32_t reliableAdaptiveTxPaceMs() {
+  const uint16_t inFlight = reliableInFlightBlocks();
+  if (inFlight >= 12u) return BLE_RELIABLE_TX_PACE_SLOW_MS;
+  if (inFlight >= 8u) return BLE_RELIABLE_TX_PACE_NORMAL_MS;
+  return BLE_RELIABLE_TX_PACE_FAST_MS;
+}
+
+void updateReliableAckTiming() {
+  const uint32_t now = millis();
+  if (bleReliableLastAckRxMs != 0u) {
+    const uint32_t interval = now - bleReliableLastAckRxMs;
+    if (interval > 0u && interval < 5000u) {
+      bleReliableAckIntervalEwmaMs =
+        (bleReliableAckIntervalEwmaMs * 7u + interval) / 8u;
+      uint32_t retry = bleReliableAckIntervalEwmaMs * 4u + 250u;
+      if (retry < BLE_RELIABLE_RETRY_MIN_MS) retry = BLE_RELIABLE_RETRY_MIN_MS;
+      if (retry > BLE_RELIABLE_RETRY_MAX_MS) retry = BLE_RELIABLE_RETRY_MAX_MS;
+      bleReliableAdaptiveRetryTimeoutMs = retry;
+    }
+  }
+  bleReliableLastAckRxMs = now;
+}
+
 void resetReliableTransport(bool resetSequence) {
   memset(bleReliableRing, 0, sizeof(bleReliableRing));
   memset(bleReliableBuildPayload, 0, sizeof(bleReliableBuildPayload));
@@ -1539,6 +1581,9 @@ void resetReliableTransport(bool resetSequence) {
   }
   bleReliableNextNewTxSequence = bleReliableNextBlockSequence;
   bleReliableLastTxMs = 0;
+  bleReliableLastAckRxMs = 0;
+  bleReliableAckIntervalEwmaMs = 120;
+  bleReliableAdaptiveRetryTimeoutMs = BLE_RELIABLE_RETRY_INITIAL_MS;
   bleReliableNackFirst = 0;
   bleReliableNackLast = 0;
   bleReliableNackPending = false;
@@ -1657,6 +1702,7 @@ void releaseAckedBlocks(uint32_t highestContiguousBlock) {
     return;
   }
 
+  updateReliableAckTiming();
   for (uint16_t i = 0; i < BLE_RELIABLE_RING_BLOCKS; ++i) {
     ReliableBleBlock &slot = bleReliableRing[i];
     if (!slot.valid) continue;
@@ -1722,7 +1768,8 @@ void serviceReliableBleTx() {
   if (refreshBlePeerMtu() < BLE_MIN_STREAM_MTU) return;
 
   const uint32_t now = millis();
-  if ((now - bleReliableLastTxMs) < BLE_RELIABLE_TX_PACE_MS) return;
+  const uint32_t txPaceMs = reliableAdaptiveTxPaceMs();
+  if ((now - bleReliableLastTxMs) < txPaceMs) return;
 
   // Explicit receiver repair requests always win over new data.
   if (bleReliableNackPending) {
@@ -1752,7 +1799,11 @@ void serviceReliableBleTx() {
        ++seq) {
     ReliableBleBlock *candidate = findReliableBlock(seq);
     if (!candidate || !candidate->sent) continue;
-    if ((now - candidate->lastSentMs) >= BLE_RELIABLE_RETRY_TIMEOUT_MS) {
+    const uint32_t noAckAge = bleReliableLastAckRxMs == 0u
+      ? (now - candidate->lastSentMs)
+      : (now - bleReliableLastAckRxMs);
+    if ((now - candidate->lastSentMs) >= bleReliableAdaptiveRetryTimeoutMs &&
+        noAckAge >= bleReliableAdaptiveRetryTimeoutMs) {
       oldestTimedOut = candidate;
       break;
     }

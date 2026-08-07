@@ -1,2 +1,3 @@
-V15-SPLITBIN-FIX
-GUI-only update; V13/V14 BLE firmware remains compatible.
+OmniBCI ADS1299 Native GUI V16
+Cross-PC adaptive USB/BLE transport
+2026-08-07

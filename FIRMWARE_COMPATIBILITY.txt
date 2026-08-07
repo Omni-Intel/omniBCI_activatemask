@@ -1,4 +1,16 @@
-V15 是纯 GUI 饱和稳定性修复。
+V16 GUI can still decode the compact reliable BLE V2 stream used by V13/V14.
 
-已经稳定工作的 V13 或 V14 BLE 固件可以继续使用，不需要重新烧录。
-包内保留 V14 固件目录，仅用于重新烧录或代码参考。
+However, for another Windows PC (Huawei/Lenovo/etc.) use the V16 BLE firmware,
+because the important cross-PC fix is also on the ESP32-C3 side:
+- no fixed 180 ms blind retransmission;
+- ACK-driven adaptive retry timeout;
+- in-flight adaptive TX pacing.
+
+SRB1:
+firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
+
+SRB2:
+firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
+
+USB-only reference:
+firmware/ESP32C3_ADS1299_SERIAL_STABLE/ESP32C3_ADS1299_SERIAL_STABLE.ino

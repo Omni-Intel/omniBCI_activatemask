@@ -1,0 +1,31 @@
+OmniBCI V16 Windows EXE build notes
+===================================
+
+Recommended distribution format: PyInstaller ONEDIR.
+
+After build, send the ENTIRE directory:
+    dist\OmniBCI_V16\
+
+The target computer launches:
+    OmniBCI_V16.exe
+
+The target computer does NOT need Python, pip, pyserial, scipy, PySide6 or bleak.
+Do not copy OmniBCI_V16.exe by itself: the adjacent _internal directory contains
+its Python runtime, Qt libraries and scientific packages.
+
+Recordings are intentionally written beside the executable:
+    OmniBCI_V16\recordings\
+
+This live-acquisition EXE intentionally excludes optional mne/pyedflib export
+packages. USB/BLE acquisition, realtime filtering, plotting and BIN recording
+remain available. Use the source/venv edition if BDF/FIF export is required.
+
+Build machine:
+    Windows 10/11 x64
+    Python 3.12 x64 recommended (3.11 also supported by build_exe.bat)
+
+Why ONEDIR instead of ONEFILE:
+    - faster launch
+    - less Windows Defender extraction overhead
+    - more reliable Qt/BLE DLL loading
+    - easier diagnosis on different PCs

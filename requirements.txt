@@ -1,8 +1,9 @@
+# Core dependencies required for live USB/BLE acquisition.
+# Export-only packages (mne/pyedflib) are intentionally optional so a computer
+# can run live EEG even when pyEDFlib has no prebuilt wheel for its Python.
 pyserial>=3.5
 numpy>=1.24
 scipy>=1.10
 pyqtgraph>=0.13
 PySide6>=6.5
-mne>=1.6
-pyedflib>=0.1.39
 bleak>=1.1,<4

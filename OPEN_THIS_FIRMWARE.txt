@@ -1,6 +1,10 @@
-No reflash is required for V15 when V13/V14 BLE firmware is already working.
+For the V16 cross-PC BLE adaptation, reflash the matching V16 firmware.
 
-Included reference firmware:
-SRB1: firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
-SRB2: firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
-USB-only: firmware/ESP32C3_ADS1299_SERIAL_STABLE/ESP32C3_ADS1299_SERIAL_STABLE.ino
+SRB1:
+firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
+
+SRB2:
+firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
+
+USB-only control/reference:
+firmware/ESP32C3_ADS1299_SERIAL_STABLE/ESP32C3_ADS1299_SERIAL_STABLE.ino
