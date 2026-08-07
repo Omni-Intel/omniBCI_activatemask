@@ -18,7 +18,7 @@ except Exception:
 
 a = Analysis(
     ['ads1299_eeg_gui_native.py'],
-    pathex=['.'],
+    pathex=['.', 'src'],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

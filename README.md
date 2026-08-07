@@ -34,7 +34,32 @@ install_and_run.bat
 run.bat
 ```
 
-主程序文件为 `ads1299_eeg_gui_native.py`。为保证环境可复现，不建议通过 Windows 文件关联直接双击 `.py` 文件。
+`ads1299_eeg_gui_native.py` 是兼容旧启动方式的轻量入口，实际程序位于
+`src/omnibci_app`。为保证环境可复现，不建议通过 Windows 文件关联直接双击 `.py` 文件。
+
+### 代码结构
+
+项目采用 Python 标准的 `src` 布局：
+
+```text
+src/omnibci_app/
+├── main.py                 # 应用入口与 QApplication 生命周期
+├── constants.py            # 协议、采样、时序和资源路径常量
+├── protocol.py             # ADS1299 帧解析、序号连续性与 BLE 载荷展开
+├── processing.py           # 环形缓冲区、PSD 与实时滤波工作线程
+├── recording.py            # 异步原始数据分段记录和元数据
+├── transports.py           # 串口与 BLE 传输工作线程
+└── ui/
+    ├── main_window.py       # 主窗口状态初始化与职责组合
+    ├── layout.py            # 界面构建和基础交互
+    ├── device_config.py     # 通道、参考、增益和 BIAS 配置
+    ├── transport_control.py # 连接管理和数据轮询
+    ├── acquisition.py       # 采集会话启停
+    ├── signal_processing.py # 实时/离线信号处理
+    ├── impedance.py         # 阻抗检测
+    ├── file_io.py           # 记录、导入和导出
+    └── visualization.py     # 波形、PSD、Alpha 与状态展示
+```
 
 ### 可选导出能力
 
