@@ -1,0 +1,104 @@
+OMNIBCI CONSOLIDATED VALIDATION REPORTS
+=======================================
+
+V14 low-latency validation
+--------------------------
+PASS  Python bytecode compilation.
+PASS  BLE scheduling constants: 4 ms receive poll, 25 ms max coalescing hold,
+      8-frame minimum coalescing and 50 ms paint interval.
+PASS  Display targets: 0.65 s normal, 0.55 s startup and 1.00 s cap.
+PASS  Display-only 1.75x catch-up and approximately 1.12 s hard resync.
+PASS  Raw BIN writer and live filter remain independent of Qt painting.
+PASS  Compact reliable BLE V2 stays compatible with V13.
+
+Deterministic 250-SPS simulation:
+- Normal 6-frame/24 ms delivery: 0.626-0.650 s steady display delay,
+  approximately 0.639 s mean and zero resyncs.
+- One 300 ms delivery gap: recovered without hard resync; final delay about
+  0.626 s.
+- One 1.2 s delivery gap: one display-only resync; final delay below 0.60 s;
+  raw BIN and reliable queues were unchanged.
+
+V15 saturation validation
+-------------------------
+PASS  Python bytecode compilation.
+PASS  Per-channel saturation uses active channel PGA/LSB.
+PASS  Raw timeline, BLE reconstruction and BIN writer remain unchanged.
+PASS  Historical V15 masking affected only the saturated channel's live-filter
+      and screen copies; other channels stayed finite and IIR recovered.
+PASS  V13/V14 reliable BLE protocol constants were unchanged.
+
+Note: V16 replaced V15's NaN/PSD-pause behavior with finite raw/filter/PSD
+samples and display-only clipping.
+
+V15 split-BIN validation
+------------------------
+PASS  Python AST parse and bytecode compile.
+PASS  Background rotation across two boundaries.
+PASS  Reconstructed bytes were byte-for-byte identical.
+PASS  Synthetic segment sizes were exactly 100, 100 and 50 bytes.
+PASS  Final manifest status, byte count and segment count.
+
+Production constants:
+  frame size:             48 bytes
+  sample rate:            250 SPS
+  segment duration:       60 s
+  complete segment size:  720,000 bytes
+  frames per segment:     15,000
+
+V16 continuity validation
+-------------------------
+PASS  Python source compilation.
+PASS  Saturation no longer pauses PSD or becomes NaN before live filtering.
+PASS  Screen rendering clips saturated values per channel Y range.
+PASS  BLE backlog no longer intentionally pauses waveform painting.
+PASS  Low-reserve playback no longer waits for a full jitter-buffer refill.
+PASS  Live PSD is fixed-cost and single-flight in a private one-thread pool.
+PASS  Synthetic six-second alternating full-scale PSD benchmark was below 2 ms
+      maximum in the Linux build container (not a Windows timing guarantee).
+
+V17 validation
+--------------
+PASS  Python syntax compilation.
+PASS  Exact AST-extracted decoder accepted three contiguous compact V2 blocks
+      and generated a cumulative ACK.
+PASS  With block 3 missing and block 4 pending, the extracted watchdog failed
+      open after the configured repair window, advanced to block 5, queued the
+      later six ADS frames and sent ACK without reconnecting.
+PASS  Both SRB1/SRB2 sources contain 384-block retention and low-priority STATUS
+      notification gating.
+
+V18 capture/TX isolation validation
+-----------------------------------
+PASS  Python GUI syntax compilation.
+PASS  serviceReliableBleTx() has one normal-operation owner: bleTxTask.
+PASS  transportTask drains frameQueue into retention without DATA notify.
+PASS  Reliable slot valid flag is published only after payload memcpy.
+PASS  Stream stop waits for bleTxTask and does not create a second sender.
+PASS  GUI logic uses full firmware queue_drop for large-gap attribution.
+
+V18 stale-NACK hotfix validation
+--------------------------------
+PASS  Python syntax compilation.
+PASS  CONTROL format remains 18 bytes, magic BA 43, version 1.
+PASS  STATUS remains 72 bytes, protocol V4.
+PASS  Both bundled firmwares contain the same stale-control hardening.
+PASS  Host revalidates NACK immediately before GATT write.
+PASS  Host drops resolved-hole NACKs and duplicate/older ACK writes.
+PASS  ACK/NACK use WRITE_NR; RESET still uses write-with-response.
+PASS  Firmware ignores prior-session and cumulative-ACK-covered controls without
+      creating false protocol errors.
+PASS  Cumulative ACK cancels or trims an already queued NACK range.
+PASS  unknownNack is reserved for an unacked, produced block absent from retention.
+PASS  GUI verdict uses recent overflow/unknown/protocol deltas.
+
+Remaining hardware validation
+-----------------------------
+The consolidated reports do not establish the following:
+- Arduino-ESP32 compilation, flashing, RAM or Flash use on a physical ESP32-C3.
+- Long-duration acquisition with a real ADS1299 board.
+- Windows Qt/PyQtGraph rendering performance under real load.
+- BLE soak behavior on target Windows adapters and in real RF conditions.
+- Physical ADS1299 rail saturation behavior.
+
+These items require validation on the target hardware and Windows environment.

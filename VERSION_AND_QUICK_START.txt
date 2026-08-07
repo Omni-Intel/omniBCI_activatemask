@@ -1,0 +1,33 @@
+OMNIBCI VERSION AND QUICK START
+===============================
+
+Current version
+---------------
+OmniBCI ADS1299 GUI V18 BLE CONTINUITY + STALE-NACK HARDENING.
+
+This is the Python-run version with V18 capture/TX isolation and ACK/NACK race
+suppression for long BLE recordings. Use the bundled V18 SRB1/SRB2 firmware for
+the complete fix.
+
+GUI
+---
+First run:  install_and_run.bat
+Later runs: run.bat
+Main file:  ads1299_eeg_gui_native.py
+
+V18 firmware
+-------------
+SRB1:
+  firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
+
+SRB2:
+  firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
+
+Dependencies
+------------
+Core live-acquisition packages are listed in requirements.txt.
+Optional BDF/MNE export packages are listed in requirements_optional_export.txt
+and can be installed with install_optional_exports.bat.
+
+The optional packages are not required for live USB/BLE acquisition. A missing
+pyEDFlib wheel must not block acquisition, filtering, plotting or BIN recording.

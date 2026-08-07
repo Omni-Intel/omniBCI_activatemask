@@ -1,3 +1,0 @@
-OmniBCI ADS1299 GUI V18 BLE CONTINUITY + STALE-NACK HARDENING
-Python run version; V18 capture/TX isolation plus ACK/NACK race suppression for long BLE recordings.
-Use the bundled V18 SRB1/SRB2 firmware for the full fix.

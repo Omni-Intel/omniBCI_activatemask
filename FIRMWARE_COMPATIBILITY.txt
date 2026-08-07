@@ -1,12 +1,30 @@
-V18 GUI uses the same compact reliable BLE DATA protocol V2 / STATUS V4 as V16/V17.
+OMNIBCI V18 FIRMWARE COMPATIBILITY
+==================================
 
-Older reliable firmware can still connect, but it does not contain the V18 capture/TX task isolation. For long sleep/EEG recordings, use the bundled V18 firmware:
+V18 uses the same compact reliable BLE DATA protocol V2 and STATUS V4 as the
+V16/V17 reliable firmware.
+
+Older reliable firmware can connect to the V18 GUI, but it lacks V18 capture/TX
+task isolation. For long sleep/EEG recordings, use the bundled V18 firmware:
 
 SRB1:
-firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
+  firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
 
 SRB2:
-firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
+  firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
 
-V18 hotfix note:
-The DATA/CONTROL wire format and 72-byte STATUS V4 layout are unchanged. The bundled V18 firmware additionally ignores obsolete ACK/NACK controls that were overtaken while queued in the Windows GATT path. Older reliable firmware may therefore show historical unknown-NACK counters that the patched GUI treats as historical unless they keep increasing.
+V18 separates capture/packing from BLE DATA notify. A Windows/BLE stack stall
+therefore fills the reliable retention ring instead of directly starving the
+ADS frameQueue.
+
+Stale-NACK hotfix
+-----------------
+The hotfix does not change the DATA/CONTROL wire format or the 72-byte STATUS V4
+layout. Bundled V18 firmware ignores obsolete ACK/NACK controls that were
+overtaken while queued in the Windows GATT path.
+
+Older firmware can report historical unknown-NACK counters. The patched V18 GUI
+treats these as historical unless they continue increasing.
+
+Firmware-local details are documented in the README file inside each firmware
+subdirectory.

@@ -69,9 +69,11 @@ if not exist "dist\OmniBCI_V16\OmniBCI_V16.exe" (
 
 mkdir "dist\OmniBCI_V16\recordings" >nul 2>&1
 if exist firmware xcopy /E /I /Y firmware "dist\OmniBCI_V16\firmware" >nul
-copy /Y VERSION.txt "dist\OmniBCI_V16\VERSION.txt" >nul
+copy /Y README.md "dist\OmniBCI_V16\README.md" >nul
+copy /Y VERSION_AND_QUICK_START.txt "dist\OmniBCI_V16\VERSION_AND_QUICK_START.txt" >nul
 copy /Y FIRMWARE_COMPATIBILITY.txt "dist\OmniBCI_V16\FIRMWARE_COMPATIBILITY.txt" >nul
 copy /Y EXE_BUILD_NOTES.txt "dist\OmniBCI_V16\EXE_BUILD_NOTES.txt" >nul
+copy /Y VALIDATION_REPORTS.txt "dist\OmniBCI_V16\VALIDATION_REPORTS.txt" >nul
 
 echo.
 echo ============================================================

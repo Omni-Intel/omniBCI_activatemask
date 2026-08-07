@@ -1,8 +1,0 @@
-V17 validation
-
-PASS: Python syntax compilation (py_compile).
-PASS: exact AST-extracted reliable decoder accepted 3 contiguous compact V2 blocks and generated cumulative ACK.
-PASS: exact AST-extracted watchdog test with block 3 missing and block 4 pending failed open after the configured repair window, advanced expected block to 5, queued the later six ADS frames, and sent ACK without reconnect.
-PASS: both SRB1/SRB2 firmware sources contain 384-block retention and low-priority STATUS notification gating.
-
-Runtime BLE hardware validation is still required on the target Windows PC/adapter because this environment has no BLE hardware.

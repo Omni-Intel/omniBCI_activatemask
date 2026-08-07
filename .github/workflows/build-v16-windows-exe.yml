@@ -38,9 +38,11 @@ jobs:
           python -m PyInstaller --noconfirm --clean OmniBCI_V16.spec
           New-Item -ItemType Directory -Force dist\OmniBCI_V16\recordings | Out-Null
           Copy-Item -Recurse -Force firmware dist\OmniBCI_V16\firmware
-          Copy-Item VERSION.txt dist\OmniBCI_V16\VERSION.txt
+          Copy-Item README.md dist\OmniBCI_V16\README.md
+          Copy-Item VERSION_AND_QUICK_START.txt dist\OmniBCI_V16\VERSION_AND_QUICK_START.txt
           Copy-Item FIRMWARE_COMPATIBILITY.txt dist\OmniBCI_V16\FIRMWARE_COMPATIBILITY.txt
           Copy-Item EXE_BUILD_NOTES.txt dist\OmniBCI_V16\EXE_BUILD_NOTES.txt
+          Copy-Item VALIDATION_REPORTS.txt dist\OmniBCI_V16\VALIDATION_REPORTS.txt
           Compress-Archive -Path dist\OmniBCI_V16 -DestinationPath OmniBCI_V16_Windows.zip -Force
 
       - name: Upload Windows build

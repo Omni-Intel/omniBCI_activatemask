@@ -1,3 +1,0 @@
-Run: run.bat
-Version: V18 BLE capture/TX isolation GUI
-Main file: ads1299_eeg_gui_native.py
