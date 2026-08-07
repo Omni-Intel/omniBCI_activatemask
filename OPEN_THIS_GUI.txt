@@ -1,5 +1,3 @@
-ads1299_eeg_gui_native.py
-Version: V16 cross-PC adaptive USB/BLE GUI
-
-On a new PC, run install_and_run.bat once. Then use run.bat.
-Do not install pyserial/scipy one-by-one into random Python installations.
+Run: run.bat
+Version: V18 BLE capture/TX isolation GUI
+Main file: ads1299_eeg_gui_native.py

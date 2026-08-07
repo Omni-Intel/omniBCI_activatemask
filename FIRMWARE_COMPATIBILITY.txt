@@ -1,10 +1,6 @@
-V16 GUI can still decode the compact reliable BLE V2 stream used by V13/V14.
+V18 GUI uses the same compact reliable BLE DATA protocol V2 / STATUS V4 as V16/V17.
 
-However, for another Windows PC (Huawei/Lenovo/etc.) use the V16 BLE firmware,
-because the important cross-PC fix is also on the ESP32-C3 side:
-- no fixed 180 ms blind retransmission;
-- ACK-driven adaptive retry timeout;
-- in-flight adaptive TX pacing.
+Older reliable firmware can still connect, but it does not contain the V18 capture/TX task isolation. For long sleep/EEG recordings, use the bundled V18 firmware:
 
 SRB1:
 firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
@@ -12,5 +8,5 @@ firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
 SRB2:
 firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
 
-USB-only reference:
-firmware/ESP32C3_ADS1299_SERIAL_STABLE/ESP32C3_ADS1299_SERIAL_STABLE.ino
+V18 hotfix note:
+The DATA/CONTROL wire format and 72-byte STATUS V4 layout are unchanged. The bundled V18 firmware additionally ignores obsolete ACK/NACK controls that were overtaken while queued in the Windows GATT path. Older reliable firmware may therefore show historical unknown-NACK counters that the patched GUI treats as historical unless they keep increasing.

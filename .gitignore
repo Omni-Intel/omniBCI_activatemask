@@ -1,7 +1,10 @@
-.buildvenv/
-/build/
-/dist/
+﻿*.exe
+*.bin
 __pycache__/
 *.pyc
 .venv/
 venv/
+.buildvenv/
+build/
+dist/
+*.spec

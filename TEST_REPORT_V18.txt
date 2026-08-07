@@ -1,0 +1,16 @@
+V18 static validation
+=====================
+
+1. Python GUI syntax: PASS (python -m py_compile ads1299_eeg_gui_native.py)
+2. DATA notify ownership: PASS
+   - serviceReliableBleTx() is invoked only from bleTxTask during normal operation.
+3. Capture/TX isolation: PASS by source inspection
+   - transportTask drains frameQueue into reliable retention and does not call DATA notify.
+4. Reliable block publication: PASS by source inspection
+   - slot.valid is set only after payload memcpy.
+5. Stream-stop dual sender: PASS
+   - stopStreamingGracefully waits for bleTxTask; it does not call serviceReliableBleTx directly.
+6. GUI gap attribution: PASS by logic inspection
+   - full firmware queue_drop can reclassify a large gap that overflowed the 8-bit per-frame hint.
+
+Hardware BLE soak test is still required on the target Windows adapter + ESP32-C3.

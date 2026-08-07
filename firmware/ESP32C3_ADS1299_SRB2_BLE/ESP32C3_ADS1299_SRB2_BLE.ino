@@ -180,7 +180,7 @@ constexpr size_t BLE_RELIABLE_HEADER_BYTES = 20;
 constexpr size_t BLE_RELIABLE_CRC_BYTES = 2;
 constexpr size_t BLE_RELIABLE_PACKET_MAX_BYTES = BLE_RELIABLE_HEADER_BYTES + BLE_RELIABLE_PAYLOAD_BYTES + BLE_RELIABLE_CRC_BYTES;
 static_assert(BLE_RELIABLE_PACKET_MAX_BYTES <= (BLE_REQUESTED_MTU - 3u), "compact BLE block must fit one MTU-247 notification");
-constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 320;       // about 7.68 s at 250 SPS
+constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 384;       // about 9.22 s at 250 SPS
 constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 16;      // about 0.38 s unacked in flight
 constexpr uint32_t BLE_RELIABLE_TX_PACE_FAST_MS = 9;     // fast adapter / low in-flight occupancy
 constexpr uint32_t BLE_RELIABLE_TX_PACE_NORMAL_MS = 14;  // moderate Windows batching
@@ -255,6 +255,7 @@ static QueueHandle_t frameQueue = nullptr;
 static QueueHandle_t bleCommandQueue = nullptr;
 static QueueHandle_t bleReliableCommandQueue = nullptr;
 static TaskHandle_t adsTaskHandle = nullptr;
+static TaskHandle_t bleTxTaskHandle = nullptr;
 static SemaphoreHandle_t adsBusMutex = nullptr;
 
 // ============================ State / diagnostics ============================
@@ -278,7 +279,7 @@ volatile uint32_t maxReadTimeUs = 0;
 volatile uint8_t discardFramesAfterReconfigure = 0;
 
 // BLE callbacks only update these small flags/counters or enqueue command bytes.
-// All ADS reconfiguration and all DATA notifications run in transportTask.
+// ADS reconfiguration + frameQueue draining run in transportTask; DATA notifications run in bleTxTask.
 static BLEServer *bleServer = nullptr;
 static BLECharacteristic *bleDataCharacteristic = nullptr;
 static BLECharacteristic *bleControlCharacteristic = nullptr;
@@ -295,6 +296,7 @@ volatile uint16_t bleConnectionId = 0xFFFF;
 volatile uint16_t blePeerMtu = 23;
 volatile uint32_t bleNotifySuccessCount = 0;
 volatile uint32_t bleNotifyErrorCount = 0;
+volatile bool bleStatusNotifyPending = false;
 volatile uint32_t bleCommandDropCount = 0;
 volatile uint32_t bleLastConfigAckMs = 0;
 static uint8_t bleLastConfigAck[12] = {0};
@@ -309,6 +311,10 @@ volatile uint32_t bleReliableRecoveredCount = 0;
 volatile uint32_t bleReliableOverflowBlocks = 0;
 volatile uint32_t bleReliableUnknownNacks = 0;
 volatile uint32_t bleReliableProtocolErrors = 0;
+// Benign control packets that became obsolete while queued in the Windows
+// GATT path (old session ACK/NACK, or a NACK for data already cumulatively ACKed).
+// These are deliberately NOT exposed as protocol errors.
+volatile uint32_t bleReliableStaleControlCount = 0;
 volatile uint32_t bleReliableSessionId = 0;
 volatile uint32_t bleReliableHighestAcked = 0xFFFFFFFFu;
 volatile uint32_t bleReliableNextBlockSequence = 0;
@@ -388,6 +394,7 @@ bool readAdsFrame(uint8_t *destination, bool &drdyWasLow);
 
 void adsAcquireTask(void *argument);
 void transportTask(void *argument);
+void bleTxTask(void *argument);
 void processSerialByte(char c);
 void flushNumericCommand();
 void handleCommand(char command);
@@ -446,6 +453,7 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
   void markConnected(BLEServer *server) {
     bleConnected = true;
     bleDataSubscribed = false;
+    bleStatusNotifyPending = false;
     bleRestartAdvertisingRequested = false;
     bleResetReliableRequested = true;
     bleConnectionId = server ? server->getConnId() : 0xFFFF;
@@ -457,6 +465,7 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
   void markDisconnected() {
     bleConnected = false;
     bleDataSubscribed = false;
+    bleStatusNotifyPending = false;
     bleConnectionId = 0xFFFF;
     blePeerMtu = 23;
     bleResetReliableRequested = true;
@@ -650,14 +659,27 @@ void setup() {
 
   const BaseType_t transportTaskResult = xTaskCreate(
     transportTask,
-    "usb_ble_transport",
+    "usb_ble_pack",
     6144,
     nullptr,
-    2,
+    3,
     nullptr
   );
 
-  if (adsTaskResult != pdPASS || transportTaskResult != pdPASS) {
+  // V18: DATA notify gets its own low-priority task.  A Windows/BLE stack
+  // stall must never stop frameQueue -> reliable retention draining.
+  const BaseType_t bleTxTaskResult = xTaskCreate(
+    bleTxTask,
+    "ble_tx",
+    4096,
+    nullptr,
+    1,
+    &bleTxTaskHandle
+  );
+
+  if (adsTaskResult != pdPASS ||
+      transportTaskResult != pdPASS ||
+      bleTxTaskResult != pdPASS) {
     while (true) delay(1000);
   }
 
@@ -669,7 +691,7 @@ void setup() {
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
-  Serial.println("ESP32C3 ADS1299 SRB2 + RELIABLE BLE V16 ADAPTIVE READY");
+  Serial.println("ESP32C3 ADS1299 SRB2 + RELIABLE BLE V18 SPLIT-TX READY");
   Serial.printf("BLE=%s name=%s requestedMTU=%u minStreamMTU=%u\n",
                 bleInitialized ? "READY" : "FAILED",
                 BLE_DEVICE_NAME,
@@ -814,11 +836,20 @@ void transportTask(void *argument) {
       disconnectSeenAtMs = 0;
     }
 
-    const uint32_t statusRefreshIntervalMs = streamingEnabled ? 10000u : 2000u;
+    const uint32_t statusRefreshIntervalMs = streamingEnabled ? 30000u : 2000u;
     if (bleInitialized &&
         (millis() - lastStatusRefreshMs) >= statusRefreshIntervalMs &&
         (millis() - bleLastConfigAckMs) >= 1000u) {
-      publishBleStatus(bleConnected);
+      // STATUS notify is lower priority than EEG DATA/ACK. During a long
+      // recording only notify when the reliable in-flight window is quiet;
+      // otherwise update the characteristic value without adding radio work.
+      const bool statusNotifySafe = !streamingEnabled || reliableInFlightBlocks() <= 4u;
+      // Build/update STATUS here, but let the low-priority BLE TX task perform
+      // the actual notify so STATUS can never stall frameQueue draining.
+      publishBleStatus(false);
+      if (bleConnected && statusNotifySafe) {
+        bleStatusNotifyPending = true;
+      }
       lastStatusRefreshMs = millis();
     }
 
@@ -852,10 +883,30 @@ void transportTask(void *argument) {
       vTaskDelay(1);
     }
 
-    // At most one reliable block is submitted per paced service call. This
-    // keeps the BLE host queue bounded while still allowing backlog catch-up.
-    serviceReliableBleTx();
+    // V18: do not call BLE notify from this task.  Its only job during BLE
+    // streaming is to keep draining frameQueue into the 9.2 s reliable ring.
+    // bleTxTask owns DATA notifications and may stall without starving capture.
     taskYIELD();
+  }
+}
+
+// ============================ Dedicated BLE TX task ============================
+void bleTxTask(void *argument) {
+  (void)argument;
+  for (;;) {
+    if (bleStatusNotifyPending && bleConnected && bleStatusCharacteristic) {
+      bleStatusNotifyPending = false;
+      bleStatusCharacteristic->notify();
+    }
+
+    if (bleReliableSessionActive && bleDataNotificationsEnabled()) {
+      serviceReliableBleTx();
+      // 1 ms service cadence; serviceReliableBleTx applies its own 9/14/20 ms
+      // pacing and reliable-window limits.
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
   }
 }
 
@@ -1399,19 +1450,19 @@ void stopStreamingGracefully() {
   stopAdsConversionsLocked();
   xSemaphoreGive(adsBusMutex);
 
-  // transportTask remains the sole DATA TX owner and drains every complete frame
+  // transportTask remains the sole frameQueue -> reliable-ring pack owner and drains every complete frame
   // accepted before the converter stopped, then seals a partial reliable block.
   StreamFrame tail = {};
   while (frameQueue && xQueueReceive(frameQueue, &tail, 0) == pdTRUE) {
     transportFrame(tail);
   }
   flushReliableBuildBlock();
-  // Give already-retained blocks a short chance to leave. ACKed blocks are
-  // released by the normal control path; no EEG value is fabricated here.
+  // Give already-retained blocks a short chance to leave.  bleTxTask is the
+  // sole DATA-notify owner, so stopping/reconfiguring can never create a second
+  // concurrent sender.
   const uint32_t drainStart = millis();
   while (bleDataNotificationsEnabled() && reliableOutstandingBlocks() > 0 &&
          (millis() - drainStart) < 300) {
-    serviceReliableBleTx();
     vTaskDelay(1);
   }
   if (Serial) Serial.flush();
@@ -1567,6 +1618,14 @@ void updateReliableAckTiming() {
 }
 
 void resetReliableTransport(bool resetSequence) {
+  // V18: avoid resetting the retention ring while the dedicated TX task is
+  // copying a block.  This runs only on connect/start/reset paths, never per
+  // sample, so the brief suspend does not affect acquisition.
+  const bool suspendTx =
+    bleTxTaskHandle != nullptr &&
+    xTaskGetCurrentTaskHandle() != bleTxTaskHandle;
+  if (suspendTx) vTaskSuspend(bleTxTaskHandle);
+
   memset(bleReliableRing, 0, sizeof(bleReliableRing));
   memset(bleReliableBuildPayload, 0, sizeof(bleReliableBuildPayload));
   bleReliableStoredBlocks = 0;
@@ -1588,6 +1647,8 @@ void resetReliableTransport(bool resetSequence) {
   bleReliableNackLast = 0;
   bleReliableNackPending = false;
   bleReliableSessionActive = bleDataNotificationsEnabled();
+
+  if (suspendTx) vTaskResume(bleTxTaskHandle);
 }
 
 ReliableBleBlock *findReliableBlock(uint32_t blockSequence) {
@@ -1619,14 +1680,16 @@ bool storeReliableBlock(
   }
   bleReliableNextBlockSequence++;
 
+  // V18: bleTxTask runs concurrently with the pack task. Publish `valid`
+  // last so the TX task can never observe a half-copied payload.
   memset(&slot, 0, sizeof(slot));
-  slot.valid = true;
   slot.sent = false;
   slot.frameCount = frameCount;
   slot.payloadLength = payloadLength;
   slot.blockSequence = blockSequence;
   slot.firstSampleSequence = firstSampleSequence;
   memcpy(slot.payload, payload, payloadLength);
+  slot.valid = true;
   bleReliableStoredBlocks++;
   return true;
 }
@@ -1717,13 +1780,28 @@ void releaseAckedBlocks(uint32_t highestContiguousBlock) {
   if (reliableSeqLessOrEqual(bleReliableNextNewTxSequence, highestContiguousBlock)) {
     bleReliableNextNewTxSequence = next;
   }
+
+  // If a cumulative ACK overtakes a queued NACK, retire the obsolete repair
+  // immediately instead of spending later BLE TX slots walking an already
+  // released range one block at a time.
+  if (bleReliableNackPending) {
+    if (reliableSeqLessOrEqual(bleReliableNackLast, highestContiguousBlock)) {
+      bleReliableNackPending = false;
+      bleReliableStaleControlCount++;
+    } else if (reliableSeqLessOrEqual(bleReliableNackFirst, highestContiguousBlock)) {
+      bleReliableNackFirst = highestContiguousBlock + 1u;
+      bleReliableStaleControlCount++;
+    }
+  }
   bleReliableAckCount++;
 }
 
 void handleReliableControl(const ReliableControlCommand &command) {
   if (command.type != BLE_CTRL_RESET && command.sessionId != bleReliableSessionId) {
-    // Stale ACKs from a previous recording must never release current blocks.
-    bleReliableProtocolErrors++;
+    // A control write from the previous BLE session may arrive after reconnect.
+    // It is stale, not malformed; ignore it without poisoning the long-run
+    // protocol-error counter.
+    bleReliableStaleControlCount++;
     return;
   }
   switch (command.type) {
@@ -1738,7 +1816,35 @@ void handleReliableControl(const ReliableControlCommand &command) {
         bleReliableProtocolErrors++;
         return;
       }
-      // Bound a malformed request to one retained-ring span.
+
+      // V18 hotfix: ACK and NACK travel through independent host scheduling.
+      // A NACK generated slightly earlier can reach the C3 after a cumulative
+      // ACK has already released that block. Treat such a request as stale,
+      // not as an unknown/malformed retransmission.
+      if (bleReliableHighestAcked != 0xFFFFFFFFu) {
+        if (reliableSeqLessOrEqual(last, bleReliableHighestAcked)) {
+          bleReliableStaleControlCount++;
+          return;
+        }
+        if (reliableSeqLessOrEqual(first, bleReliableHighestAcked)) {
+          first = bleReliableHighestAcked + 1u;
+        }
+      }
+
+      // Requests beyond the newest produced block are also obsolete/premature
+      // host controls. They cannot identify a retained-data failure.
+      if (bleReliableNextBlockSequence == 0u) {
+        bleReliableStaleControlCount++;
+        return;
+      }
+      const uint32_t newestProduced = bleReliableNextBlockSequence - 1u;
+      if (!reliableSeqLessOrEqual(first, newestProduced)) {
+        bleReliableStaleControlCount++;
+        return;
+      }
+      if (!reliableSeqLessOrEqual(last, newestProduced)) last = newestProduced;
+
+      // Bound a malformed/over-wide request to one retained-ring span.
       if ((last - first) >= BLE_RELIABLE_RING_BLOCKS) {
         last = first + BLE_RELIABLE_RING_BLOCKS - 1u;
       }
@@ -1778,8 +1884,21 @@ void serviceReliableBleTx() {
     if (block) {
       sendReliableBlock(*block, true);
     } else {
-      bleReliableUnknownNacks++;
-      if (sendReliableGapMarker(requested)) bleReliableLastTxMs = millis();
+      // Re-check at transmit time because an ACK may have released the block
+      // after the NACK was queued. Only an unacked, already-produced block that
+      // is genuinely absent from retention is an "unknown NACK".
+      const bool alreadyAcked =
+        bleReliableHighestAcked != 0xFFFFFFFFu &&
+        reliableSeqLessOrEqual(requested, bleReliableHighestAcked);
+      const bool notProducedYet =
+        bleReliableNextBlockSequence == 0u ||
+        !reliableSeqLessOrEqual(requested, bleReliableNextBlockSequence - 1u);
+      if (alreadyAcked || notProducedYet) {
+        bleReliableStaleControlCount++;
+      } else {
+        bleReliableUnknownNacks++;
+        if (sendReliableGapMarker(requested)) bleReliableLastTxMs = millis();
+      }
     }
     if (requested == bleReliableNackLast) {
       bleReliableNackPending = false;
@@ -2258,6 +2377,7 @@ void clearDiagnostics() {
   bleReliableOverflowBlocks = 0;
   bleReliableUnknownNacks = 0;
   bleReliableProtocolErrors = 0;
+  bleReliableStaleControlCount = 0;
 }
 
 void printHelpAndDiagnostics() {
@@ -2293,6 +2413,10 @@ void printHelpAndDiagnostics() {
                 (unsigned long)bleNotifyErrorCount,
                 (unsigned long)bleCommandDropCount,
                 (unsigned long)bleMtuBlockedFrameCount);
+  Serial.printf("BLE reliable unknownNack=%lu protocolErr=%lu staleCtrlIgnored=%lu\n",
+                (unsigned long)bleReliableUnknownNacks,
+                (unsigned long)bleReliableProtocolErrors,
+                (unsigned long)bleReliableStaleControlCount);
   Serial.printf("reference=%s enabledMask=0x%02X biasMask=0x%02X srb2Mask=0x%02X\n",
                 currentReferenceMode == REFERENCE_SRB2 ? "SRB2" : "SRB1",
                 currentEnabledMask, currentBiasSensPMask, currentSrb2Mask);

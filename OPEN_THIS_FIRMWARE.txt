@@ -1,4 +1,4 @@
-For the V16 cross-PC BLE adaptation, reflash the matching V16 firmware.
+For V18 long-run BLE continuity, flash the matching firmware:
 
 SRB1:
 firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
@@ -6,5 +6,4 @@ firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
 SRB2:
 firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
 
-USB-only control/reference:
-firmware/ESP32C3_ADS1299_SERIAL_STABLE/ESP32C3_ADS1299_SERIAL_STABLE.ino
+The wire protocol is unchanged, but V18 separates capture/packing from BLE DATA notify so a BLE-stack stall cannot directly starve frameQueue.
