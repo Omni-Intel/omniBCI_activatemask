@@ -1,10 +1,11 @@
 from contextlib import ExitStack
 import json
+import threading
 import unittest
 
 import numpy as np
 from websockets.sync.client import connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from onmibci_stream import LocalStreamServer, StreamBatch, _Subscriber, _WirePacket
 
@@ -83,7 +84,17 @@ class LocalStreamServerTests(unittest.TestCase):
                 ws.send("[]")
                 with self.assertRaises(ConnectionClosed) as raised:
                     ws.recv()
-                self.assertEqual(raised.exception.rcvd.code, 1008)
+            self.assertEqual(raised.exception.rcvd.code, 1008)
+        finally:
+            server.stop()
+
+    def test_wrong_path_is_rejected(self):
+        server = LocalStreamServer(port=0, session_id="s1")
+        server.start()
+        try:
+            with self.assertRaises(InvalidStatus):
+                with connect(f"ws://127.0.0.1:{server.port}/wrong-path"):
+                    pass
         finally:
             server.stop()
 
@@ -95,8 +106,12 @@ class LocalStreamServerTests(unittest.TestCase):
 
     def test_bounded_subscriber_queue_reports_dropped_batches(self):
         subscriber = _Subscriber("raw", queue_size=1)
-        subscriber.enqueue(_WirePacket("first", b"", samples=2))
-        subscriber.enqueue(_WirePacket("second", b"", samples=3))
+        self.assertTrue(
+            subscriber.enqueue(_WirePacket("first", b"", samples=2))
+        )
+        self.assertFalse(
+            subscriber.enqueue(_WirePacket("second", b"", samples=3))
+        )
 
         gap = subscriber.take_gap()
 
@@ -105,6 +120,34 @@ class LocalStreamServerTests(unittest.TestCase):
         self.assertEqual(gap.dropped_samples, 2)
         self.assertEqual(subscriber.queue.get_nowait().header, "second")
         self.assertIsNone(subscriber.take_gap())
+
+    def test_stalled_websocket_sender_receives_an_explicit_gap(self):
+        server = LocalStreamServer(port=0, queue_size=1, session_id="s1")
+        server.start()
+        release = threading.Event()
+        entered = threading.Event()
+        try:
+            with connect(f"ws://127.0.0.1:{server.port}/v1/stream") as ws:
+                self.subscribe(ws, "raw")
+
+                def stall_loop():
+                    entered.set()
+                    release.wait(timeout=2.0)
+
+                server._loop.call_soon_threadsafe(stall_loop)
+                self.assertTrue(entered.wait(timeout=2.0))
+                server.publish(self.make_batch("raw", session_id="s1"))
+                server.publish(self.make_batch("raw", session_id="s1"))
+                release.set()
+
+                gap = json.loads(ws.recv())
+                self.assertEqual(gap["type"], "gap")
+                self.assertEqual(gap["dropped_batches"], 1)
+                decoded = StreamBatch.from_messages(ws.recv(), ws.recv())
+                self.assertEqual(decoded.stream, "raw")
+        finally:
+            release.set()
+            server.stop()
 
 
 if __name__ == "__main__":

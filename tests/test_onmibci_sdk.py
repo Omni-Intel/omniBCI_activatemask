@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from onmibci_sdk import ProtocolError, _StreamIterator, connect_local
+from onmibci_sdk import LocalClient, ProtocolError, _StreamIterator, connect_local
 from onmibci_stream import LocalStreamServer, StreamBatch
 
 
@@ -89,6 +89,17 @@ class LocalClientTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             next(iterator)
         self.assertTrue(connection.closed)
+
+    def test_validate_hello_requires_stream_metadata(self):
+        minimal_hello = {
+            "type": "hello",
+            "schema_version": 1,
+            "stream": "raw",
+            "session_id": "s1",
+        }
+
+        with self.assertRaises(ProtocolError):
+            LocalClient._validate_hello(json.dumps(minimal_hello), "raw")
 
 
 if __name__ == "__main__":

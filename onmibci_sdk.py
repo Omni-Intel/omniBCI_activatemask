@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import json
 from typing import Any, Iterator
 
 from websockets.exceptions import ConnectionClosedOK
 
 from onmibci_stream import (
+    DEFAULT_CHANNELS,
     GapEvent,
+    SAMPLE_RATE,
     SCHEMA_VERSION,
     STREAM_FILTERED,
     STREAM_RAW,
     StreamBatch,
+    UNIT_UV,
 )
 
 
@@ -56,8 +60,8 @@ class _StreamIterator:
             try:
                 return GapEvent(
                     stream=event["stream"],
-                    dropped_batches=int(event["dropped_batches"]),
-                    dropped_samples=int(event["dropped_samples"]),
+                    dropped_batches=event["dropped_batches"],
+                    dropped_samples=event["dropped_samples"],
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 self.close()
@@ -111,13 +115,14 @@ class LocalClient:
     def _open_stream(self, stream: str) -> _StreamIterator:
         from websockets.sync.client import connect
 
-        connection = connect(
-            self.url,
-            open_timeout=self.timeout,
-            close_timeout=self.timeout,
-            max_size=None,
-            proxy=None,
-        )
+        connect_options = {
+            "open_timeout": self.timeout,
+            "close_timeout": self.timeout,
+            "max_size": None,
+        }
+        if "proxy" in inspect.signature(connect).parameters:
+            connect_options["proxy"] = None
+        connection = connect(self.url, **connect_options)
         try:
             connection.send(
                 json.dumps(
@@ -144,12 +149,24 @@ class LocalClient:
             raise ProtocolError("API hello must be a JSON object")
         if hello.get("type") != "hello":
             raise ProtocolError("API did not send hello")
-        if hello.get("schema_version") != SCHEMA_VERSION:
+        if hello.get("schema_version") != SCHEMA_VERSION or not isinstance(
+            hello.get("schema_version"), int
+        ) or isinstance(hello.get("schema_version"), bool):
             raise ProtocolError("API hello has an unsupported schema version")
         if hello.get("stream") != stream:
             raise ProtocolError("API hello stream does not match subscription")
-        if not hello.get("session_id"):
+        if not isinstance(hello.get("session_id"), str) or not hello.get(
+            "session_id"
+        ):
             raise ProtocolError("API hello has no session_id")
+        if hello.get("sample_rate") != SAMPLE_RATE or not isinstance(
+            hello.get("sample_rate"), int
+        ) or isinstance(hello.get("sample_rate"), bool):
+            raise ProtocolError("API hello has an unsupported sample rate")
+        if hello.get("channels") != list(DEFAULT_CHANNELS):
+            raise ProtocolError("API hello has unsupported channels")
+        if hello.get("unit") != UNIT_UV:
+            raise ProtocolError("API hello has an unsupported unit")
         return hello
 
 

@@ -36,6 +36,19 @@ run.bat
 
 主程序文件为 `ads1299_eeg_gui_native.py`。为保证环境可复现，不建议通过 Windows 文件关联直接双击 `.py` 文件。
 
+如果直接使用 uv，项目已经提交了 `uv.lock`，可在项目根目录执行：
+
+```powershell
+uv sync
+uv run python ads1299_eeg_gui_native.py
+```
+
+同事的本地脚本也可以用同一个 uv 环境运行：
+
+```powershell
+uv run python your_model_script.py
+```
+
 ### 可选导出能力
 
 实时 USB/BLE 采集不依赖 `mne` 或 `pyedflib`。如需 BDF/FIF/MNE 导出，再运行：

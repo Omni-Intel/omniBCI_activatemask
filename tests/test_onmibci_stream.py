@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import numpy as np
@@ -82,6 +83,35 @@ class StreamBatchTests(unittest.TestCase):
                 generation=None,
                 session_id="s1",
             )
+
+    def test_wire_metadata_rejects_type_coercion(self):
+        batch = StreamBatch.from_gui_matrix(
+            stream="raw",
+            values=np.zeros((8, 1), dtype=np.float32),
+            sequence=np.array([1], dtype=np.uint32),
+            valid=np.array([True]),
+            modes=np.array([0], dtype=np.uint8),
+            generation=None,
+            session_id="s1",
+        )
+        header, payload = batch.to_messages()
+        metadata = json.loads(header)
+
+        invalid_fields = {
+            "valid-string": {"valid": ["false"]},
+            "shape-bool": {"shape": [True, 8]},
+            "sequence-negative": {"sequence": [-1]},
+            "modes-fraction": {"modes": [1.5]},
+            "session-number": {"session_id": 123},
+            "channels-string": {"channels": "ABCDEFGH"},
+            "sample-rate-string": {"sample_rate": "250"},
+        }
+        for label, update in invalid_fields.items():
+            with self.subTest(label):
+                invalid = dict(metadata)
+                invalid.update(update)
+                with self.assertRaises((TypeError, ValueError)):
+                    StreamBatch.from_messages(json.dumps(invalid), payload)
 
 
 if __name__ == "__main__":

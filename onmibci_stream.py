@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from http import HTTPStatus
 import json
+import queue
 import threading
 from typing import Any
 import uuid
@@ -19,16 +21,43 @@ DEFAULT_CHANNELS = tuple(f"CH{i}" for i in range(1, CHANNELS + 1))
 STREAM_RAW = "raw"
 STREAM_FILTERED = "filtered"
 STREAMS = frozenset((STREAM_RAW, STREAM_FILTERED))
+STREAM_PATH = "/v1/stream"
 UNIT_UV = "uV"
 WIRE_DTYPE = "float32"
 _WIRE_FLOAT_DTYPE = np.dtype("<f4")
 
 
-def _one_dimensional_array(value: Any, dtype: np.dtype, name: str) -> np.ndarray:
+def _is_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _integer_array(
+    value: Any,
+    dtype: np.dtype,
+    name: str,
+    *,
+    maximum: int,
+) -> np.ndarray:
     array = np.asarray(value)
     if array.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional")
+    if array.size:
+        if not np.issubdtype(array.dtype, np.integer) or np.issubdtype(
+            array.dtype, np.bool_
+        ):
+            raise ValueError(f"{name} must contain integers")
+        if np.any(array < 0) or np.any(array > maximum):
+            raise ValueError(f"{name} contains an out-of-range value")
     return np.asarray(array, dtype=dtype).copy()
+
+
+def _boolean_array(value: Any, name: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if array.size and array.dtype != np.dtype(bool):
+        raise ValueError(f"{name} must contain booleans")
+    return array.astype(bool, copy=True)
 
 
 @dataclass(frozen=True)
@@ -38,9 +67,14 @@ class GapEvent:
     dropped_samples: int
 
     def __post_init__(self) -> None:
-        if self.stream not in STREAMS:
+        if not isinstance(self.stream, str) or self.stream not in STREAMS:
             raise ValueError(f"unsupported stream: {self.stream!r}")
-        if self.dropped_batches < 0 or self.dropped_samples < 0:
+        if (
+            not _is_integer(self.dropped_batches)
+            or not _is_integer(self.dropped_samples)
+            or self.dropped_batches < 0
+            or self.dropped_samples < 0
+        ):
             raise ValueError("gap counts must be non-negative")
 
 
@@ -58,15 +92,22 @@ class StreamBatch:
     unit: str = UNIT_UV
 
     def __post_init__(self) -> None:
-        if self.stream not in STREAMS:
+        if not isinstance(self.stream, str) or self.stream not in STREAMS:
             raise ValueError(f"unsupported stream: {self.stream!r}")
-        if not self.session_id:
+        if not isinstance(self.session_id, str) or not self.session_id:
             raise ValueError("session_id must not be empty")
-        if self.sample_rate <= 0:
+        if not _is_integer(self.sample_rate) or self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
 
-        channels = tuple(str(channel) for channel in self.channels)
-        if not channels:
+        if isinstance(self.channels, (str, bytes)):
+            raise ValueError("channels must be a sequence of strings")
+        try:
+            channels = tuple(self.channels)
+        except TypeError as exc:
+            raise ValueError("channels must be a sequence of strings") from exc
+        if not channels or any(
+            not isinstance(channel, str) or not channel for channel in channels
+        ):
             raise ValueError("channels must not be empty")
 
         values = np.asarray(self.values)
@@ -74,16 +115,28 @@ class StreamBatch:
             raise ValueError("values must have shape (samples, channels)")
         values = np.ascontiguousarray(values, dtype=_WIRE_FLOAT_DTYPE).copy()
 
-        sequence = _one_dimensional_array(self.sequence, np.dtype("<u4"), "sequence")
-        valid = _one_dimensional_array(self.valid, np.dtype(bool), "valid")
-        modes = _one_dimensional_array(self.modes, np.dtype("u1"), "modes")
+        sequence = _integer_array(
+            self.sequence,
+            np.dtype("<u4"),
+            "sequence",
+            maximum=0xFFFFFFFF,
+        )
+        valid = _boolean_array(self.valid, "valid")
+        modes = _integer_array(
+            self.modes,
+            np.dtype("u1"),
+            "modes",
+            maximum=0xFF,
+        )
         samples = values.shape[0]
         if any(array.size != samples for array in (sequence, valid, modes)):
             raise ValueError("sequence, valid, and modes must match values length")
 
-        if self.generation is not None and self.generation < 0:
+        if self.generation is not None and (
+            not _is_integer(self.generation) or self.generation < 0
+        ):
             raise ValueError("generation must be non-negative or None")
-        if not self.unit:
+        if not isinstance(self.unit, str) or not self.unit:
             raise ValueError("unit must not be empty")
 
         object.__setattr__(self, "values", values)
@@ -153,7 +206,9 @@ class StreamBatch:
             raise ValueError("invalid data header JSON") from exc
         if not isinstance(metadata, dict) or metadata.get("type") != "data":
             raise ValueError("data header must have type=data")
-        if metadata.get("schema_version") != SCHEMA_VERSION:
+        if metadata.get("schema_version") != SCHEMA_VERSION or not _is_integer(
+            metadata.get("schema_version")
+        ):
             raise ValueError("unsupported stream schema version")
         if metadata.get("dtype") != WIRE_DTYPE:
             raise ValueError("unsupported stream data type")
@@ -162,9 +217,12 @@ class StreamBatch:
         if (
             not isinstance(shape, list)
             or len(shape) != 2
-            or not all(isinstance(value, int) and value >= 0 for value in shape)
+            or not all(_is_integer(value) and value >= 0 for value in shape)
         ):
             raise ValueError("invalid data shape")
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError("binary payload must be bytes-like")
+        payload = bytes(payload)
         expected_bytes = shape[0] * shape[1] * _WIRE_FLOAT_DTYPE.itemsize
         if len(payload) != expected_bytes:
             raise ValueError("binary payload length does not match data shape")
@@ -179,7 +237,7 @@ class StreamBatch:
             generation=metadata.get("generation"),
             session_id=metadata.get("session_id"),
             sample_rate=metadata.get("sample_rate", SAMPLE_RATE),
-            channels=tuple(metadata.get("channels", DEFAULT_CHANNELS)),
+            channels=metadata.get("channels", DEFAULT_CHANNELS),
             unit=metadata.get("unit", UNIT_UV),
         )
 
@@ -220,32 +278,59 @@ class _WirePacket:
 class _Subscriber:
     def __init__(self, stream: str, queue_size: int):
         self.stream = stream
-        self.queue: asyncio.Queue[_WirePacket] = asyncio.Queue(maxsize=queue_size)
+        self.queue: queue.Queue[_WirePacket] = queue.Queue(maxsize=queue_size)
+        self.wakeup: asyncio.Event | None = None
+        self._lock = threading.Lock()
+        self._wake_pending = False
         self.dropped_batches = 0
         self.dropped_samples = 0
 
-    def enqueue(self, packet: _WirePacket) -> None:
-        if self.queue.full():
-            try:
-                dropped = self.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                dropped = None
-            if dropped is not None:
-                self.dropped_batches += 1
-                self.dropped_samples += dropped.samples
-        try:
-            self.queue.put_nowait(packet)
-        except asyncio.QueueFull:
-            self.dropped_batches += 1
-            self.dropped_samples += packet.samples
+    def enqueue(self, packet: _WirePacket) -> bool:
+        """Queue a packet and return whether the sender needs a wakeup."""
 
-    def take_gap(self) -> GapEvent | None:
+        with self._lock:
+            try:
+                self.queue.put_nowait(packet)
+            except queue.Full:
+                try:
+                    dropped = self.queue.get_nowait()
+                except queue.Empty:
+                    dropped = None
+                if dropped is not None:
+                    self.dropped_batches += 1
+                    self.dropped_samples += dropped.samples
+                try:
+                    self.queue.put_nowait(packet)
+                except queue.Full:
+                    self.dropped_batches += 1
+                    self.dropped_samples += packet.samples
+
+            if self._wake_pending:
+                return False
+            self._wake_pending = True
+            return True
+
+    def next_packet(self) -> tuple[_WirePacket, GapEvent | None] | None:
+        with self._lock:
+            try:
+                packet = self.queue.get_nowait()
+            except queue.Empty:
+                self._wake_pending = False
+                return None
+            gap = self._take_gap_locked()
+            return packet, gap
+
+    def _take_gap_locked(self) -> GapEvent | None:
         if not self.dropped_batches:
             return None
         gap = GapEvent(self.stream, self.dropped_batches, self.dropped_samples)
         self.dropped_batches = 0
         self.dropped_samples = 0
         return gap
+
+    def take_gap(self) -> GapEvent | None:
+        with self._lock:
+            return self._take_gap_locked()
 
 
 class LocalStreamServer:
@@ -274,6 +359,7 @@ class LocalStreamServer:
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
         self._subscribers: set[_Subscriber] = set()
+        self._subscribers_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -312,15 +398,25 @@ class LocalStreamServer:
         loop = self._loop
         if loop is None or not loop.is_running():
             return
-        future = asyncio.run_coroutine_threadsafe(self._publish(batch), loop)
-        future.add_done_callback(self._consume_publish_result)
-
-    @staticmethod
-    def _consume_publish_result(future: "asyncio.Future[Any]") -> None:
-        try:
-            future.result()
-        except (asyncio.CancelledError, RuntimeError):
-            pass
+        with self._subscribers_lock:
+            subscribers = tuple(
+                subscriber
+                for subscriber in self._subscribers
+                if subscriber.stream == batch.stream
+            )
+        if not subscribers:
+            return
+        header, payload = batch.to_messages()
+        packet = _WirePacket(header, payload, batch.values.shape[0])
+        for subscriber in subscribers:
+            if not subscriber.enqueue(packet):
+                continue
+            if subscriber.wakeup is None:
+                continue
+            try:
+                loop.call_soon_threadsafe(subscriber.wakeup.set)
+            except RuntimeError:
+                return
 
     def _run(self) -> None:
         try:
@@ -339,13 +435,21 @@ class LocalStreamServer:
                 self._handle_client,
                 self.host,
                 self.port,
-                max_size=None,
+                process_request=self._process_request,
+                max_size=64 * 1024,
             ) as server:
                 self.port = int(server.sockets[0].getsockname()[1])
                 self._ready.set()
                 await self._stop_event.wait()
         finally:
-            self._subscribers.clear()
+            with self._subscribers_lock:
+                self._subscribers.clear()
+
+    @staticmethod
+    async def _process_request(connection: Any, request: Any) -> Any:
+        if request.path != STREAM_PATH:
+            return connection.respond(HTTPStatus.NOT_FOUND, "invalid stream path\n")
+        return None
 
     async def _handle_client(self, websocket: Any) -> None:
         subscriber: _Subscriber | None = None
@@ -369,13 +473,16 @@ class LocalStreamServer:
                 return
 
             subscriber = _Subscriber(stream, self.queue_size)
-            self._subscribers.add(subscriber)
+            subscriber.wakeup = asyncio.Event()
+            with self._subscribers_lock:
+                self._subscribers.add(subscriber)
             await websocket.send(json.dumps(self._hello(stream), separators=(",", ":")))
             sender = asyncio.create_task(self._send_packets(websocket, subscriber))
             await websocket.wait_closed()
         finally:
             if subscriber is not None:
-                self._subscribers.discard(subscriber)
+                with self._subscribers_lock:
+                    self._subscribers.discard(subscriber)
             if sender is not None:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
@@ -393,26 +500,25 @@ class LocalStreamServer:
 
     async def _send_packets(self, websocket: Any, subscriber: _Subscriber) -> None:
         while True:
-            packet = await subscriber.queue.get()
-            gap = subscriber.take_gap()
-            if gap is not None:
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "gap",
-                            "stream": gap.stream,
-                            "dropped_batches": gap.dropped_batches,
-                            "dropped_samples": gap.dropped_samples,
-                        },
-                        separators=(",", ":"),
+            assert subscriber.wakeup is not None
+            await subscriber.wakeup.wait()
+            subscriber.wakeup.clear()
+            while True:
+                item = subscriber.next_packet()
+                if item is None:
+                    break
+                packet, gap = item
+                if gap is not None:
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "gap",
+                                "stream": gap.stream,
+                                "dropped_batches": gap.dropped_batches,
+                                "dropped_samples": gap.dropped_samples,
+                            },
+                            separators=(",", ":"),
+                        )
                     )
-                )
-            await websocket.send(packet.header)
-            await websocket.send(packet.payload)
-
-    async def _publish(self, batch: StreamBatch) -> None:
-        header, payload = batch.to_messages()
-        packet = _WirePacket(header, payload, batch.values.shape[0])
-        for subscriber in tuple(self._subscribers):
-            if subscriber.stream == batch.stream:
-                subscriber.enqueue(packet)
+                await websocket.send(packet.header)
+                await websocket.send(packet.payload)
