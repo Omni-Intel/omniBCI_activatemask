@@ -6,7 +6,7 @@ import numpy as np
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from onmibci_stream import LocalStreamServer, StreamBatch
+from onmibci_stream import LocalStreamServer, StreamBatch, _Subscriber, _WirePacket
 
 
 class LocalStreamServerTests(unittest.TestCase):
@@ -92,6 +92,19 @@ class LocalStreamServerTests(unittest.TestCase):
         foreign_batch = self.make_batch("raw", session_id="other")
         with self.assertRaises(ValueError):
             server.publish(foreign_batch)
+
+    def test_bounded_subscriber_queue_reports_dropped_batches(self):
+        subscriber = _Subscriber("raw", queue_size=1)
+        subscriber.enqueue(_WirePacket("first", b"", samples=2))
+        subscriber.enqueue(_WirePacket("second", b"", samples=3))
+
+        gap = subscriber.take_gap()
+
+        self.assertEqual(gap.stream, "raw")
+        self.assertEqual(gap.dropped_batches, 1)
+        self.assertEqual(gap.dropped_samples, 2)
+        self.assertEqual(subscriber.queue.get_nowait().header, "second")
+        self.assertIsNone(subscriber.take_gap())
 
 
 if __name__ == "__main__":

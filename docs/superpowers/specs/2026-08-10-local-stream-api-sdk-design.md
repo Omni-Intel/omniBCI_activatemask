@@ -18,6 +18,24 @@ sequence, and acquisition modes. The new API must publish at these existing
 boundaries so the colleague's program receives the same signal semantics as
 the GUI without re-running or approximating the filter.
 
+## USB and BLE coverage
+
+The API is deliberately above the physical transport. `poll_transport()` has
+separate USB-serial and BLE receive branches, but both branches call the same
+`process_frames(..., live=True)` path. The raw publisher runs after the common
+timeline is appended to `MainWindow.ring`, and the filtered publisher runs when
+the common `LiveFilterWorker` result is accepted. Therefore the colleague uses
+the same `connect_local()`, `stream_raw()`, and `stream_filtered()` code for
+both GUI modes.
+
+The two input paths retain their existing timeline semantics. USB publishes
+the decoded frames received from the serial worker. BLE publishes its expanded
+timeline, including explicit invalid samples for recoverable sequence gaps.
+`sequence` and `valid` must be used together: an API queue `GapEvent` means the
+subscriber fell behind, while `valid=false` describes an acquisition-timeline
+sample that was not available. Neither path turns a missing sample into a
+fabricated EEG value.
+
 ## Architecture
 
 ```text
@@ -125,13 +143,15 @@ inventing samples.
 ## GUI integration
 
 1. Start the local stream server with the GUI and stop it during GUI shutdown.
-2. Publish the decoded timeline immediately after the raw ring append and
+2. Keep USB serial and BLE receive code above the shared `process_frames`
+   boundary; do not duplicate API publishing in either transport branch.
+3. Publish the decoded timeline immediately after the raw ring append and
    before filter-only saturation masking.
-3. Publish each accepted `FilteredBatch` at the existing filter-result drain
+4. Publish each accepted `FilteredBatch` at the existing filter-result drain
    point.
-4. Copy arrays before crossing from the Qt/filter threads into the API server
+5. Copy arrays before crossing from the Qt/filter threads into the API server
    thread.
-5. Keep raw and filtered subscribers independent so one slow model cannot
+6. Keep raw and filtered subscribers independent so one slow model cannot
    starve the other stream or the GUI.
 
 ## Testing and acceptance
@@ -144,6 +164,8 @@ inventing samples.
 - Fan-out tests prove two subscribers each receive a full copy of a batch.
 - Backpressure tests prove a slow subscriber does not block publishing and
   receives an explicit gap event.
+- Transport-wiring review proves both the USB and BLE receive branches enter
+  the shared publish path; no hardware is required for the API/SDK tests.
 - A GUI-independent integration test verifies the server and SDK without
   hardware or a visible Qt window.
 - Existing Python syntax checks and project tests remain green.

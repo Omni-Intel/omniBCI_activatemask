@@ -309,6 +309,9 @@ git commit -m "feat: add Python EEG stream SDK"
 
 **Interfaces:**
 - `MainWindow.stream_server` is a `LocalStreamServer` started with the GUI and stopped by `closeEvent`.
+- `poll_transport()` keeps USB serial and BLE receive handling separate, but
+  both branches call the shared `process_frames(..., live=True)` boundary.
+  API publishing must not be duplicated inside either transport branch.
 - Raw publish uses `timeline_values`, `timeline_sequence`, `timeline_valid`, and `timeline_modes` immediately after `self.ring.append_batch(...)`, before `filter_values` saturation masking.
 - Filtered publish uses `FilteredBatch.filtered`, `.sequence`, `.valid`, `.modes`, and `.generation` immediately before/with `self.filtered_ring.append_batch(...)`.
 
@@ -365,7 +368,8 @@ requirements, then run `uv lock` from the repository root.
 Add a short section showing `uv sync`, starting the GUI, and importing
 `connect_local` for `stream_raw()` and `stream_filtered()`. State that the API
 binds to localhost and that the raw stream is decoded microvolts, not wire
-bytes.
+bytes. Explain that the same SDK works in both USB and BLE GUI modes, while
+`sequence`/`valid` distinguish an acquisition gap from an API subscriber gap.
 
 - [ ] **Step 3: Run the full verification set**
 
@@ -379,6 +383,10 @@ Run: `git diff --check`
 
 Expected: all commands exit 0; the test output reports zero failures and no
 unexpected errors.
+
+Also inspect the GUI wiring: the USB and BLE branches of `poll_transport()`
+must both reach the shared `process_frames(..., live=True)` call, which owns the
+raw and filtered publish points.
 
 - [ ] **Step 4: Review the complete diff and commit documentation/dependency changes**
 

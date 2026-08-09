@@ -50,6 +50,9 @@ class _StreamIterator:
 
         event_type = event.get("type")
         if event_type == "gap":
+            if event.get("stream") != self.stream:
+                self.close()
+                raise ProtocolError("API gap stream does not match subscription")
             try:
                 return GapEvent(
                     stream=event["stream"],

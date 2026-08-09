@@ -1,8 +1,9 @@
+import json
 import unittest
 
 import numpy as np
 
-from onmibci_sdk import connect_local
+from onmibci_sdk import ProtocolError, _StreamIterator, connect_local
 from onmibci_stream import LocalStreamServer, StreamBatch
 
 
@@ -63,6 +64,31 @@ class LocalClientTests(unittest.TestCase):
             if iterator is not None:
                 iterator.close()
             server.stop()
+
+    def test_stream_iterator_rejects_gap_for_another_stream(self):
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+
+            def recv(self):
+                return json.dumps(
+                    {
+                        "type": "gap",
+                        "stream": "filtered",
+                        "dropped_batches": 1,
+                        "dropped_samples": 2,
+                    }
+                )
+
+            def close(self):
+                self.closed = True
+
+        connection = FakeConnection()
+        iterator = _StreamIterator(None, "raw", connection)
+
+        with self.assertRaises(ProtocolError):
+            next(iterator)
+        self.assertTrue(connection.closed)
 
 
 if __name__ == "__main__":

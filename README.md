@@ -46,6 +46,57 @@ install_optional_exports.bat
 
 可选包安装失败不会阻止实时采集、滤波、绘图和 BIN 记录。
 
+## 本地实时数据 API 与 Python SDK
+
+GUI 启动后会在本机 `127.0.0.1:8765` 提供 WebSocket 数据接口。接口只
+允许本机连接，不提供公网或局域网监听。
+
+当前提供两条逻辑数据流：
+
+- `raw`：已经解析为微伏、但未经过 GUI 滤波的原始脑电；不是串口原始字节。
+- `filtered`：GUI `LiveFilterWorker` 实时滤波后的数据。
+
+### USB 与 BLE 两种采集模式
+
+无论 GUI 当前选择有线 USB 串口还是 BLE，SDK 的连接和读取方式都相同。
+两种模式都会进入 GUI 的公共帧解析、raw ring、实时滤波和 API 发布链路：
+
+- USB 使用串口接收线程拿到的已解析帧；
+- BLE 使用 BLE 接收线程重组后的时间线，BLE 可恢复的序号缺口会通过
+  `sequence` 和 `valid=false` 保留下来。
+
+`GapEvent` 表示 API 客户端自己的队列来不及读取而发生的丢批；它和 BLE/USB
+采集时间线里的无效样本是两件事。模型应同时检查 `sequence`、`valid` 和
+`GapEvent`，不要把缺失样本当成真实 EEG。
+
+同事的 Python 脚本可以在项目目录中使用 SDK：
+
+```python
+from onmibci_sdk import GapEvent, connect_local
+
+client = connect_local()
+for item in client.stream_raw():
+    if isinstance(item, GapEvent):
+        print("stream gap:", item.dropped_samples)
+        continue
+    raw_eeg_uv = item.values  # shape: (samples, 8), dtype: float32
+    # prediction = model.predict(raw_eeg_uv)
+```
+
+读取滤波数据时改用：
+
+```python
+for item in client.stream_filtered():
+    if isinstance(item, GapEvent):
+        continue
+    filtered_eeg_uv = item.values
+```
+
+第一版 SDK 文件为 `onmibci_sdk.py`，协议模块为 `onmibci_stream.py`；如果
+脚本不在项目目录中运行，需要将这两个文件一起放入脚本目录，或者把项目
+根目录加入 `PYTHONPATH`。数据按批次实时发送，批次包含序列号、有效标记、
+采集模式和滤波配置代数。
+
 ## 固件选择与兼容性
 
 长时间 BLE 采集应使用项目内配套的 V18 固件：
