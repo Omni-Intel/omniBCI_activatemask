@@ -95,6 +95,13 @@ except Exception as exc:  # pragma: no cover - serial mode remains usable
     BLE_AVAILABLE = False
     BLE_IMPORT_ERROR = str(exc)
 
+from onmibci_stream import (
+    LocalStreamServer,
+    STREAM_FILTERED,
+    STREAM_RAW,
+    publish_gui_matrix,
+)
+
 
 FS = 250
 CHANNELS = 8
@@ -2541,6 +2548,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_worker: Optional[LiveFilterWorker] = None
         self.filter_batches_applied = 0
         self.filter_stale_batches = 0
+        self.stream_server: Optional[LocalStreamServer] = None
+        self.stream_api_errors = 0
         self.ser: Optional[serial.Serial] = None
         self.serial_worker: Optional[SerialTransportWorker] = None
         self.serial_control_read_active = False
@@ -2710,6 +2719,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_processing_state()
 
         self._build_omni_ui()
+        self.stream_server = LocalStreamServer()
+        try:
+            self.stream_server.start()
+        except Exception as exc:
+            print(f"Local EEG stream API unavailable: {exc}", file=sys.stderr)
+            self.stream_server = None
         if BLE_AVAILABLE:
             self.ble_worker = BleTransportWorker(self)
             self.ble_worker.scan_started.connect(self.on_ble_scan_started)
@@ -6316,6 +6331,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ring.append_batch(
                 timeline_values, timeline_valid, timeline_sequence, timeline_modes
             )
+            self._publish_stream_batch(
+                STREAM_RAW,
+                timeline_values,
+                timeline_valid,
+                timeline_sequence,
+                timeline_modes,
+                generation=None,
+            )
             # Raw ring/BIN keep the exact ADC rail values. For the live filter
             # and screen copy only, isolate rail samples per channel with NaN.
             # Otherwise a floating BIAS/electrode can alternate between +/-FS and
@@ -6361,9 +6384,46 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filtered_ring.append_batch(
                 batch.filtered, batch.valid, batch.sequence, batch.modes
             )
+            self._publish_stream_batch(
+                STREAM_FILTERED,
+                batch.filtered,
+                batch.valid,
+                batch.sequence,
+                batch.modes,
+                generation=batch.generation,
+            )
             self.filter_batches_applied += 1
             if time.perf_counter() >= deadline:
                 break
+
+    def _publish_stream_batch(
+        self,
+        stream: str,
+        values: np.ndarray,
+        valid: np.ndarray,
+        sequence: np.ndarray,
+        modes: np.ndarray,
+        generation: Optional[int],
+    ) -> None:
+        server = self.stream_server
+        if server is None:
+            return
+        try:
+            publish_gui_matrix(
+                server,
+                stream=stream,
+                values=values,
+                sequence=sequence,
+                valid=valid,
+                modes=modes,
+                generation=generation,
+                session_id=server.session_id,
+            )
+        except Exception as exc:
+            self.stream_api_errors += 1
+            if self.stream_api_errors == 1:
+                print(f"Local EEG stream publish disabled: {exc}", file=sys.stderr)
+                self.stream_server = None
 
     def filter_worker_backlog_samples(self) -> int:
         worker = self.filter_worker
@@ -7652,6 +7712,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):  # noqa: N802
         try:
+            if self.stream_server is not None:
+                self.stream_server.stop()
+                self.stream_server = None
             self.stop_stream()
             if self.serial_worker is not None:
                 self.serial_worker.stop(timeout=2.0, close_port=False)
