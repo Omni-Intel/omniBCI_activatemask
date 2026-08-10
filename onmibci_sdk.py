@@ -5,15 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 import inspect
 import json
+import os
 from typing import Any, Iterator
+from urllib.parse import urlsplit, urlunsplit
+import uuid
 
 from websockets.exceptions import ConnectionClosedOK
 
 from onmibci_stream import (
+    CONTROL_PATH,
     DEFAULT_CHANNELS,
     GapEvent,
+    MarkerEvent,
     SAMPLE_RATE,
     SCHEMA_VERSION,
+    STREAM_PATH,
     STREAM_FILTERED,
     STREAM_RAW,
     StreamBatch,
@@ -25,6 +31,14 @@ class ProtocolError(RuntimeError):
     """Raised when the API sends an invalid or unexpected message."""
 
 
+@dataclass(frozen=True)
+class ExportResult:
+    path: str
+    recording_id: str
+    event_count: int
+    sample_count: int
+
+
 @dataclass
 class _StreamIterator:
     client: "LocalClient"
@@ -34,7 +48,7 @@ class _StreamIterator:
     def __iter__(self) -> "_StreamIterator":
         return self
 
-    def __next__(self) -> StreamBatch | GapEvent:
+    def __next__(self) -> StreamBatch | GapEvent | MarkerEvent:
         try:
             message = self.connection.recv()
         except ConnectionClosedOK:
@@ -62,10 +76,18 @@ class _StreamIterator:
                     stream=event["stream"],
                     dropped_batches=event["dropped_batches"],
                     dropped_samples=event["dropped_samples"],
+                    dropped_markers=event.get("dropped_markers", 0),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 self.close()
                 raise ProtocolError("API sent an invalid gap event") from exc
+
+        if event_type == "marker":
+            try:
+                return MarkerEvent.from_dict(event)
+            except (TypeError, ValueError, KeyError) as exc:
+                self.close()
+                raise ProtocolError("API sent an invalid marker event") from exc
 
         if event_type != "data":
             self.close()
@@ -104,13 +126,129 @@ class LocalClient:
     ):
         self.url = url
         self.timeout = timeout
+        self.control_url = self._derive_control_url(url)
         self.hello: dict[str, Any] | None = None
 
-    def stream_raw(self) -> Iterator[StreamBatch | GapEvent]:
+    def stream_raw(self) -> Iterator[StreamBatch | GapEvent | MarkerEvent]:
         return self._open_stream(STREAM_RAW)
 
-    def stream_filtered(self) -> Iterator[StreamBatch | GapEvent]:
+    def stream_filtered(self) -> Iterator[StreamBatch | GapEvent | MarkerEvent]:
         return self._open_stream(STREAM_FILTERED)
+
+    def send_marker(
+        self,
+        code: str,
+        value: None | bool | int | float | str = None,
+        *,
+        timestamp: float | None = None,
+        sequence: int | None = None,
+        duration: float = 0.0,
+        description: str = "",
+    ) -> MarkerEvent:
+        request: dict[str, Any] = {
+            "type": "marker",
+            "code": code,
+            "value": value,
+            "sequence": sequence,
+            "duration": duration,
+            "description": description,
+        }
+        if timestamp is not None:
+            request["timestamp"] = timestamp
+        result = self._control_request(request)
+        try:
+            return MarkerEvent.from_dict(result)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ProtocolError("API returned an invalid marker result") from exc
+
+    def stop_measurement(self) -> dict[str, Any]:
+        return self._control_request({"type": "stop_measurement"})
+
+    def export_bdf(self, path: os.PathLike[str] | str, *, overwrite: bool = False) -> ExportResult:
+        if not isinstance(overwrite, bool):
+            raise TypeError("overwrite must be a bool")
+        result = self._control_request(
+            {
+                "type": "export_bdf",
+                "path": os.fspath(path),
+                "overwrite": overwrite,
+            }
+        )
+        if (
+            not isinstance(result.get("path"), str)
+            or not isinstance(result.get("recording_id"), str)
+            or not result["recording_id"]
+            or not isinstance(result.get("event_count"), int)
+            or isinstance(result["event_count"], bool)
+            or result["event_count"] < 0
+            or not isinstance(result.get("sample_count"), int)
+            or isinstance(result["sample_count"], bool)
+            or result["sample_count"] < 0
+        ):
+            raise ProtocolError("API returned an invalid BDF export result")
+        return ExportResult(
+            path=result["path"],
+            recording_id=result["recording_id"],
+            event_count=result["event_count"],
+            sample_count=result["sample_count"],
+        )
+
+    @staticmethod
+    def _derive_control_url(url: str) -> str:
+        if not isinstance(url, str):
+            raise TypeError("url must be a string")
+        parsed = urlsplit(url)
+        if parsed.path != STREAM_PATH:
+            raise ValueError(f"stream URL must end with {STREAM_PATH}")
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, CONTROL_PATH, parsed.query, parsed.fragment)
+        )
+
+    def _control_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        from websockets.sync.client import connect
+
+        request = dict(request)
+        request_id = uuid.uuid4().hex
+        request["request_id"] = request_id
+        connect_options = {
+            "open_timeout": self.timeout,
+            "close_timeout": self.timeout,
+            "max_size": None,
+        }
+        if "proxy" in inspect.signature(connect).parameters:
+            connect_options["proxy"] = None
+        try:
+            with connect(self.control_url, **connect_options) as connection:
+                connection.send(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
+                message = connection.recv()
+        except Exception as exc:
+            raise ProtocolError("could not complete API control request") from exc
+
+        if not isinstance(message, str):
+            raise ProtocolError("API control response must be JSON text")
+        try:
+            response = json.loads(message)
+        except json.JSONDecodeError as exc:
+            raise ProtocolError("API sent invalid control JSON") from exc
+        if not isinstance(response, dict):
+            raise ProtocolError("API control response must be an object")
+        if response.get("type") != "control_response":
+            raise ProtocolError("API did not send a control response")
+        if response.get("schema_version") != SCHEMA_VERSION:
+            raise ProtocolError("API control response has an unsupported schema")
+        if response.get("request_id") != request_id:
+            raise ProtocolError("API control response request ID does not match")
+        if not response.get("ok"):
+            error = response.get("error")
+            if isinstance(error, dict):
+                code = error.get("code", "unknown")
+                message = error.get("message", "control request failed")
+                raise ProtocolError(f"API control error {code}: {message}")
+            raise ProtocolError("API control request failed")
+        result = response.get("result", {})
+        if not isinstance(result, dict):
+            raise ProtocolError("API control result must be an object")
+        return result
 
     def _open_stream(self, stream: str) -> _StreamIterator:
         from websockets.sync.client import connect
@@ -185,8 +323,10 @@ def connect_local(
 
 
 __all__ = [
+    "ExportResult",
     "GapEvent",
     "LocalClient",
+    "MarkerEvent",
     "ProtocolError",
     "StreamBatch",
     "connect_local",

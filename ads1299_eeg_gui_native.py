@@ -97,8 +97,10 @@ except Exception as exc:  # pragma: no cover - serial mode remains usable
 
 from onmibci_stream import (
     LocalStreamServer,
+    MarkerEvent,
     STREAM_FILTERED,
     STREAM_RAW,
+    bdf_annotation_for_marker,
     publish_gui_matrix,
 )
 
@@ -1147,6 +1149,7 @@ class AsyncRawWriter:
                 "segment_index": int(self._segment_index),
                 "segment_bytes": int(self._segment_bytes),
                 "segment_count": int(len(self._segments)),
+                "segments": [dict(item) for item in self._segments],
                 "bytes_written": int(self.bytes_written),
                 "queued_bytes": int(self._queued_bytes),
             }
@@ -2527,6 +2530,8 @@ class BleTransportWorker(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    api_gui_request = QtCore.Signal(object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V18 | BLE continuity + stale-NACK hardening")
@@ -2549,6 +2554,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_batches_applied = 0
         self.filter_stale_batches = 0
         self.stream_server: Optional[LocalStreamServer] = None
+        self.api_gui_request.connect(self._handle_api_gui_request)
         self.stream_api_errors = 0
         self.ser: Optional[serial.Serial] = None
         self.serial_worker: Optional[SerialTransportWorker] = None
@@ -2719,7 +2725,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_processing_state()
 
         self._build_omni_ui()
-        self.stream_server = LocalStreamServer()
+        self.stream_server = LocalStreamServer(
+            stop_handler=self._api_stop_measurement,
+            export_handler=self._api_export_bdf,
+        )
         try:
             self.stream_server.start()
         except Exception as exc:
@@ -4243,6 +4252,181 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             writer.close()
 
+    def _write_bdf_data(
+        self,
+        path: Path,
+        data: np.ndarray,
+        valid: np.ndarray,
+        *,
+        markers: tuple[MarkerEvent, ...] = tuple(),
+        recording_started_at: float | None = None,
+        first_sequence: int | None = None,
+        overwrite: bool = False,
+    ) -> None:
+        if not overwrite and Path(path).exists():
+            raise FileExistsError(f"BDF output already exists: {path}")
+        data = np.asarray(data, dtype=np.float64)
+        valid = np.asarray(valid, dtype=bool)
+        if data.ndim != 2 or data.shape[0] != CHANNELS or data.shape[1] <= 0:
+            raise ValueError("BDF data must have shape (8, samples)")
+        if valid.ndim != 1 or valid.size != data.shape[1]:
+            raise ValueError("BDF validity length must match data")
+        if markers and recording_started_at is None:
+            raise ValueError("recording_started_at is required for marker export")
+        try:
+            import pyedflib
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 BDF 依赖 pyedflib，请运行：uv sync --extra export"
+            ) from exc
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        writer = pyedflib.EdfWriter(
+            str(path),
+            CHANNELS,
+            file_type=pyedflib.FILETYPE_BDFPLUS,
+        )
+        try:
+            headers = []
+            for ch in range(CHANNELS):
+                finite = data[ch][np.isfinite(data[ch])]
+                peak = float(np.max(np.abs(finite))) if finite.size else 1.0
+                physical_peak = max(100, int(np.ceil(peak * 1.1)))
+                headers.append({
+                    "label": f"CH{ch + 1}",
+                    "dimension": "uV",
+                    "sample_frequency": FS,
+                    "physical_min": -physical_peak,
+                    "physical_max": physical_peak,
+                    "digital_min": -8388608,
+                    "digital_max": 8388607,
+                    "transducer": "ADS1299",
+                    "prefilter": "Raw, unfiltered",
+                })
+            writer.setSignalHeaders(headers)
+            writer.setPatientCode("")
+            writer.setEquipment("ADS1299")
+            writer.writeSamples([
+                np.nan_to_num(data[ch], nan=0.0, posinf=0.0, neginf=0.0)
+                for ch in range(CHANNELS)
+            ])
+            annotations = []
+            remainder = data.shape[1] % FS
+            # A duration annotation covering the padded tail can hide later
+            # user markers in some BDF+ readers. The writer still performs
+            # the required record padding; keep this legacy annotation only
+            # for exports without user events.
+            if remainder and not markers:
+                annotations.append(
+                    (
+                        float(data.shape[1]) / FS,
+                        float(FS - remainder) / FS,
+                        "BDF_padding",
+                    )
+                )
+
+            if not valid.all():
+                padded = np.r_[False, ~valid, False].astype(np.int8)
+                edges = np.diff(padded)
+                starts = np.flatnonzero(edges == 1)
+                ends = np.flatnonzero(edges == -1)
+                for start, end in zip(starts, ends):
+                    annotations.append(
+                        (
+                            float(start) / FS,
+                            float(end - start) / FS,
+                            "BAD_frame",
+                        )
+                    )
+            for marker in markers:
+                onset, duration, text = bdf_annotation_for_marker(
+                    marker,
+                    recording_started_at=float(recording_started_at),
+                    first_sequence=first_sequence,
+                    sample_rate=FS,
+                    sample_count=int(data.shape[1]),
+                )
+                annotations.append((onset, duration, text))
+            for onset, duration, text in sorted(annotations, key=lambda item: item[0]):
+                writer.writeAnnotation(onset, duration, text)
+        finally:
+            writer.close()
+
+    def export_recording_bdf(
+        self,
+        path: Path,
+        markers: tuple[MarkerEvent, ...],
+        *,
+        recording_id: str,
+        recording_started_at: float,
+        first_sequence: int | None,
+        overwrite: bool = False,
+    ) -> dict:
+        """Export every completed BIN segment from the last live recording."""
+
+        if not isinstance(recording_id, str) or not recording_id:
+            raise ValueError("recording_id must not be empty")
+        path = Path(path)
+        snapshot = self.raw_writer.snapshot()
+        segment_records = snapshot.get("segments", [])
+        segment_paths = [
+            Path(record["path"])
+            for record in segment_records
+            if isinstance(record, dict) and isinstance(record.get("path"), str)
+        ]
+        if not segment_paths:
+            first_path = snapshot.get("first_path")
+            if isinstance(first_path, str) and first_path:
+                segment_paths = [Path(first_path)]
+        segment_paths = [segment for segment in segment_paths if segment.exists()]
+        if not segment_paths:
+            raise RuntimeError("no_completed_recording")
+
+        parser = AdsFrameParser(self.channel_lsb_uv)
+        frames: list[Frame] = []
+        for segment_path in segment_paths:
+            frames.extend(parser.feed(segment_path.read_bytes()))
+        if not frames:
+            raise RuntimeError("recording_contains_no_valid_frames")
+
+        (
+            data,
+            valid,
+            sequence,
+            _modes,
+            _lost,
+            _filled,
+            _gap_events,
+            _large_discontinuities,
+            _last_sequence,
+            _last_mode,
+        ) = expand_frames_to_timeline(
+            frames,
+            previous_sequence=None,
+            previous_mode=int(frames[0].mode),
+        )
+        if first_sequence is None:
+            first_sequence = int(sequence[0])
+        for marker in markers:
+            if marker.recording_id != recording_id:
+                raise ValueError("marker recording_id does not match export")
+        self._write_bdf_data(
+            path,
+            data,
+            valid,
+            markers=tuple(markers),
+            recording_started_at=recording_started_at,
+            first_sequence=first_sequence,
+            overwrite=overwrite,
+        )
+        return {
+            "path": str(path.resolve()),
+            "recording_id": recording_id,
+            "event_count": len(markers),
+            "sample_count": int(data.shape[1]),
+        }
+
     def build_mne_raw(self):
         """Build an unfiltered MNE RawArray from the currently imported file."""
         if self.offline_uv is None:
@@ -4970,6 +5154,86 @@ class MainWindow(QtWidgets.QMainWindow):
                     except queue.Empty:
                         break
         self.last_serial_waiting_bytes = 0
+
+    def _run_api_on_gui(self, operation: str, payload: dict) -> dict:
+        """Run a control operation on the Qt thread and return its result."""
+
+        request = {
+            "operation": operation,
+            "payload": dict(payload),
+            "done": threading.Event(),
+            "result": None,
+            "error": None,
+        }
+        self.api_gui_request.emit(request)
+        if not request["done"].wait(timeout=120.0):
+            raise RuntimeError("gui_control_timeout")
+        if request["error"] is not None:
+            raise request["error"]
+        result = request["result"]
+        if not isinstance(result, dict):
+            raise RuntimeError("GUI control handler returned an invalid result")
+        return result
+
+    @QtCore.Slot(object)
+    def _handle_api_gui_request(self, request: dict) -> None:
+        try:
+            operation = request["operation"]
+            payload = request["payload"]
+            if operation == "stop_measurement":
+                self.stop_stream(offer_export=False)
+                request["result"] = {
+                    "recording_id": payload["recording_id"],
+                    "stopped": True,
+                }
+            elif operation == "export_bdf":
+                request["result"] = self.export_recording_bdf(
+                    Path(payload["path"]),
+                    payload["markers"],
+                    recording_id=payload["recording_id"],
+                    recording_started_at=payload["recording_started_at"],
+                    first_sequence=payload["first_sequence"],
+                    overwrite=payload["overwrite"],
+                )
+            else:
+                raise RuntimeError("unsupported_gui_control")
+        except BaseException as exc:
+            request["error"] = exc
+        finally:
+            request["done"].set()
+
+    def _api_stop_measurement(self) -> dict:
+        if not self.streaming or not self.recording_session_id:
+            raise RuntimeError("not_recording")
+        recording_id = self.recording_session_id
+        return self._run_api_on_gui(
+            "stop_measurement", {"recording_id": recording_id}
+        )
+
+    def _api_export_bdf(self, request: dict, markers: tuple[MarkerEvent, ...]) -> dict:
+        path = request.get("path")
+        overwrite = request.get("overwrite", False)
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string")
+        if not isinstance(overwrite, bool):
+            raise ValueError("overwrite must be a bool")
+        if self.stream_server is None:
+            raise RuntimeError("stream_api_unavailable")
+        state = self.stream_server.recording_snapshot()
+        recording_id = state.get("recording_id")
+        if not isinstance(recording_id, str) or not recording_id:
+            raise RuntimeError("no_recording")
+        return self._run_api_on_gui(
+            "export_bdf",
+            {
+                "path": path,
+                "overwrite": overwrite,
+                "markers": tuple(markers),
+                "recording_id": recording_id,
+                "recording_started_at": state["recording_started_at"],
+                "first_sequence": state["first_sequence"],
+            },
+        )
 
     def _recording_folder(self) -> Path:
         folder = RECORDINGS_DIR / "bin"
@@ -5854,6 +6118,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recording_session_id = str(snap.get("session_id", ""))
             self.recording_manifest_path = str(snap.get("manifest_path", ""))
             self.recording_segment_index = int(snap.get("segment_index", 1))
+            if self.stream_server is not None:
+                self.stream_server.begin_recording(
+                    self.recording_session_id,
+                    started_at=time.time(),
+                )
             self.raw_recording_enabled = True
             self.raw_write_errors = 0
             self.raw_file = True
@@ -5870,6 +6139,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"当前 {Path(self.raw_path).name}"
             )
         except Exception as exc:
+            if self.stream_server is not None:
+                self.stream_server.end_recording()
             self.close_raw_file()
             QtWidgets.QMessageBox.critical(self, "开始失败", str(exc))
 
@@ -5888,6 +6159,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ble_worker is not None:
             self.ble_worker.set_streaming_hint(False)
         self.close_raw_file()
+        if self.stream_server is not None:
+            self.stream_server.end_recording()
         snap = self.raw_writer.snapshot()
         segment_count = int(snap.get("segment_count", 0))
         if was_streaming and self.recording_session_id:
@@ -6331,6 +6604,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ring.append_batch(
                 timeline_values, timeline_valid, timeline_sequence, timeline_modes
             )
+            if self.stream_server is not None and timeline_count:
+                self.stream_server.set_first_sequence(int(timeline_sequence[0]))
             self._publish_stream_batch(
                 STREAM_RAW,
                 timeline_values,
@@ -7712,10 +7987,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):  # noqa: N802
         try:
+            self.stop_stream()
             if self.stream_server is not None:
                 self.stream_server.stop()
                 self.stream_server = None
-            self.stop_stream()
             if self.serial_worker is not None:
                 self.serial_worker.stop(timeout=2.0, close_port=False)
                 self.serial_worker = None

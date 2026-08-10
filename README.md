@@ -110,6 +110,18 @@ for item in client.stream_filtered():
 根目录加入 `PYTHONPATH`。数据按批次实时发送，批次包含序列号、有效标记、
 采集模式和滤波配置代数。
 
+完整的同事接入说明见 [`docs/SDK_USAGE.md`](docs/SDK_USAGE.md)。
+
+SDK 还支持实时事件标记和测量结束后的 BDF+ 导出：
+
+```python
+client.send_marker("stimulus_on", 1, sequence=12500, description="刺激开始")
+client.stop_measurement()
+result = client.export_bdf(r"D:\recordings\session_001.bdf")
+```
+
+事件会写入导出的 BDF+ Annotation 通道；导出功能需要 `uv sync --extra export`。
+
 ## 固件选择与兼容性
 
 长时间 BLE 采集应使用项目内配套的 V18 固件：
