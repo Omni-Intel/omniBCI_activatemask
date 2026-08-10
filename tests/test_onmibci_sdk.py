@@ -3,8 +3,14 @@ import unittest
 
 import numpy as np
 
-from onmibci_sdk import LocalClient, ProtocolError, _StreamIterator, connect_local
-from onmibci_stream import LocalStreamServer, StreamBatch
+from onmibci_sdk import (
+    ExportResult,
+    LocalClient,
+    ProtocolError,
+    _StreamIterator,
+    connect_local,
+)
+from onmibci_stream import LocalStreamServer, MarkerEvent, StreamBatch
 
 
 class LocalClientTests(unittest.TestCase):
@@ -39,6 +45,61 @@ class LocalClientTests(unittest.TestCase):
         finally:
             if iterator is not None:
                 iterator.close()
+            server.stop()
+
+    def test_send_marker_returns_acknowledged_event_and_streams_it(self):
+        server = LocalStreamServer(port=0, session_id="api-1")
+        server.start()
+        server.begin_recording("rec-1", started_at=100.0)
+        iterator = None
+        try:
+            client = connect_local(port=server.port)
+            iterator = client.stream_raw()
+
+            marker = client.send_marker("stimulus_on", 1, sequence=10)
+
+            self.assertIsInstance(marker, MarkerEvent)
+            self.assertEqual(marker.recording_id, "rec-1")
+            self.assertEqual(next(iterator).code, "stimulus_on")
+        finally:
+            if iterator is not None:
+                iterator.close()
+            server.stop()
+
+    def test_stop_and_export_return_typed_results(self):
+        stop_calls = []
+
+        def stop_handler():
+            stop_calls.append(True)
+            server.end_recording()
+            return {"recording_id": "rec-1"}
+
+        def export_handler(request, markers):
+            return {
+                "path": request["path"],
+                "recording_id": "rec-1",
+                "event_count": len(markers),
+                "sample_count": 250,
+            }
+
+        server = LocalStreamServer(
+            port=0,
+            stop_handler=stop_handler,
+            export_handler=export_handler,
+        )
+        server.start()
+        server.begin_recording("rec-1")
+        try:
+            client = connect_local(port=server.port)
+            self.assertEqual(client.stop_measurement()["recording_id"], "rec-1")
+            result = client.export_bdf("out.bdf")
+
+            self.assertIsInstance(result, ExportResult)
+            self.assertEqual(result.path, "out.bdf")
+            self.assertEqual(result.event_count, 0)
+            self.assertEqual(result.sample_count, 250)
+            self.assertEqual(stop_calls, [True])
+        finally:
             server.stop()
 
     def test_stream_filtered_uses_the_filtered_subscription(self):

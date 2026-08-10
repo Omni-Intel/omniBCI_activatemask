@@ -31,6 +31,56 @@ class LocalStreamServerTests(unittest.TestCase):
             raise AssertionError(f"unexpected hello: {hello}")
         return hello
 
+    def test_control_marker_is_acknowledged_and_broadcast(self):
+        server = LocalStreamServer(port=0, session_id="api-1")
+        server.start()
+        server.begin_recording("rec-1", started_at=100.0)
+        try:
+            with connect(
+                f"ws://127.0.0.1:{server.port}/v1/stream"
+            ) as stream_ws, connect(
+                f"ws://127.0.0.1:{server.port}/v1/control"
+            ) as control_ws:
+                self.subscribe(stream_ws, "raw")
+                control_ws.send(
+                    json.dumps(
+                        {
+                            "type": "marker",
+                            "code": "stimulus_on",
+                            "value": 1,
+                            "sequence": 12,
+                            "description": "left",
+                        }
+                    )
+                )
+
+                response = json.loads(control_ws.recv())
+                self.assertTrue(response["ok"])
+                self.assertEqual(response["result"]["recording_id"], "rec-1")
+
+                marker = json.loads(stream_ws.recv())
+                self.assertEqual(marker["type"], "marker")
+                self.assertEqual(marker["code"], "stimulus_on")
+
+        finally:
+            server.stop()
+
+    def test_marker_is_rejected_outside_a_recording(self):
+        server = LocalStreamServer(port=0)
+        server.start()
+        try:
+            with connect(
+                f"ws://127.0.0.1:{server.port}/v1/control"
+            ) as control_ws:
+                control_ws.send(
+                    json.dumps({"type": "marker", "code": "x", "value": 1})
+                )
+                response = json.loads(control_ws.recv())
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "not_recording")
+        finally:
+            server.stop()
+
     def test_subscriber_receives_hello_and_published_batch(self):
         server = LocalStreamServer(port=0, session_id="s1")
         server.start()

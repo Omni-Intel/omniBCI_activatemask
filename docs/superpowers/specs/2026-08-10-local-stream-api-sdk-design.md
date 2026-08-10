@@ -177,3 +177,20 @@ inventing samples.
 - No raw serial-frame API.
 - No model execution inside the GUI.
 - No change to the existing filter algorithm or recording format.
+
+## Marker and BDF export extension
+
+The API keeps `/v1/stream` for subscriptions and adds a localhost-only
+`/v1/control` WebSocket for one-request/one-response commands. The SDK exposes
+`send_marker()`, `stop_measurement()`, and `export_bdf()`. A marker contains a
+code, JSON scalar value, UNIX timestamp, optional acquisition sequence,
+duration, description, event ID, API session ID, and recording ID.
+
+The GUI opens a marker session with the same recording ID as the segmented BIN
+writer. Markers are broadcast to raw and filtered subscribers and retained
+until the next recording starts. After measurement stops, the export command
+parses every completed BIN segment, reconstructs the USB/BLE timeline, and
+writes BDF+ Annotation entries. Sequence alignment is preferred for onset;
+timestamp-relative alignment is the fallback. BDF padding annotations are not
+added to an event-bearing export because some pyEDFlib readers treat the
+padding interval as covering later user events.

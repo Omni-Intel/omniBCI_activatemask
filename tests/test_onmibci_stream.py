@@ -1,9 +1,15 @@
 import json
+from pathlib import Path
 import unittest
 
 import numpy as np
 
-from onmibci_stream import StreamBatch, publish_gui_matrix
+from onmibci_stream import (
+    MarkerEvent,
+    StreamBatch,
+    bdf_annotation_for_marker,
+    publish_gui_matrix,
+)
 
 
 class _CaptureServer:
@@ -15,6 +21,66 @@ class _CaptureServer:
 
 
 class StreamBatchTests(unittest.TestCase):
+    def test_gui_recording_lifecycle_keeps_one_marker_path_for_usb_and_ble(self):
+        source = Path(__file__).resolve().parents[1] / "ads1299_eeg_gui_native.py"
+        text = source.read_text(encoding="utf-8")
+
+        self.assertIn("self.stream_server.begin_recording(", text)
+        self.assertIn("self.stream_server.set_first_sequence(", text)
+        self.assertIn("self.stream_server.end_recording()", text)
+        self.assertGreaterEqual(text.count("self.process_frames(frames, live=True)"), 2)
+
+    def test_marker_round_trip_preserves_event_fields(self):
+        marker = MarkerEvent(
+            event_id="evt-1",
+            session_id="api-1",
+            recording_id="rec-1",
+            code="stimulus_on",
+            value=1,
+            timestamp=100.25,
+            sequence=125,
+            duration=0.2,
+            description="left",
+        )
+
+        decoded = MarkerEvent.from_dict(marker.to_dict())
+
+        self.assertEqual(decoded, marker)
+
+    def test_bdf_annotation_prefers_sequence_alignment(self):
+        marker = MarkerEvent(
+            event_id="evt-1",
+            session_id="api-1",
+            recording_id="rec-1",
+            code="button",
+            value="A",
+            timestamp=999.0,
+            sequence=1125,
+            duration=0.0,
+            description="press",
+        )
+
+        onset, duration, text = bdf_annotation_for_marker(
+            marker,
+            recording_started_at=100.0,
+            first_sequence=1000,
+            sample_rate=250,
+            sample_count=2000,
+        )
+
+        self.assertAlmostEqual(onset, 0.5)
+        self.assertEqual(duration, 0.0)
+        self.assertIn("button", text)
+        self.assertIn("press", text)
+
+    def test_marker_rejects_complex_value_and_negative_duration(self):
+        with self.assertRaises(ValueError):
+            MarkerEvent(
+                "e", "s", "r", "x", {"not": "scalar"}, 1.0, None, 0.0, ""
+            )
+        with self.assertRaises(ValueError):
+            MarkerEvent("e", "s", "r", "x", 1, 1.0, None, -1.0, "")
+
     def test_raw_boundary_preserves_rail_values(self):
         raw_values = np.zeros((8, 2), dtype=np.float32)
         raw_values[0, 0] = 8388607.0
