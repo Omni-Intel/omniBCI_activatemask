@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "bleak>=1.1,<4",
+    "mne>=1.6",
     "numpy>=1.24",
+    "pyedflib>=0.1.39",
     "pyqtgraph>=0.13",
     "pyserial>=3.5",
     "pyside6>=6.5",

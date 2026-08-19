@@ -89,6 +89,42 @@ class BdfExportTests(unittest.TestCase):
             else:
                 sys.modules["pyedflib"] = previous
 
+    def test_save_bdf_writes_gui_marker_annotations(self):
+        fake_pyedflib = types.SimpleNamespace(
+            EdfWriter=_FakeEdfWriter,
+            FILETYPE_BDFPLUS=42,
+        )
+        previous = sys.modules.get("pyedflib")
+        sys.modules["pyedflib"] = fake_pyedflib
+        _FakeEdfWriter.instances.clear()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                window = MainWindow.__new__(MainWindow)
+                window.offline_uv = np.zeros((CHANNELS, 250), dtype=np.float32)
+                window.offline_valid = np.ones(250, dtype=bool)
+                window.channel_names = [f"CH{index}" for index in range(1, 9)]
+                marker = MarkerEvent(
+                    "e1", "gui", "rec", "stimulus_on", 1,
+                    100.25, 125, 0.0, "start",
+                )
+
+                window.save_bdf(
+                    Path(directory) / "marked.bdf",
+                    markers=(marker,),
+                    recording_started_at=100.0,
+                    first_sequence=100,
+                )
+
+                self.assertTrue(any(
+                    "stimulus_on" in annotation[2]
+                    for annotation in _FakeEdfWriter.instances[0].annotations
+                ))
+        finally:
+            if previous is None:
+                sys.modules.pop("pyedflib", None)
+            else:
+                sys.modules["pyedflib"] = previous
+
     def test_channel_name_validation_rejects_invalid_or_duplicate_names(self):
         window = MainWindow.__new__(MainWindow)
         window.channel_names = [f"CH{index}" for index in range(1, 9)]

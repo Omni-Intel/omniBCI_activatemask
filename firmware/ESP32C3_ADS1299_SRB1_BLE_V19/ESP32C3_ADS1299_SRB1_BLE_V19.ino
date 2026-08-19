@@ -299,6 +299,7 @@ static QueueHandle_t bleDeviceCommandQueue = nullptr;
 static TaskHandle_t adsTaskHandle = nullptr;
 static TaskHandle_t bleTxTaskHandle = nullptr;
 static SemaphoreHandle_t adsBusMutex = nullptr;
+static portMUX_TYPE bleReliableMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ============================ State / diagnostics ============================
 volatile bool streamingEnabled = false;
@@ -1681,6 +1682,18 @@ ReliableBleBlock *findReliableBlock(uint32_t blockSequence) {
   return &slot;
 }
 
+bool copyReliableBlock(uint32_t blockSequence, ReliableBleBlock &destination) {
+  bool found = false;
+  portENTER_CRITICAL(&bleReliableMux);
+  ReliableBleBlock *block = findReliableBlock(blockSequence);
+  if (block) {
+    destination = *block;
+    found = true;
+  }
+  portEXIT_CRITICAL(&bleReliableMux);
+  return found;
+}
+
 bool storeReliableBlock(
   const uint8_t *payload,
   uint16_t payloadLength,
@@ -1690,6 +1703,7 @@ bool storeReliableBlock(
   if (!payload || payloadLength == 0 || frameCount == 0 ||
       payloadLength > BLE_RELIABLE_PAYLOAD_BYTES) return false;
 
+  portENTER_CRITICAL(&bleReliableMux);
   const uint32_t blockSequence = bleReliableNextBlockSequence;
   ReliableBleBlock &slot = bleReliableRing[blockSequence % BLE_RELIABLE_RING_BLOCKS];
   if (slot.valid) {
@@ -1700,6 +1714,7 @@ bool storeReliableBlock(
     // keeps a contiguous block sequence; its ADS sample sequence still exposes
     // the exact lost samples to the GUI.
     bleReliableOverflowBlocks++;
+    portEXIT_CRITICAL(&bleReliableMux);
     return false;
   }
   bleReliableNextBlockSequence++;
@@ -1715,6 +1730,7 @@ bool storeReliableBlock(
   memcpy(slot.payload, payload, payloadLength);
   slot.valid = true;
   bleReliableStoredBlocks++;
+  portEXIT_CRITICAL(&bleReliableMux);
   return true;
 }
 
@@ -1778,6 +1794,17 @@ bool sendReliableBlock(ReliableBleBlock &block, bool retransmission) {
   return true;
 }
 
+void markReliableBlockSent(const ReliableBleBlock &snapshot) {
+  portENTER_CRITICAL(&bleReliableMux);
+  ReliableBleBlock *block = findReliableBlock(snapshot.blockSequence);
+  if (block) {
+    block->sent = snapshot.sent;
+    block->retries = snapshot.retries;
+    block->lastSentMs = snapshot.lastSentMs;
+  }
+  portEXIT_CRITICAL(&bleReliableMux);
+}
+
 void releaseAckedBlocks(uint32_t highestContiguousBlock) {
   if (bleReliableNextBlockSequence == 0) return;
   const uint32_t newestProduced = bleReliableNextBlockSequence - 1u;
@@ -1789,6 +1816,7 @@ void releaseAckedBlocks(uint32_t highestContiguousBlock) {
     return;
   }
 
+  portENTER_CRITICAL(&bleReliableMux);
   updateReliableAckTiming();
   for (uint16_t i = 0; i < BLE_RELIABLE_RING_BLOCKS; ++i) {
     ReliableBleBlock &slot = bleReliableRing[i];
@@ -1818,6 +1846,7 @@ void releaseAckedBlocks(uint32_t highestContiguousBlock) {
     }
   }
   bleReliableAckCount++;
+  portEXIT_CRITICAL(&bleReliableMux);
 }
 
 void handleReliableControl(const ReliableControlCommand &command) {
@@ -1902,11 +1931,17 @@ void serviceReliableBleTx() {
   if ((now - bleReliableLastTxMs) < txPaceMs) return;
 
   // Explicit receiver repair requests always win over new data.
-  if (bleReliableNackPending) {
-    const uint32_t requested = bleReliableNackFirst;
-    ReliableBleBlock *block = findReliableBlock(requested);
-    if (block) {
-      sendReliableBlock(*block, true);
+  bool nackPending = false;
+  uint32_t requested = 0;
+  portENTER_CRITICAL(&bleReliableMux);
+  nackPending = bleReliableNackPending;
+  requested = bleReliableNackFirst;
+  portEXIT_CRITICAL(&bleReliableMux);
+  if (nackPending) {
+    ReliableBleBlock snapshot = {};
+    if (copyReliableBlock(requested, snapshot)) {
+      if (!sendReliableBlock(snapshot, true)) return;
+      markReliableBlockSent(snapshot);
     } else {
       // Re-check at transmit time because an ACK may have released the block
       // after the NACK was queued. Only an unacked, already-produced block that
@@ -1921,38 +1956,45 @@ void serviceReliableBleTx() {
         bleReliableStaleControlCount++;
       } else {
         bleReliableUnknownNacks++;
-        if (sendReliableGapMarker(requested)) bleReliableLastTxMs = millis();
+        if (!sendReliableGapMarker(requested)) return;
+        bleReliableLastTxMs = millis();
       }
     }
-    if (requested == bleReliableNackLast) {
-      bleReliableNackPending = false;
-    } else {
-      bleReliableNackFirst = requested + 1u;
+    portENTER_CRITICAL(&bleReliableMux);
+    if (bleReliableNackPending && bleReliableNackFirst == requested) {
+      if (requested == bleReliableNackLast) {
+        bleReliableNackPending = false;
+      } else {
+        bleReliableNackFirst = requested + 1u;
+      }
     }
+    portEXIT_CRITICAL(&bleReliableMux);
     return;
   }
 
   if (bleReliableNextBlockSequence == 0) return;
 
   // If the cumulative ACK was lost, retry the oldest unacknowledged block.
-  ReliableBleBlock *oldestTimedOut = nullptr;
+  ReliableBleBlock oldestTimedOut = {};
+  bool hasOldestTimedOut = false;
   const uint32_t firstUnacked = reliableFirstUnackedSequence();
   for (uint32_t seq = firstUnacked;
        reliableSeqLessOrEqual(seq, bleReliableNextBlockSequence - (bleReliableNextBlockSequence ? 1u : 0u));
        ++seq) {
-    ReliableBleBlock *candidate = findReliableBlock(seq);
-    if (!candidate || !candidate->sent) continue;
+    ReliableBleBlock candidate = {};
+    if (!copyReliableBlock(seq, candidate) || !candidate.sent) continue;
     const uint32_t noAckAge = bleReliableLastAckRxMs == 0u
-      ? (now - candidate->lastSentMs)
+      ? (now - candidate.lastSentMs)
       : (now - bleReliableLastAckRxMs);
-    if ((now - candidate->lastSentMs) >= bleReliableAdaptiveRetryTimeoutMs &&
+    if ((now - candidate.lastSentMs) >= bleReliableAdaptiveRetryTimeoutMs &&
         noAckAge >= bleReliableAdaptiveRetryTimeoutMs) {
       oldestTimedOut = candidate;
+      hasOldestTimedOut = true;
       break;
     }
   }
-  if (oldestTimedOut) {
-    sendReliableBlock(*oldestTimedOut, true);
+  if (hasOldestTimedOut) {
+    if (sendReliableBlock(oldestTimedOut, true)) markReliableBlockSent(oldestTimedOut);
     return;
   }
 
@@ -1961,10 +2003,16 @@ void serviceReliableBleTx() {
   while (reliableSeqLessOrEqual(bleReliableNextNewTxSequence, windowLast) &&
          reliableSeqLessOrEqual(bleReliableNextNewTxSequence,
            bleReliableNextBlockSequence - (bleReliableNextBlockSequence ? 1u : 0u))) {
-    const uint32_t seq = bleReliableNextNewTxSequence++;
-    ReliableBleBlock *block = findReliableBlock(seq);
-    if (!block || block->sent) continue;
-    sendReliableBlock(*block, false);
+    const uint32_t seq = bleReliableNextNewTxSequence;
+    ReliableBleBlock snapshot = {};
+    if (!copyReliableBlock(seq, snapshot)) return;
+    if (snapshot.sent) {
+      bleReliableNextNewTxSequence++;
+      continue;
+    }
+    if (!sendReliableBlock(snapshot, false)) return;
+    markReliableBlockSent(snapshot);
+    bleReliableNextNewTxSequence++;
     return;
   }
 }

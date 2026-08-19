@@ -643,22 +643,30 @@ class LocalStreamServer:
             except RuntimeError:
                 return
 
-    def accept_marker(self, request: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(request, dict):
-            raise ValueError("marker request must be an object")
+    def add_marker(
+        self,
+        code: str,
+        value: Any = None,
+        *,
+        timestamp: float | None = None,
+        sequence: int | None = None,
+        duration: float = 0.0,
+        description: str = "",
+        event_id: str | None = None,
+    ) -> MarkerEvent:
         with self._recording_lock:
             if not self._recording_active or self._recording_id is None:
                 raise RuntimeError("not_recording")
             marker = MarkerEvent(
-                event_id=request.get("event_id") or uuid.uuid4().hex,
+                event_id=event_id or uuid.uuid4().hex,
                 session_id=self.session_id,
                 recording_id=self._recording_id,
-                code=request.get("code"),
-                value=request.get("value"),
-                timestamp=request.get("timestamp", time.time()),
-                sequence=request.get("sequence"),
-                duration=request.get("duration", 0.0),
-                description=request.get("description", ""),
+                code=code,
+                value=value,
+                timestamp=time.time() if timestamp is None else timestamp,
+                sequence=sequence,
+                duration=duration,
+                description=description,
             )
             self._markers.append(marker)
 
@@ -666,7 +674,20 @@ class LocalStreamServer:
             subscribers = tuple(self._subscribers)
         packet = _WirePacket(marker.to_message(), None, 0, "marker")
         self._enqueue_packet(subscribers, packet)
-        return marker.to_dict()
+        return marker
+
+    def accept_marker(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request, dict):
+            raise ValueError("marker request must be an object")
+        return self.add_marker(
+            request.get("code"),
+            request.get("value"),
+            timestamp=request.get("timestamp"),
+            sequence=request.get("sequence"),
+            duration=request.get("duration", 0.0),
+            description=request.get("description", ""),
+            event_id=request.get("event_id"),
+        ).to_dict()
 
     def _control_response(
         self,

@@ -386,6 +386,20 @@ def sequence_gap_size(previous_sequence: Optional[int], current_sequence: int) -
     return int(delta - 1) if 1 < delta < 1_000_000 else 0
 
 
+def reliable_missing_prefix(expected: int, pending_keys, max_span: int):
+    """Return only the missing prefix before the first block already buffered."""
+    pending = sorted(int(key) for key in pending_keys)
+    if not pending or pending[0] <= int(expected):
+        return None
+    return int(expected), min(pending[0] - 1, int(expected) + int(max_span))
+
+
+def saturation_percent(saturated_samples: int, eligible_samples: int) -> float:
+    if eligible_samples <= 0:
+        return 0.0
+    return 100.0 * int(saturated_samples) / int(eligible_samples)
+
+
 def expand_frames_to_timeline(
     frames: List[Frame],
     previous_sequence: Optional[int],
@@ -631,6 +645,46 @@ class RingBuffer:
             return self.data[:, idx].copy(), self.valid[idx].copy(), self.seq[idx].copy(), self.mode[idx].copy()
         idxs = np.r_[np.arange(start, self.capacity), np.arange(0, self.head)]
         return self.data[:, idxs].copy(), self.valid[idxs].copy(), self.seq[idxs].copy(), self.mode[idxs].copy()
+
+
+class SoftTriggerWindow(QtWidgets.QWidget):
+    def __init__(self, send_trigger, parent=None):
+        super().__init__(parent, QtCore.Qt.Window)
+        self._send_trigger = send_trigger
+        self.setWindowTitle("软 Trigger")
+        self.setFixedWidth(300)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.trigger_spin = QtWidgets.QSpinBox()
+        self.trigger_spin.setRange(1, 255)
+        self.trigger_spin.setValue(1)
+        self.trigger_spin.setKeyboardTracking(False)
+        form.addRow("Trigger 编号", self.trigger_spin)
+        layout.addLayout(form)
+
+        self.send_button = QtWidgets.QPushButton("发送")
+        self.send_button.clicked.connect(self.send_current_trigger)
+        layout.addWidget(self.send_button)
+
+        self.result_label = QtWidgets.QLabel("等待发送")
+        self.result_label.setWordWrap(True)
+        layout.addWidget(self.result_label)
+
+        self.space_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Space), self)
+        self.space_shortcut.setContext(QtCore.Qt.WindowShortcut)
+        self.space_shortcut.setAutoRepeat(False)
+        self.space_shortcut.activated.connect(self.send_current_trigger)
+
+    def send_current_trigger(self):
+        number = int(self.trigger_spin.value())
+        try:
+            marker = self._send_trigger(number)
+            sequence = "---" if marker.sequence is None else str(marker.sequence)
+            self.result_label.setText(f"已发送 Trigger {number} · Seq {sequence}")
+        except Exception as exc:
+            self.result_label.setText(str(exc))
+            APP_LOGGER.warning("GUI soft trigger failed: %s", exc)
 
 
 class ClockAxisItem(pg.AxisItem):
@@ -1186,6 +1240,8 @@ class AsyncRawWriter:
 
     def start_session(self, folder: str, configuration: Optional[dict] = None):
         self.stop(timeout=2.0)
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("上一次分包 BIN 写盘线程未退出，不能开始新的记录会话")
         target = Path(folder)
         target.mkdir(parents=True, exist_ok=True)
         now = datetime.now()
@@ -1760,7 +1816,7 @@ class BleTransportWorker(QtCore.QThread):
                 # even though no data was actually lost.
                 packet_to_send = bytes(packet)
                 if (
-                    kind in ("ack", "nack")
+                    kind in ("ack", "ack_keepalive", "nack")
                     and len(packet_to_send) == BLE_CTRL_PACKET_BYTES
                     and packet_to_send[:2] == BLE_CTRL_MAGIC
                     and packet_to_send[2] == BLE_CTRL_VERSION
@@ -1791,7 +1847,7 @@ class BleTransportWorker(QtCore.QThread):
                                 packet_to_send = self._make_reliable_control_packet(
                                     BLE_CTRL_NACK_RANGE, current_session, seq_a, seq_b
                                 )
-                        else:
+                        elif kind == "ack":
                             ack_seq = int(seq_a)
                             last_wire = int(self._reliable_last_ack_wire)
                             if last_wire != 0xFFFFFFFF and ack_seq <= last_wire:
@@ -1804,10 +1860,10 @@ class BleTransportWorker(QtCore.QThread):
                 # later cumulative ACKs. RESET remains write-with-response.
                 await client.write_gatt_char(
                     BLE_CONTROL_UUID, packet_to_send,
-                    response=(kind not in ("ack", "nack"))
+                    response=(kind not in ("ack", "ack_keepalive", "nack"))
                 )
             with self._reliable_lock:
-                if kind == "ack":
+                if kind in ("ack", "ack_keepalive"):
                     self._reliable_ack_sent += 1
                     if len(packet_to_send) >= 12:
                         self._reliable_last_ack_wire = struct.unpack_from("<I", packet_to_send, 8)[0]
@@ -2109,6 +2165,7 @@ class BleTransportWorker(QtCore.QThread):
                     self._reliable_last_ack_sent = 0xFFFFFFFF
                     self._reliable_last_ack_time = 0.0
                     self._reliable_last_nack = None
+                    self._reliable_last_ack_wire = 0xFFFFFFFF
                     self._reliable_gap_sequence = None
                     self._reliable_gap_first_seen = 0.0
                     self._reliable_accept_any_session = False
@@ -2148,7 +2205,14 @@ class BleTransportWorker(QtCore.QThread):
                     self._reliable_gap_sequence = expected
                     self._reliable_gap_first_seen = time.monotonic()
                 first_missing = expected
-                last_missing = min(block_seq - 1, expected + 255)
+                missing_prefix = reliable_missing_prefix(
+                    expected,
+                    self._reliable_pending,
+                    255,
+                )
+                if missing_prefix is None:
+                    continue
+                _, last_missing = missing_prefix
                 now = time.monotonic()
                 last_nack = self._reliable_last_nack
                 should_send_nack = (
@@ -2157,11 +2221,6 @@ class BleTransportWorker(QtCore.QThread):
                     or (now - last_nack[2]) >= self.adaptive_timing()["nack_repeat_s"]
                 )
                 if should_send_nack:
-                    # The first out-of-order block already defines the complete
-                    # missing prefix. Later blocks behind the same hole must not
-                    # generate one extra GATT write each.
-                    if last_nack is not None and last_nack[0] == first_missing:
-                        last_missing = last_nack[1]
                     control_packets.append((
                         self._make_reliable_control_packet(
                             BLE_CTRL_NACK_RANGE,
@@ -2273,7 +2332,10 @@ class BleTransportWorker(QtCore.QThread):
                             self._reliable_gap_first_seen = now
                         age = max(0.0, now - self._reliable_gap_first_seen)
                         first_available = int(pending_keys[0])
-                        last_pending = min(pending_keys[-1] - 1, expected + 63)
+                        missing_prefix = reliable_missing_prefix(expected, pending_keys, 63)
+                        if missing_prefix is None:
+                            continue
+                        _, last_pending = missing_prefix
                         last_nack = self._reliable_last_nack
                         if (
                             last_nack is None
@@ -2332,6 +2394,24 @@ class BleTransportWorker(QtCore.QThread):
                             self._reliable_last_ack_time = now
                             self._reliable_last_nack = None
                             self._reliable_last_delivery_monotonic = now
+
+                    elif (
+                        self._reliable_session_id is not None
+                        and expected > 0
+                        and (now - self._reliable_last_ack_time)
+                        >= self.adaptive_timing()["ack_interval_s"]
+                    ):
+                        highest = expected - 1
+                        controls.append((
+                            self._make_reliable_control_packet(
+                                BLE_CTRL_ACK,
+                                self._reliable_session_id,
+                                highest,
+                            ),
+                            "ack_keepalive",
+                        ))
+                        self._reliable_last_ack_sent = highest
+                        self._reliable_last_ack_time = now
 
                     # V18 deliberately does not call client.disconnect() merely
                     # because DATA is temporarily quiet. Real disconnections still
@@ -2637,6 +2717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_batches_applied = 0
         self.filter_stale_batches = 0
         self.stream_server: Optional[LocalStreamServer] = None
+        self.soft_trigger_window: Optional[SoftTriggerWindow] = None
         self.api_gui_request.connect(self._handle_api_gui_request)
         self.stream_api_errors = 0
         self.ser: Optional[serial.Serial] = None
@@ -2706,6 +2787,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backlog_events = 0
         self.queue_drop_hints = 0
         self.saturation_samples = 0
+        self.saturation_eligible_samples = 0
         self.saturation_channel_samples = np.zeros(CHANNELS, dtype=np.int64)
         self.last_visible_saturated_channels: Tuple[int, ...] = tuple()
         self.last_seq: Optional[int] = None
@@ -3095,6 +3177,7 @@ class MainWindow(QtWidgets.QMainWindow):
         acquire_menu.addAction(
             "停止采集", lambda: self.stop_stream(offer_export=True)
         )
+        acquire_menu.addAction("打开软 Trigger", self.show_soft_trigger_window)
 
         toolbar = self.addToolBar("EEG 工具")
         toolbar.setMovable(False)
@@ -3132,6 +3215,9 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(self.logo_label)
         toolbar.addSeparator()
         toolbar.addAction(open_action)
+        trigger_action = toolbar.addAction("软 Trigger")
+        trigger_action.setToolTip("打开独立软 Trigger 窗口")
+        trigger_action.triggered.connect(self.show_soft_trigger_window)
         export_file_button = QtWidgets.QToolButton()
         export_file_button.setText("导出文件…")
         export_file_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
@@ -4290,9 +4376,30 @@ class MainWindow(QtWidgets.QMainWindow):
             fif_dir.mkdir(parents=True, exist_ok=True)
             stem = source.stem
             written = []
+            markers = tuple()
+            recording_started_at = None
+            first_sequence = None
+            recording_state = None
+            if source_path and self.stream_server is not None:
+                state = self.stream_server.recording_snapshot()
+                if state.get("recording_id") == self.recording_session_id:
+                    recording_state = state
+                    markers = tuple(state.get("markers", ()))
+                    recording_started_at = state.get("recording_started_at")
+                    first_sequence = state.get("first_sequence")
             if "BDF" in choice:
                 bdf_path = bdf_dir / f"{stem}.bdf"
-                self.save_bdf(bdf_path)
+                if recording_state is not None:
+                    self.export_recording_bdf(
+                        bdf_path,
+                        markers,
+                        recording_id=self.recording_session_id,
+                        recording_started_at=recording_started_at,
+                        first_sequence=first_sequence,
+                        overwrite=True,
+                    )
+                else:
+                    self.save_bdf(bdf_path)
                 written.append(bdf_path)
             if "FIF" in choice:
                 fif_path = fif_dir / f"{stem}_raw.fif"
@@ -4308,70 +4415,28 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "导出 BDF/FIF 失败", str(exc))
 
-    def save_bdf(self, path: Path):
+    def save_bdf(
+        self,
+        path: Path,
+        *,
+        markers: tuple[MarkerEvent, ...] = tuple(),
+        recording_started_at: float | None = None,
+        first_sequence: int | None = None,
+    ):
         """Write the unfiltered input-referred signal as 24-bit BDF+."""
         if self.offline_uv is None:
             raise RuntimeError("没有可导出的采样数据。")
-        try:
-            import pyedflib
-        except ImportError as exc:
-            raise RuntimeError(
-                "缺少 BDF 依赖 pyedflib，请运行：py -3 -m pip install pyedflib"
-            ) from exc
-
-        path = Path(path)
         data = np.asarray(self.offline_uv, dtype=np.float64)
-        writer = pyedflib.EdfWriter(
-            str(path),
-            CHANNELS,
-            file_type=pyedflib.FILETYPE_BDFPLUS,
+        valid = np.asarray(self.offline_valid, dtype=bool)
+        self._write_bdf_data(
+            Path(path),
+            data,
+            valid,
+            markers=markers,
+            recording_started_at=recording_started_at,
+            first_sequence=first_sequence,
+            overwrite=True,
         )
-        try:
-            headers = []
-            for ch in range(CHANNELS):
-                finite = data[ch][np.isfinite(data[ch])]
-                peak = float(np.max(np.abs(finite))) if finite.size else 1.0
-                physical_peak = max(100, int(np.ceil(peak * 1.1)))
-                headers.append({
-                    "label": self.channel_names[ch],
-                    "dimension": "uV",
-                    "sample_frequency": FS,
-                    "physical_min": -physical_peak,
-                    "physical_max": physical_peak,
-                    "digital_min": -8388608,
-                    "digital_max": 8388607,
-                    "transducer": "ADS1299",
-                    "prefilter": "Raw, unfiltered",
-                })
-            writer.setSignalHeaders(headers)
-            writer.setPatientCode("")
-            writer.setEquipment("ADS1299")
-            writer.writeSamples([
-                np.nan_to_num(data[ch], nan=0.0, posinf=0.0, neginf=0.0)
-                for ch in range(CHANNELS)
-            ])
-            remainder = data.shape[1] % FS
-            if remainder:
-                writer.writeAnnotation(
-                    float(data.shape[1]) / FS,
-                    float(FS - remainder) / FS,
-                    "BDF_padding",
-                )
-
-            valid = np.asarray(self.offline_valid, dtype=bool)
-            if valid.size == data.shape[1] and not valid.all():
-                padded = np.r_[False, ~valid, False].astype(np.int8)
-                edges = np.diff(padded)
-                starts = np.flatnonzero(edges == 1)
-                ends = np.flatnonzero(edges == -1)
-                for start, end in zip(starts, ends):
-                    writer.writeAnnotation(
-                        float(start) / FS,
-                        float(end - start) / FS,
-                        "BAD_frame",
-                    )
-        finally:
-            writer.close()
 
     def _write_bdf_data(
         self,
@@ -4662,6 +4727,30 @@ class MainWindow(QtWidgets.QMainWindow):
             APP_LOGGER.info("status: %s", text)
             self._last_logged_status = text
 
+    def send_soft_trigger(self, number: int) -> MarkerEvent:
+        number = int(number)
+        if not 1 <= number <= 255:
+            raise ValueError("Trigger 编号必须在 1-255 之间")
+        if not self.streaming:
+            raise RuntimeError("请先开始采集，再发送软 Trigger")
+        if self.stream_server is None:
+            raise RuntimeError("本地 marker 服务不可用")
+        marker = self.stream_server.add_marker(
+            "soft_trigger",
+            number,
+            sequence=self.last_seq,
+            description=f"GUI Trigger {number}",
+        )
+        self.set_status(f"已发送软 Trigger {number}，Seq={marker.sequence if marker.sequence is not None else '---'}")
+        return marker
+
+    def show_soft_trigger_window(self):
+        if self.soft_trigger_window is None:
+            self.soft_trigger_window = SoftTriggerWindow(self.send_soft_trigger, self)
+        self.soft_trigger_window.show()
+        self.soft_trigger_window.raise_()
+        self.soft_trigger_window.activateWindow()
+
     def open_log_directory(self):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         APP_LOGGER.info("opening log directory: %s", LOG_DIR)
@@ -4892,7 +4981,21 @@ class MainWindow(QtWidgets.QMainWindow):
         snapshot = decode_config_snapshot(
             self.ble_worker.request_blocking(MSG_SET_CONFIG, payload, timeout=4.0)
         )
-        if not snapshot.verified or snapshot.enabled_mask != enabled_mask:
+        gain_codes = {1: 0, 2: 1, 4: 2, 6: 3, 8: 4, 12: 5, 24: 6}
+        active_mux = 1 if self.current_mode == 3 else 5 if self.current_mode == 4 else 0
+        expected_bias_mask = bias_mask if self.current_mode in (0, 1) else 0
+        expected_registers = tuple(
+            (active_mux if self.channel_enabled[ch] else 0x81)
+            | (gain_codes[int(self.channel_gains[ch])] << 4)
+            for ch in range(CHANNELS)
+        )
+        if (
+            not snapshot.verified
+            or snapshot.enabled_mask != enabled_mask
+            or snapshot.bias_p != expected_bias_mask
+            or int(snapshot.mode) != int(self.current_mode)
+            or tuple(snapshot.channel_registers) != expected_registers
+        ):
             raise RuntimeError("ADS1299 配置读回不一致")
         self.ble_worker.config_snapshot = snapshot
         return {
@@ -4918,8 +5021,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.channel_bias[ch] = bool(snapshot.bias_p & (1 << ch))
             self.channel_srb2[ch] = False
         self.current_mode = int(snapshot.mode)
+        if len(set(int(value) for value in self.channel_gains)) == 1:
+            self.gain = int(self.channel_gains[0])
+        self.lsb_uv = self.calc_lsb_uv()
         self.set_reference_mode_local(REFERENCE_SRB1)
         self.set_bias_checks(int(snapshot.bias_p))
+
+    def resync_ble_configuration(self) -> bool:
+        if self.ble_worker is None:
+            return False
+        try:
+            snapshot = decode_config_snapshot(
+                self.ble_worker.request_blocking(MSG_GET_CONFIG, b"", timeout=3.0)
+            )
+            if not snapshot.verified:
+                return False
+            self.ble_worker.config_snapshot = snapshot
+            self.apply_ble_config_snapshot(snapshot)
+            self.refresh_channel_parameter_labels()
+            if hasattr(self, "mode_combo"):
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.setCurrentIndex(self._mode_index_from_code(self.current_mode))
+                self.mode_combo.blockSignals(False)
+            if hasattr(self, "pga_combo") and len(set(int(value) for value in self.channel_gains)) == 1:
+                self.pga_combo.blockSignals(True)
+                self.pga_combo.setCurrentText(str(self.gain))
+                self.pga_combo.blockSignals(False)
+            return True
+        except Exception:
+            return False
 
     def on_ble_connected(self, name: str, address: str, mtu: int, reconnected: bool):
         self.transport_connecting = False
@@ -6083,6 +6213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backlog_events = 0
         self.queue_drop_hints = 0
         self.saturation_samples = 0
+        self.saturation_eligible_samples = 0
         self.saturation_channel_samples = np.zeros(CHANNELS, dtype=np.int64)
         self.last_visible_saturated_channels: Tuple[int, ...] = tuple()
         self.last_seq = None
@@ -6233,7 +6364,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if QtWidgets.QMessageBox.question(
                 self,
                 "采集完成",
-                "分包 BIN 已保存。是否转换第一个一分钟文件为 BDF 或 MNE FIF？",
+                "分包 BIN 已保存。是否导出本次记录的 BDF，或转换第一段 MNE FIF？",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No,
             ) == QtWidgets.QMessageBox.Yes:
@@ -6311,13 +6442,19 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = int(np.clip(idx, 0, len(MODE_ITEMS) - 1))
         name, cmd, expected = MODE_ITEMS[idx]
         was_streaming = self.streaming
+        old_mode = int(self.current_mode)
         try:
             self.transport_write(b"s")
             self.streaming = False
             time.sleep(0.08)
-            self.transport_reset_input_buffer()
+            if self.active_transport == "serial":
+                self.transport_reset_input_buffer()
             self.parser.reset()
-            self.transport_write(cmd)
+            if self.active_transport == "ble":
+                self.current_mode = expected
+                self._ble_write_bulk_config(REFERENCE_SRB1)
+            else:
+                self.transport_write(cmd)
             if cmd in (b"q", b"t"):
                 # Diagnostic modes should show the unfiltered ADC behavior.
                 self.filter_check.setChecked(False)
@@ -6331,7 +6468,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fs_est = np.nan
             self.current_mode = expected
             time.sleep(0.35)
-            self.transport_reset_input_buffer()
+            if self.active_transport == "serial":
+                self.transport_reset_input_buffer()
             if was_streaming:
                 self.transport_write(b"b")
                 self.streaming = True
@@ -6340,6 +6478,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_status(f"模式已切换：{name}")
             return True
         except Exception as exc:
+            if self.active_transport != "ble" or not self.resync_ble_configuration():
+                self.current_mode = old_mode
             self.streaming = False
             self._sync_internal_short_button(self.current_mode == 3)
             QtWidgets.QMessageBox.critical(self, "模式切换失败", str(exc))
@@ -6373,32 +6513,48 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if new_gain not in VALID_GAINS:
             return
-        self.gain = new_gain
-        self.channel_gains[:] = new_gain
-        self.lsb_uv = self.calc_lsb_uv()
-        self.refresh_channel_parameter_labels()
         if self.transport_connected() and self.offline_uv is None:
             was_streaming = bool(self.streaming)
+            old_gain = int(self.gain)
+            old_channel_gains = self.channel_gains.copy()
             try:
                 if was_streaming:
                     self.transport_write(b"s")
                     self.streaming = False
                     time.sleep(0.08)
-                self.transport_reset_input_buffer()
-                self.transport_write(str(new_gain).encode("ascii"))
-                time.sleep(0.08)
-                self.transport_reset_input_buffer()
+                if self.active_transport == "serial":
+                    self.transport_reset_input_buffer()
+                self.gain = new_gain
+                self.channel_gains[:] = new_gain
+                if self.active_transport == "ble":
+                    self._ble_write_bulk_config(REFERENCE_SRB1)
+                else:
+                    self.transport_write(str(new_gain).encode("ascii"))
+                    time.sleep(0.08)
+                if self.active_transport == "serial":
+                    self.transport_reset_input_buffer()
                 if was_streaming:
                     self.transport_write(b"b")
                     self.streaming = True
                 self.ring.clear()
                 self.reset_processing_state()
                 self.last_seq = None
+                self.lsb_uv = self.calc_lsb_uv()
+                self.refresh_channel_parameter_labels()
                 self.set_status(f"已发送 PGA={new_gain}；显示 LSB 同步为 {self.lsb_uv:.6g} uV/code。")
             except Exception as exc:
+                if self.active_transport != "ble" or not self.resync_ble_configuration():
+                    self.gain = old_gain
+                    self.channel_gains[:] = old_channel_gains
+                self.lsb_uv = self.calc_lsb_uv()
+                self.refresh_channel_parameter_labels()
                 self.streaming = False
                 self.set_status(f"PGA 指令发送失败：{exc}")
         else:
+            self.gain = new_gain
+            self.channel_gains[:] = new_gain
+            self.lsb_uv = self.calc_lsb_uv()
+            self.refresh_channel_parameter_labels()
             self.set_status(f"仅修改本地解码 PGA={new_gain}，LSB={self.lsb_uv:.6g} uV/code。")
 
     def _ble_pending_bytes(self) -> int:
@@ -6632,6 +6788,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             enabled_saturated = frame_saturated & self.channel_enabled
             self.saturation_samples += int(np.sum(enabled_saturated))
+            self.saturation_eligible_samples += int(np.count_nonzero(self.channel_enabled))
             self.saturation_channel_samples += enabled_saturated.astype(np.int64)
             self.current_mode = fr.mode
             if fr.mode in (0, 1, 2):
@@ -7740,7 +7897,10 @@ class MainWindow(QtWidgets.QMainWindow):
         raw_pp = f"{self.latest_raw_pp:.2f} uV" if np.isfinite(self.latest_raw_pp) else "---"
         line_ratio = f"{self.latest_line_ratio:.3f}" if np.isfinite(self.latest_line_ratio) else "---"
         valid_ratio = f"{100*self.latest_valid_ratio:.2f}%" if np.isfinite(self.latest_valid_ratio) else "---"
-        saturation = 100 * self.saturation_samples / max(1, self.packet_count * 5)
+        saturation = saturation_percent(
+            self.saturation_samples,
+            self.saturation_eligible_samples,
+        )
         mode = MODE_NAMES.get(self.current_mode, "UNKNOWN")
         verdict = self.make_verdict(saturation)
         raw_path = self.raw_path if self.raw_path else "---"

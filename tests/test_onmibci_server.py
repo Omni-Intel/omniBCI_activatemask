@@ -11,6 +11,29 @@ from onmibci_stream import LocalStreamServer, StreamBatch, _Subscriber, _WirePac
 
 
 class LocalStreamServerTests(unittest.TestCase):
+    def test_in_process_marker_uses_active_recording_store(self):
+        server = LocalStreamServer(port=0, session_id="api-1")
+        server.begin_recording("rec-1", started_at=100.0)
+
+        marker = server.add_marker(
+            "soft_trigger",
+            12,
+            timestamp=100.5,
+            sequence=125,
+            description="GUI soft trigger",
+        )
+
+        self.assertEqual(marker.code, "soft_trigger")
+        self.assertEqual(marker.value, 12)
+        self.assertEqual(marker.sequence, 125)
+        self.assertEqual(server.marker_snapshot(), (marker,))
+
+    def test_in_process_marker_rejects_when_not_recording(self):
+        server = LocalStreamServer(port=0)
+
+        with self.assertRaisesRegex(RuntimeError, "not_recording"):
+            server.add_marker("soft_trigger", 1)
+
     @staticmethod
     def make_batch(stream, generation=None, session_id="s1"):
         return StreamBatch.from_gui_matrix(
