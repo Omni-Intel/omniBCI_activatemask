@@ -3843,8 +3843,10 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if hasattr(self, "channel_plots"):
                 self.channel_plots[ch].setLabel("left", name, units="uV")
-            self.channel_combo.setItemText(ch, name)
-            self.single_channel_combo.setItemText(ch, name)
+            if hasattr(self, "channel_combo"):
+                self.channel_combo.setItemText(ch, name)
+            if hasattr(self, "single_channel_combo"):
+                self.single_channel_combo.setItemText(ch, name)
 
     def validated_channel_name(self, ch, name):
         name = str(name).strip()
