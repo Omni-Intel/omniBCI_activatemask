@@ -2,9 +2,9 @@
 
 ## 项目概览
 
-OmniBCI 是面向 ADS1299 的原生 Python EEG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。
+OmniBCI 是面向 ADS1299 的原生 Python EEG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线只支持 **SRB1-only 固件 V19 / 设备控制协议 V1**。
 
-V18 主要解决长时间 BLE 采集中的连续性问题：当 Windows/BLE 通知链路发生数秒暂停时，固件的采集/打包路径不再被 BLE DATA notify 阻塞。
+V19 延续并加固了长时间 BLE 连续性设计：当 Windows/BLE 通知链路出现抖动或拥塞时，固件的采集/打包路径不会被 BLE DATA notify 拖死，未成功提交的数据块也不会被误标为已发送。
 
 关键数据路径为：
 
@@ -15,6 +15,44 @@ ADS DRDY/read -> frameQueue -> reliable retention ring -> BLE DATA notify
 其中前三段由高优先级采集/打包任务负责，BLE 通知由独立的低优先级任务负责。可靠保留环可保存 384 个六帧块，在 250 SPS 下约为 9.2 秒。
 
 GUI 同时使用固件完整的 32 位 `queue_drop` 计数器进行丢帧归因，避免 8 位帧内提示在大规模突发丢帧时回绕而导致误判。
+
+## 当前实现状态
+
+### 已完成功能
+
+- **采集与硬件控制**：USB 串口与 BLE 采集、V19/V1 版本握手、ADS1299 完整寄存器快照、通道开关/PGA/BIAS、内部短接、内部测试和电极阻抗检测。
+- **SRB1-only**：GUI 与固件均移除 SRB2 切换入口；测量电极接 INxP，公共参考接 SRB1。
+- **BLE 可靠传输**：六帧 compact block、384 块保留环、累计 ACK/NACK 修复、旧控制抑制、拥塞退避重试、512 帧采集队列和可分离 MCU/主机丢帧的 STATUS V5 诊断。
+- **实时显示**：8 通道波形、自定义通道名、单通道视图、`A - B` 派生差分波形与 PSD、实时滤波、陷波、Welch PSD、阿尔法峰和信号质量指标。差分仅影响显示/分析，不篡改原始记录。
+- **录制与导出**：每次采集写入一个连续 BIN，同时生成 manifest/sidecar 元数据；防止重复点击“开始”覆盖当前会话；支持 CSV、BDF+、FIF/MNE 导出和 BDF+ Annotation 事件标记。
+- **本地数据 API**：`127.0.0.1:8765` WebSocket raw/filtered 数据流、Python SDK、客户端慢消费 `GapEvent`、实时 marker 和远程停止/导出。
+- **日志与自恢复**：异步 JSONL 事件日志、滚动应用日志、GUI 按钮操作关联、BLE/STATUS/性能快照、渲染卡顿记录、主线程 hang dump、显示缓冲自适应和绘图连续卡顿时暂停 PSD。
+
+### 2026-08-19 最新日志验证
+
+分析对象为本地事件日志 `gui_20260819_181238_38380.jsonl`（日志文件本身不入库）。其中 BLE 连续采集约 4 分 30 秒，记录 67,560 帧 / 3,242,880 字节，与 `67,560 × 48` 完全一致。
+
+| 指标 | 结果 | 判定 |
+| --- | ---: | --- |
+| ADS/主机序号缺口 | 0 | 未观察到波形缺口或真实掉包 |
+| 固件 `frameQueue drop` / `notify error` | 0 / 0 | 上一版的主要丢帧原因已消失 |
+| CRC / sync / decode error | 0 / 0 / 0 | 主机解码链正常 |
+| NACK / 重传 / forced skip | 0 / 0 / 0 | 本次不需要修复包或跳过缺块 |
+| reliable pending | 当前 0，峰值 1 | 可靠环无堆积 |
+| 固件 retained / flight | 通常 3–8 / 2–8 | 距离 384 块容量上限很远 |
+| missed DRDY / bad ADS STATUS | 0 / 0 | 采样时序和 SPI 帧对齐未观察到异常 |
+| 最大 ADS 读取耗时 | 2,390 µs | 低于 250 SPS 的 4,000 µs 帧周期 |
+| BLE Notify 长间隔 | p95 172 ms，最大 250 ms | Windows 批量交付仍存在，但无 >500 ms 事件且未造成丢帧 |
+| GUI 运行期绘制延迟 | 偶发 109–125 ms | 屏幕刷新仍有轻微抖动，接收和 BIN 写盘未受影响 |
+
+### 现有问题与风险
+
+1. **最终 V19 整合版仍需硬件回归**：上述日志验证了相同的 BLE/SPI 连续性修复，但产生日志的运行发生在最终 V19/V1 握手代码合并前。当前 V19 固件已编译、Python 已通过测试，但仍应重新烧录并进行至少 30 分钟、最好整夜的实机回归。
+2. **GUI 主线程仍有短暂停顿**：BLE 采集中记录到若干次 109–125 ms 绘制间隔；打开串口阶段有一次约 2.06 s 停顿，连接切换阶段有一次约 390 ms 停顿。这些暂未导致丢数据，但还可继续把串口打开/配置和更多绘图工作移出 Qt 主线程。
+3. **软件 SPI 时序余量有限**：当前最大读取耗时 2.39 ms，低于 4 ms 帧周期，但在更重的 BLE/中断负载下余量不大。若后续出现 `missed_drdy` 或 `late_drdy` 持续增长，下一步应改用 ESP32-C3 硬件 SPI。
+4. **存在 1 次未持续的 reliable protocol error**：该计数在一次 STATUS 中由 0 变为 1，之后未再增长，也没有引发 NACK、重传或数据缺口。暂按偶发/过时控制观察；如持续增长需记录原始 CONTROL 包类型和 CRC 失败位置。
+5. **Windows BLE 设备名不可作为唯一身份**：日志中广播名仍可显示为截断的 `OmniBCI-`，Windows 缓存也可能保留多个同名记录。应以 MAC 地址和连接后 V19/V1 GATT 握手为最终判定。
+6. **长时间稳定性尚未被这份日志证明**：4.5 分钟无丢包只能说明当前修复有效，不能替代 30 分钟、2 小时和整夜测试，也不能覆盖所有 Windows 蓝牙适配器。
 
 ## 安装与运行
 
@@ -177,7 +215,7 @@ IN1N～IN8N        -> 不作为外部公共参考使用
 - GUI 与固件均按当前启用通道掩码过滤 `BIAS_SENSP`。
 - `A7 CH GAIN FLAGS` 中 bit0 表示启用通道，bit1 表示加入 `BIAS_SENSP`，bit2 在本固件中忽略。
 
-烧录时在 Arduino IDE 中选择 ESP32-C3，启用 `USB CDC On Boot`，打开 `ESP32C3_ADS1299_SRB1_PONLY_REFERENCE.ino`；串口波特率为 921600。
+烧录时在 Arduino IDE 中选择 ESP32-C3，启用 `USB CDC On Boot`，打开 `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`；串口波特率为 921600。
 
 连接人体电极时必须使用电池供电和符合要求的电气隔离，不得让未隔离 USB 或市电设备形成到人体的导电通路。
 
@@ -253,9 +291,18 @@ dist\OmniBCI_V16\
 
 目标电脑启动 `OmniBCI_V16.exe`，不需要安装 Python 或依赖包。不能只复制 EXE，因为相邻 `_internal` 目录包含 Python 运行时、Qt 与科学计算库。记录文件写入可执行文件旁的 `recordings\`。
 
-当前构建资产仍沿用 `OmniBCI_V16` 命名，但其 GUI 数据路径属于 V16 起建立、并延续到 V18 的跨电脑架构；正式发布前建议统一构建产物与当前 V18 的版本命名。
+当前构建资产仍沿用 `OmniBCI_V16` 命名，但代码与配套固件已进入 V19；正式发布前应统一 EXE、spec、输出目录和用户文档的版本命名。
 
 ## 版本变更摘要
+
+### V19 — SRB1-only 握手、日志诊断与 BLE 掉包修复
+
+- 只保留 SRB1 固件，增加 V19/V1 HELLO、事务 ID、CRC 和完整 ADS1299 寄存器快照。
+- STATUS V5 扩展为 96 字节，保留 `config_generation` 并附加采集侧时序诊断。
+- ADS 软件 SPI 读取整帧期间不再长时间禁用中断，避免每 4 ms 饿死 BLE 协议栈。
+- BLE `notify` 拥塞失败不再误标已发送或推进块序号，改为有界退避与原块重试。
+- 采集队列增加到 512 帧；GUI 控制 ACK/NACK 合并，拦截重复开始录制。
+- 增加通道命名、`A - B` 差分显示/PSD、单 BIN 连续录制、JSONL 性能事件日志和卡顿自恢复。
 
 ### V18 — BLE 采集/发送隔离与 stale-NACK 热修复
 
@@ -293,14 +340,13 @@ dist\OmniBCI_V16\
 - 使用本地 `.venv`，把 `mne`/`pyedflib` 移为可选导出依赖。
 - 增加 PyInstaller 资源路径、spec、构建批处理及 GitHub Actions 构建流程。
 
-### V15 Split-BIN Fix
+### V15 录制链路（后续已改为单一连续 BIN）
 
 - 每次采集持续写入单个原始 BIN：`MMDD_HHMM_ID.bin`，避免分钟边界的新文件创建和杀毒扫描干扰。
 - GUI 每次启动会在 `logs/` 生成一个 JSONL 事件日志，关联按钮操作、固件状态、BLE Notify 长间隔、渲染卡顿、缓冲重同步和自动修复动作；日志由独立线程写入，不阻塞采集。
 - 可靠 BLE 控制采用单一合并队列，只保留最新累计 ACK/NACK；缺块修复窗口为 6 秒，并在每次新连接配置后清理旧可靠会话，避免慢速 Windows GATT 写入形成控制任务风暴和过早跳块。
-- 250 SPS 下每个完整分段为 720,000 字节 / 15,000 帧。
-- 每次会话生成 manifest，每个分段生成 sidecar metadata。
-- 分段、轮换、flush 与 JSON 元数据均在后台写盘线程中完成。
+- 每次会话生成 manifest 与 sidecar metadata。
+- BIN 写入、flush 与 JSON 元数据均在后台写盘线程中完成。
 
 ### V15 — 饱和稳定性修复（历史行为）
 
