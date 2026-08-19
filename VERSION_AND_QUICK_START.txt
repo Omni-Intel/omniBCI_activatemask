@@ -18,7 +18,7 @@ Main file:  ads1299_eeg_gui_native.py
 V19 firmware
 -------------
 SRB1:
-  firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
+  firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino
 
 Upload/diagnostic port on the current test PC: COM6
 
