@@ -62,6 +62,19 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Tuple
 
+from onmibci_ble_protocol import (
+    MSG_GET_CONFIG,
+    MSG_HELLO,
+    MSG_RESPONSE,
+    MSG_SET_CONFIG,
+    PROTOCOL_VERSION as BLE_DEVICE_PROTOCOL_VERSION,
+    ProtocolError,
+    decode_config_snapshot,
+    decode_packet,
+    encode_packet,
+    encode_set_config,
+)
+
 import numpy as np
 
 try:
@@ -156,14 +169,10 @@ TRANSPORT_NORMAL_BUDGET_S = 0.0025
 TRANSPORT_CATCHUP_BUDGET_S = 0.0050
 TRANSPORT_REPOLL_DELAY_MS = 2
 TRANSPORT_CATCHUP_THRESHOLD_BYTES = FRAME_BYTES * 10
-BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V3"
-BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2"
+BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V19"
 BLE_DEVICE_NAME_COMMON = "OmniBCI-C3-ADS1299"
 BLE_DEVICE_NAMES = (
     BLE_DEVICE_NAME_SRB1,
-    BLE_DEVICE_NAME_SRB2,
-    "OmniBCI-C3-SRB1-V11",
-    "OmniBCI-C3-SRB2-V11",
     BLE_DEVICE_NAME_COMMON,
 )
 # Fallback label only. Connection compatibility is verified from GATT UUIDs and
@@ -173,6 +182,8 @@ BLE_SERVICE_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0001"
 BLE_DATA_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0002"
 BLE_CONTROL_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0003"
 BLE_STATUS_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0004"
+BLE_RESPONSE_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0005"
+BLE_FIRMWARE_VERSION = 19
 BLE_BLOCK_MAGIC = b"\xB1\x4B"
 BLE_BLOCK_VERSION_V1 = 1
 BLE_BLOCK_VERSION_V2 = 2
@@ -298,10 +309,7 @@ LEAD_OFF_SERIES_SRB1_KOHM = 9.98
 LEAD_OFF_SERIES_SRB2_KOHM = 4.40
 REFERENCE_SRB1 = 0
 REFERENCE_SRB2 = 1
-REFERENCE_ITEMS = [
-    ("SRB2 公共参考（信号接 INxN）", REFERENCE_SRB2),
-    ("SRB1 全局参考（信号接 INxP）", REFERENCE_SRB1),
-]
+REFERENCE_ITEMS = [("SRB1 全局参考（信号接 INxP）", REFERENCE_SRB1)]
 MODE_ITEMS = [
     ("EEG + BIAS P+N", b"n", 0),
     ("EEG + BIAS 仅信号侧", b"p", 1),
@@ -1430,6 +1438,10 @@ class BleTransportWorker(QtCore.QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.status_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=64)
+        self._response_waiters = {}
+        self._next_request_id = 1
+        self.device_info = None
+        self.config_snapshot = None
         # DATA notifications stay in the BLE worker thread.  A lock-protected
         # deque is drained by the GUI timer, avoiding one queued Qt event per
         # notification (a common cause of visible Windows GUI stalls).
@@ -1637,7 +1649,9 @@ class BleTransportWorker(QtCore.QThread):
                     return
                 services = client.services
                 missing = [
-                    uuid for uuid in (BLE_DATA_UUID, BLE_CONTROL_UUID, BLE_STATUS_UUID)
+                    uuid for uuid in (
+                        BLE_DATA_UUID, BLE_CONTROL_UUID, BLE_STATUS_UUID, BLE_RESPONSE_UUID
+                    )
                     if services.get_characteristic(uuid) is None
                 ]
                 if missing:
@@ -1650,15 +1664,36 @@ class BleTransportWorker(QtCore.QThread):
                         self._reliable_accept_any_session = True
                 await client.start_notify(BLE_DATA_UUID, self._on_data)
                 await client.start_notify(BLE_STATUS_UUID, self._on_status)
+                await client.start_notify(BLE_RESPONSE_UUID, self._on_response)
                 # Give the resubscribed link a fresh stall deadline. Otherwise
                 # the watchdog can immediately disconnect again based on the
                 # timestamp from before the radio interruption.
                 self._last_notify_monotonic = time.monotonic()
-                try:
-                    status = bytes(await client.read_gatt_char(BLE_STATUS_UUID))
-                    self._publish_status(status)
-                except Exception as exc:
-                    self.info.emit(f"BLE 状态读取暂时失败：{exc}")
+                hello = await self._request(MSG_HELLO, timeout=2.5)
+                if len(hello) < 11 or hello[0] != 0:
+                    raise RuntimeError("固件握手响应无效")
+                firmware_version = hello[1]
+                protocol_version = hello[4]
+                if firmware_version != BLE_FIRMWARE_VERSION:
+                    raise RuntimeError(
+                        f"固件版本不兼容：需要 V{BLE_FIRMWARE_VERSION}，设备为 V{firmware_version}"
+                    )
+                if protocol_version != BLE_DEVICE_PROTOCOL_VERSION:
+                    raise RuntimeError(
+                        f"通信协议不兼容：需要 V{BLE_DEVICE_PROTOCOL_VERSION}，设备为 V{protocol_version}"
+                    )
+                self.device_info = {
+                    "firmware": (hello[1], hello[2], hello[3]),
+                    "protocol": protocol_version,
+                    "capabilities": int.from_bytes(hello[5:7], "little"),
+                    "boot_id": int.from_bytes(hello[7:11], "little"),
+                }
+                if not (reconnected and self._streaming_hint):
+                    self.config_snapshot = decode_config_snapshot(
+                        await self._request(MSG_GET_CONFIG, timeout=3.0)
+                    )
+                status = bytes(await client.read_gatt_char(BLE_STATUS_UUID))
+                self._publish_status(status)
                 mtu = int(getattr(client, "mtu_size", 23) or 23)
                 name = str(getattr(device, "name", "") or BLE_DEVICE_NAME)
                 address = str(getattr(device, "address", key) or key)
@@ -2393,6 +2428,43 @@ class BleTransportWorker(QtCore.QThread):
     def _on_status(self, _characteristic, data):
         self._publish_status(bytes(data))
 
+    def _on_response(self, _characteristic, data):
+        try:
+            packet = decode_packet(bytes(data))
+        except ProtocolError as exc:
+            self.info.emit(f"BLE RESPONSE 无效：{exc}")
+            return
+        waiter = self._response_waiters.pop(packet.request_id, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(packet)
+
+    async def _request(self, message_type: int, payload: bytes = b"", timeout: float = 3.0):
+        client = self._client
+        if client is None or not bool(getattr(client, "is_connected", False)):
+            raise RuntimeError("BLE 尚未连接")
+        request_id = self._next_request_id
+        self._next_request_id = 1 if request_id >= 0xFFFF else request_id + 1
+        waiter = self._loop.create_future()
+        self._response_waiters[request_id] = waiter
+        try:
+            await client.write_gatt_char(
+                BLE_CONTROL_UUID,
+                encode_packet(message_type, request_id, payload),
+                response=True,
+            )
+            packet = await asyncio.wait_for(waiter, timeout=timeout)
+        finally:
+            self._response_waiters.pop(request_id, None)
+        if packet.message_type != (MSG_RESPONSE | message_type):
+            raise RuntimeError(
+                f"BLE 响应类型不匹配：0x{packet.message_type:02X}"
+            )
+        return packet.payload
+
+    def request_blocking(self, message_type: int, payload: bytes = b"", timeout: float = 3.0):
+        future = self._submit(self._request(message_type, bytes(payload), timeout))
+        return bytes(future.result(timeout=max(0.5, timeout + 0.5)))
+
     async def _status_poll_loop(self, client):
         try:
             while (
@@ -2509,6 +2581,7 @@ class BleTransportWorker(QtCore.QThread):
                         pass
                     try:
                         await client.stop_notify(BLE_STATUS_UUID)
+                        await client.stop_notify(BLE_RESPONSE_UUID)
                     except Exception:
                         pass
                     await client.disconnect()
@@ -2534,7 +2607,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V18 | BLE continuity + stale-NACK hardening")
+        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | 固件 V19 / 通信协议 V1")
         self.resize(1500, 920)
 
         self.gain = 24  # legacy/global command value
@@ -2542,10 +2615,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_names = [f"CH{index}" for index in range(1, CHANNELS + 1)]
         self.channel_enabled = np.array([True] * 5 + [False] * 3, dtype=bool)
         self.channel_bias = np.array([True] * 5 + [False] * 3, dtype=bool)
-        # Default: measurement electrodes on INxN and the common reference
-        # electrode on SRB2. SRB1 remains selectable for boards that route it.
-        self.reference_mode = REFERENCE_SRB2
-        self.channel_srb2 = np.array([True] * 5 + [False] * 3, dtype=bool)
+        self.reference_mode = REFERENCE_SRB1
+        self.channel_srb2 = np.zeros(CHANNELS, dtype=bool)
         self.lsb_uv = self.calc_lsb_uv()
         self.ring = RingBuffer(CHANNELS, FS * 90)            # untouched input-referred uV
         self.filtered_ring = RingBuffer(CHANNELS, FS * 90)   # continuous causal display chain
@@ -3135,11 +3206,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reference_combo.setCurrentIndex(0)
         self.reference_combo.setMinimumWidth(205)
         self.reference_combo.setToolTip(
-            "SRB1：每通道信号接 INxP，参考接 SRB1；"
-            "SRB2：每通道信号接 INxN，参考接 SRB2。"
+            "V19 固定使用 SRB1：每通道信号接 INxP，公共参考接 SRB1。"
         )
         self.apply_reference_btn = QtWidgets.QPushButton("应用参考")
         self.apply_reference_btn.clicked.connect(self.apply_reference_mode)
+        self.reference_combo.setEnabled(False)
+        self.apply_reference_btn.setVisible(False)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -3823,10 +3895,7 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled = bool(self.channel_enabled[ch])
             bias = "BIAS✓" if self.channel_bias[ch] else "BIAS—"
             power = "ON" if enabled else "OFF"
-            if self.reference_is_srb2():
-                reference = "SRB2✓" if self.channel_srb2[ch] and enabled else "SRB2—"
-            else:
-                reference = "SRB1全局"
+            reference = "SRB1全局"
             button.setText(f"{name}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {reference}")
             icon = QtGui.QPixmap(11, 11)
             icon.fill(QtGui.QColor("#56bd31" if enabled else "#8b969e"))
@@ -3835,11 +3904,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{name} (INP{ch+1}): {'启用' if enabled else '禁用'}, "
                 f"PGA ×{int(self.channel_gains[ch])}, "
                 f"{'参与' if self.channel_bias[ch] else '不参与'} {self.bias_register_name()}；"
-                + (
-                    f"SRB2 {'接入' if self.channel_srb2[ch] and enabled else '断开'}"
-                    if self.reference_is_srb2()
-                    else "EEG 模式使用全局 SRB1"
-                )
+                + "EEG 模式使用全局 SRB1"
             )
             if hasattr(self, "channel_plots"):
                 self.channel_plots[ch].setLabel("left", name, units="uV")
@@ -3887,20 +3952,10 @@ class MainWindow(QtWidgets.QMainWindow):
         bias = QtWidgets.QCheckBox(f"加入 {self.bias_register_name()} 共模反馈计算")
         bias.setChecked(bool(self.channel_bias[ch]))
         form.addRow("BIAS", bias)
-        srb2 = QtWidgets.QCheckBox("该通道接入 SRB2 公共参考")
-        srb2.setChecked(bool(self.channel_srb2[ch]))
-        srb2.setEnabled(self.reference_is_srb2())
-        form.addRow("SRB2", srb2)
-        if self.reference_is_srb2():
-            note_text = (
-                "SRB2 模式：测量电极接 INxN，公共参考接 SRB2；"
-                "MISC1.SRB1 关闭，BIAS 默认从 N 侧取样。"
-            )
-        else:
-            note_text = (
-                "SRB1 模式：测量电极接 INxP，公共参考接 SRB1；"
-                "SRB1 全局开启，逐通道 SRB2 不生效。"
-            )
+        note_text = (
+            "V19 固定使用 SRB1：测量电极接 INxP，公共参考接 SRB1，"
+            "MISC1.SRB1 在 EEG 模式中全局开启。"
+        )
         note = QtWidgets.QLabel(note_text)
         note.setWordWrap(True)
         note.setStyleSheet("color:#5d6870;")
@@ -3911,21 +3966,15 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(buttons)
 
         def update_summary(*_args):
-            reference = (
-                f"SRB2 {'ON' if srb2.isChecked() else 'OFF'}"
-                if self.reference_is_srb2()
-                else "SRB1 GLOBAL"
-            )
             summary.setText(
                 f"CH{ch+1}  |  {'ON' if enabled.isChecked() else 'OFF'}  |  "
                 f"PGA ×{gain.currentText()}  |  BIAS {'YES' if bias.isChecked() else 'NO'}  |  "
-                f"{reference}"
+                "SRB1 GLOBAL"
             )
 
         enabled.toggled.connect(update_summary)
         gain.currentTextChanged.connect(update_summary)
         bias.toggled.connect(update_summary)
-        srb2.toggled.connect(update_summary)
         update_summary()
         selected_name = self.channel_names[ch]
 
@@ -3947,7 +3996,7 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled.isChecked(),
             int(gain.currentText()),
             bias.isChecked(),
-            srb2.isChecked(),
+            False,
             selected_name,
         )
 
@@ -3957,9 +4006,8 @@ class MainWindow(QtWidgets.QMainWindow):
         channel_name = self.validated_channel_name(ch, channel_name)
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
-        if srb2 is None:
-            srb2 = bool(self.channel_srb2[ch])
-        effective_srb2 = bool(srb2 and enabled and self.reference_is_srb2())
+        srb2 = False
+        effective_srb2 = False
         flags = (
             (0x01 if enabled else 0)
             | (0x02 if bias and enabled else 0)
@@ -3967,6 +4015,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         was_streaming = bool(self.streaming)
         ack = None
+        old_state = (
+            bool(self.channel_enabled[ch]),
+            int(self.channel_gains[ch]),
+            bool(self.channel_bias[ch]),
+            bool(self.channel_srb2[ch]),
+        )
         try:
             if self.transport_connected() and self.offline_uv is None:
                 if was_streaming:
@@ -3986,22 +4040,20 @@ class MainWindow(QtWidgets.QMainWindow):
                             self.ble_worker.status_queue.get_nowait()
                         except queue.Empty:
                             break
-                self.transport_write(bytes([0xA7, ch & 0x07, gain & 0xFF, flags]))
-                ack = self.read_config_ack(0xA7, expected_argument=ch & 0x07)
-                if ack is None:
-                    raise RuntimeError(
-                        "固件未返回 A7 寄存器读回。请烧录带配置 ACK 的最新固件。"
-                    )
-                if ack["argument"] != (ch & 0x07) or not ack["verified"]:
-                    raise RuntimeError(
-                        f"ADS1299 配置校验失败：CH{ch+1}, "
-                        f"CHnSET=0x{ack['channel_register']:02X}, "
-                        f"BIAS_P=0x{ack['bias_p']:02X}, BIAS_N=0x{ack['bias_n']:02X}"
-                    )
+                if self.active_transport == "ble":
+                    self.channel_enabled[ch] = bool(enabled)
+                    self.channel_gains[ch] = int(gain)
+                    self.channel_bias[ch] = bool(bias and enabled)
+                    ack = self._ble_write_bulk_config(REFERENCE_SRB1)
+                else:
+                    self.transport_write(bytes([0xA7, ch & 0x07, gain & 0xFF, flags]))
+                    ack = self.read_config_ack(0xA7, expected_argument=ch & 0x07)
+                    if ack is None or ack["argument"] != (ch & 0x07) or not ack["verified"]:
+                        raise RuntimeError(f"ADS1299 配置校验失败：CH{ch+1}")
             self.channel_enabled[ch] = bool(enabled)
             self.channel_gains[ch] = int(gain)
             self.channel_bias[ch] = bool(bias and enabled)
-            self.channel_srb2[ch] = bool(srb2 and enabled)
+            self.channel_srb2[ch] = False
             self.channel_names[ch] = channel_name
             self.set_bias_checks(sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i]))
             self.refresh_channel_parameter_labels()
@@ -4014,21 +4066,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.first_seq = None
             self.first_clock = None
             readback = (
-                f"；ADS读回 CHnSET=0x{ack['channel_register']:02X}, "
+                f"；ADS读回 CHnSET=0x{(ack.get('channel_registers') or [ack.get('channel_register', 0xFF)] * 8)[ch]:02X}, "
                 f"P=0x{ack['bias_p']:02X}, N=0x{ack['bias_n']:02X}"
                 if ack is not None else "；仅更新离线显示参数"
             )
             self.set_status(
                 f"已确认 CH{ch+1}: {'ON' if enabled else 'OFF'}, PGA×{gain}, "
                 f"{self.bias_register_name()}={'YES' if bias and enabled else 'NO'}, "
-                + (
-                    f"SRB2={'ON' if effective_srb2 else 'OFF'}"
-                    if self.reference_is_srb2()
-                    else "SRB1=GLOBAL"
-                )
+                + "SRB1=GLOBAL"
                 + readback
             )
         except Exception as exc:
+            (
+                self.channel_enabled[ch],
+                self.channel_gains[ch],
+                self.channel_bias[ch],
+                self.channel_srb2[ch],
+            ) = old_state
+            self.refresh_channel_parameter_labels()
             QtWidgets.QMessageBox.critical(self, "通道设置失败", str(exc))
         finally:
             if was_streaming and self.transport_connected():
@@ -4618,17 +4673,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reference_combo.setEnabled(False)
             self.apply_reference_btn.setEnabled(False)
             self.reference_combo.setToolTip(
-                "连接后自动识别固定 SRB1 固件或可切换 SRB1/SRB2 固件。"
+                "V19 固定使用 SRB1。"
             )
         else:
             self.serial_label.setText("串口")
             self.refresh_btn.setText("扫描串口")
             self.connect_btn.setText("打开串口")
-            self.reference_combo.setEnabled(True)
-            self.apply_reference_btn.setEnabled(True)
+            self.reference_combo.setEnabled(False)
+            self.apply_reference_btn.setEnabled(False)
             self.reference_combo.setToolTip(
-                "SRB1：每通道信号接 INxP，参考接 SRB1；"
-                "SRB2：每通道信号接 INxN，参考接 SRB2。"
+                "新版本固定使用 SRB1：每通道信号接 INxP，公共参考接 SRB1。"
             )
         self._apply_transport_timing(kind)
         self.refresh_ports()
@@ -4788,46 +4842,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _ble_write_channel_config(self, ch: int, reference_mode: int):
-        """Legacy A7 path kept for manual per-channel changes."""
-        enabled = bool(self.channel_enabled[ch])
-        flags = (
-            (0x01 if enabled else 0)
-            | (0x02 if self.channel_bias[ch] and enabled else 0)
-            | (
-                0x04
-                if reference_mode == REFERENCE_SRB2
-                and self.channel_srb2[ch]
-                and enabled
-                else 0
-            )
-        )
-        last_ack = None
-        for attempt in range(1, 4):
-            self.transport_reset_input_buffer(reset_reliable=False)
-            self.transport_write(bytes((0xA7, ch, int(self.channel_gains[ch]), flags)))
-            ack = self.read_config_ack(
-                0xA7,
-                timeout=1.8,
-                expected_argument=ch,
-            )
-            last_ack = ack
-            if ack is not None and ack["verified"]:
-                return ack
-            time.sleep(0.08 * attempt)
-
-        detail = "无 ACK"
-        if last_ack is not None:
-            detail = (
-                f"verified={int(bool(last_ack['verified']))}, "
-                f"CHnSET=0x{last_ack['channel_register']:02X}, "
-                f"P=0x{last_ack['bias_p']:02X}, N=0x{last_ack['bias_n']:02X}"
-            )
-        raise RuntimeError(
-            f"BLE 初始化时 CH{ch+1} 配置连续 3 次读回失败（{detail}）"
-        )
+        """V19 applies one atomic SRB1-only snapshot for every channel edit."""
+        return self._ble_write_bulk_config(REFERENCE_SRB1)
 
     def _ble_write_bulk_config(self, reference_mode: int):
-        """Configure all eight channels in one ADS stop/write/verify transaction."""
+        """Configure and read back all ADS1299 registers in one V1 transaction."""
+        if self.ble_worker is None:
+            raise RuntimeError("BLE 后台线程未就绪")
         enabled_mask = sum(
             (1 << ch) for ch in range(CHANNELS) if self.channel_enabled[ch]
         ) & 0xFF
@@ -4836,101 +4857,44 @@ class MainWindow(QtWidgets.QMainWindow):
             for ch in range(CHANNELS)
             if self.channel_enabled[ch] and self.channel_bias[ch]
         ) & 0xFF
-        srb2_mask = sum(
-            (1 << ch)
-            for ch in range(CHANNELS)
-            if (
-                reference_mode == REFERENCE_SRB2
-                and self.channel_enabled[ch]
-                and self.channel_srb2[ch]
-            )
-        ) & 0xFF
-        gains = [int(v) & 0xFF for v in self.channel_gains]
-        packet = bytes((
-            0xA5,
-            int(reference_mode) & 0x01,
+        payload = encode_set_config(
+            self.current_mode,
             enabled_mask,
             bias_mask,
-            srb2_mask,
-            *gains,
-        ))
-        last_ack = None
-        for attempt in range(1, 4):
-            self.transport_reset_input_buffer(reset_reliable=False)
-            self.transport_write(packet)
-            ack = self.read_config_ack(
-                0xA5,
-                timeout=2.8,
-                expected_argument=enabled_mask,
-            )
-            last_ack = ack
-            if (
-                ack is not None
-                and ack["verified"]
-                and int(ack.get("enabled_mask", -1)) == enabled_mask
-            ):
-                return ack
-            time.sleep(0.10 * attempt)
-
-        detail = "无 ACK"
-        if last_ack is not None:
-            detail = (
-                f"verified={int(bool(last_ack['verified']))}, "
-                f"enabled=0x{last_ack['enabled_mask']:02X}, "
-                f"P=0x{last_ack['bias_p']:02X}, N=0x{last_ack['bias_n']:02X}, "
-                f"reference={'SRB2' if last_ack.get('reference') else 'SRB1'}"
-            )
-        raise RuntimeError(
-            "BLE 批量通道初始化连续 3 次失败（"
-            + detail
-            + "）。请烧录 V16 配套固件。"
+            self.impedance_mask if self.impedance_active else 0,
+            self.channel_gains,
         )
+        snapshot = decode_config_snapshot(
+            self.ble_worker.request_blocking(MSG_SET_CONFIG, payload, timeout=4.0)
+        )
+        if not snapshot.verified or snapshot.enabled_mask != enabled_mask:
+            raise RuntimeError("ADS1299 配置读回不一致")
+        self.ble_worker.config_snapshot = snapshot
+        return {
+            "verified": snapshot.verified,
+            "enabled_mask": snapshot.enabled_mask,
+            "bias_p": snapshot.bias_p,
+            "bias_n": snapshot.bias_n,
+            "reference": REFERENCE_SRB1,
+            "generation": snapshot.generation,
+            "channel_registers": snapshot.channel_registers,
+        }
 
     def sync_ble_configuration(self, requested_reference=None, probe_capability: bool = True):
-        """Apply one atomic A5 configuration instead of eight full A7 rewrites."""
-        self.transport_write(b"s")
-        time.sleep(0.08)
+        """V19 is fixed SRB1; connection handshake already read device state."""
+        self.set_reference_mode_local(REFERENCE_SRB1)
+        return REFERENCE_SRB1, False
 
-        if requested_reference is None:
-            hinted = self.ble_reference_hint_from_name(self.ble_device_name)
-            requested_reference = self.reference_mode if hinted is None else hinted
-        requested_reference = (
-            REFERENCE_SRB2
-            if int(requested_reference) == REFERENCE_SRB2
-            else REFERENCE_SRB1
-        )
-
-        supports_srb2 = bool(self.ble_supports_srb2)
-        if probe_capability:
-            self.transport_reset_input_buffer(reset_reliable=False)
-            self.transport_write(bytes((0xA8, REFERENCE_SRB2)))
-            time.sleep(0.06)
-            self.transport_write(b"p")
-            time.sleep(0.06)
-            probe_ack = self._ble_write_bulk_config(REFERENCE_SRB2)
-            supports_srb2 = (
-                int(probe_ack.get("reference", REFERENCE_SRB1)) == REFERENCE_SRB2
-            )
-
-        actual_reference = (
-            REFERENCE_SRB2
-            if requested_reference == REFERENCE_SRB2 and supports_srb2
-            else REFERENCE_SRB1
-        )
-        self.transport_reset_input_buffer(reset_reliable=False)
-        self.transport_write(bytes((0xA8, actual_reference)))
-        time.sleep(0.06)
-        self.transport_write(b"p")
-        time.sleep(0.06)
-        ack = self._ble_write_bulk_config(actual_reference)
-        if int(ack.get("reference", REFERENCE_SRB1)) != actual_reference:
-            raise RuntimeError(
-                f"BLE 参考模式读回不一致：请求 "
-                f"{('SRB2' if actual_reference else 'SRB1')}，固件返回 "
-                f"{('SRB2' if ack.get('reference') else 'SRB1')}"
-            )
-        self.transport_reset_input_buffer(clear_status=True, reset_reliable=False)
-        return actual_reference, supports_srb2
+    def apply_ble_config_snapshot(self, snapshot):
+        gain_by_code = {0: 1, 1: 2, 2: 4, 3: 6, 4: 8, 5: 12, 6: 24}
+        for ch, register in enumerate(snapshot.channel_registers):
+            self.channel_enabled[ch] = not bool(register & 0x80)
+            self.channel_gains[ch] = gain_by_code.get((register >> 4) & 0x07, 24)
+            self.channel_bias[ch] = bool(snapshot.bias_p & (1 << ch))
+            self.channel_srb2[ch] = False
+        self.current_mode = int(snapshot.mode)
+        self.set_reference_mode_local(REFERENCE_SRB1)
+        self.set_bias_checks(int(snapshot.bias_p))
 
     def on_ble_connected(self, name: str, address: str, mtu: int, reconnected: bool):
         self.transport_connecting = False
@@ -4957,53 +4921,34 @@ class MainWindow(QtWidgets.QMainWindow):
         if reconnected and self.streaming:
             if self.ble_worker is not None:
                 self.ble_worker.set_streaming_hint(True)
-            self.reference_combo.setEnabled(bool(self.ble_supports_srb2))
-            self.apply_reference_btn.setEnabled(bool(self.ble_supports_srb2))
             self.set_status(
-                f"BLE 已自动重连：{name}，MTU={mtu}；正在继续原可靠会话并补传断线期间数据。"
+                f"BLE 已自动重连并完成 V19/V1 握手：{name}，MTU={mtu}；"
+                "正在继续原可靠会话并补传断线期间数据。"
             )
             return
 
-        hinted_reference = self.ble_reference_hint_from_name(name)
-        requested_reference = (
-            self.reference_mode
-            if reconnected or hinted_reference is None
-            else hinted_reference
-        )
         try:
-            self.transport_reset_input_buffer()
-            actual_reference, supports_srb2 = self.sync_ble_configuration(
-                requested_reference=requested_reference,
-                probe_capability=not reconnected or self.ble_reference_profile == "unknown",
-            )
-            self.ble_supports_srb2 = bool(supports_srb2)
-            self.ble_reference_profile = "dual" if supports_srb2 else "srb1_fixed"
-            self.set_reference_mode_local(actual_reference)
-            if actual_reference == REFERENCE_SRB2:
-                for ch in range(CHANNELS):
-                    if self.channel_enabled[ch]:
-                        self.channel_srb2[ch] = True
-            self.reference_combo.setEnabled(bool(supports_srb2))
-            self.apply_reference_btn.setEnabled(bool(supports_srb2))
-            self.reference_combo.setToolTip(
-                "此 BLE 固件支持运行时切换 SRB1/SRB2。"
-                if supports_srb2
-                else "此 BLE 固件固定为 SRB1。"
-            )
+            self.ble_supports_srb2 = False
+            self.ble_reference_profile = "srb1_fixed"
+            snapshot = self.ble_worker.config_snapshot if self.ble_worker is not None else None
+            if snapshot is None:
+                raise RuntimeError("未收到 ADS1299 寄存器快照")
+            self.apply_ble_config_snapshot(snapshot)
             self.refresh_channel_parameter_labels()
-            self.current_mode = 1
-            self.mode_before_internal_short = 1
-            self.mode_combo.setCurrentIndex(self._mode_index_from_code(1))
-            self._sync_internal_short_button(False)
+            self.mode_before_internal_short = self.current_mode if self.current_mode in (0, 1, 2) else 1
+            self.mode_combo.setCurrentIndex(self._mode_index_from_code(self.current_mode))
+            self._sync_internal_short_button(self.current_mode == 3)
             action = "已自动重连" if reconnected else "已连接"
-            capability = "可切换 SRB1/SRB2" if supports_srb2 else "固定 SRB1"
+            info = self.ble_worker.device_info if self.ble_worker is not None else None
+            firmware = info.get("firmware", (19, 0, 0)) if info else (19, 0, 0)
+            protocol = info.get("protocol", 1) if info else 1
             self.set_status(
-                f"BLE {action}：{name}，MTU={mtu}，当前 {self.reference_short_name()}，"
-                f"{capability}。"
+                f"BLE {action}并确认设备就绪：{name}，MTU={mtu}，"
+                f"固件 V{firmware[0]}.{firmware[1]}.{firmware[2]}，协议 V{protocol}，固定 SRB1。"
                 + ("采集已恢复。" if reconnected and self.streaming else "点击“开始采集”。")
             )
         except Exception as exc:
-            self.set_status(f"BLE 已连接，但参考模式/通道初始化失败：{exc}")
+            self.set_status(f"BLE 握手后初始化界面失败：{exc}")
 
     def on_ble_disconnected(self, reason: str, will_reconnect: bool):
         self.ble_connected = False
@@ -5067,6 +5012,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "reliable_unknown_nack": int.from_bytes(data[64:68], "little"),
                 "reliable_protocol_error": int.from_bytes(data[68:72], "little"),
             })
+        if len(data) >= 76:
+            status["config_generation"] = int.from_bytes(data[72:76], "little")
 
         previous = dict(self.ble_status)
         counter_keys = (
@@ -5092,10 +5039,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ble_peer_mtu = self.ble_status["mtu"]
         self.current_mode = int(self.ble_status["mode"])
         self._sync_internal_short_button(self.current_mode == 3)
-        if (len(data) < 72 or data[2] not in (0x03, 0x04)) and not self.ble_protocol_warned:
+        if (len(data) < 76 or data[2] != 0x04) and not self.ble_protocol_warned:
             self.ble_protocol_warned = True
             self.set_status(
-                "BLE 固件协议不匹配：请烧录可靠传输协议 V3/V4 的 SRB1 或 SRB2 固件。"
+                "BLE STATUS 格式不匹配：请烧录 SRB1-only 固件 V19。"
             )
         if self.ble_peer_mtu >= BLE_MIN_STREAM_MTU:
             self.ble_low_mtu_warned = False
@@ -5934,16 +5881,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 time.sleep(0.08)
             self.transport_reset_input_buffer()
             self.parser.reset()
-            self.transport_write(bytes((0xA9, mask & 0xFF)))
-            ack = self.read_config_ack(0xA9, expected_argument=mask & 0xFF)
-            expected_p = 0 if self.reference_is_srb2() else mask
-            expected_n = mask if self.reference_is_srb2() else 0
+            if self.active_transport == "ble":
+                self.impedance_active = True
+                self.impedance_mask = mask
+                ack = self._ble_write_bulk_config(REFERENCE_SRB1)
+                snapshot = self.ble_worker.config_snapshot
+                expected_p = mask
+                expected_n = 0
+                confirmed = (
+                    snapshot is not None
+                    and snapshot.verified
+                    and snapshot.lead_off_p == expected_p
+                    and snapshot.lead_off_n == expected_n
+                )
+            else:
+                self.transport_write(bytes((0xA9, mask & 0xFF)))
+                ack = self.read_config_ack(0xA9, expected_argument=mask & 0xFF)
+                expected_p = mask
+                expected_n = 0
+                confirmed = (
+                    ack is not None
+                    and ack["verified"]
+                    and ack["loff_p"] == expected_p
+                    and ack["loff_n"] == expected_n
+                    and ack["loff_config"] == 0x02
+                )
             if (
-                ack is None
-                or not ack["verified"]
-                or ack["loff_p"] != expected_p
-                or ack["loff_n"] != expected_n
-                or ack["loff_config"] != 0x02
+                not confirmed
             ):
                 raise RuntimeError(
                     "固件未确认 LOFF 寄存器。请烧录本版本配套固件后重试。"
@@ -5970,7 +5934,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.transport_write(b"s")
                     time.sleep(0.05)
                     self.transport_reset_input_buffer()
-                    self.transport_write(bytes((0xA9, 0x00)))
+                    if self.active_transport == "ble":
+                        self.impedance_active = False
+                        self.impedance_mask = 0
+                        self._ble_write_bulk_config(REFERENCE_SRB1)
+                    else:
+                        self.transport_write(bytes((0xA9, 0x00)))
             except Exception:
                 pass
             self.impedance_active = False
@@ -5987,16 +5956,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.streaming = False
                 time.sleep(0.08)
                 self.transport_reset_input_buffer()
-                self.transport_write(bytes((0xA9, 0x00)))
-                ack = self.read_config_ack(0xA9, expected_argument=mask & 0xFF)
-                if (
-                    ack is None
-                    or not ack["verified"]
-                    or ack["loff_p"] != 0
-                    or ack["loff_n"] != 0
-                    or ack["loff_config"] != 0
-                ):
-                    error = "ADS1299 未确认 LOFF 已关闭"
+                if self.active_transport == "ble":
+                    self.impedance_active = False
+                    self.impedance_mask = 0
+                    self._ble_write_bulk_config(REFERENCE_SRB1)
+                    snapshot = self.ble_worker.config_snapshot
+                    if snapshot is None or snapshot.lead_off_p != 0 or snapshot.lead_off_n != 0:
+                        error = "ADS1299 未确认 LOFF 已关闭"
+                else:
+                    self.transport_write(bytes((0xA9, 0x00)))
+                    ack = self.read_config_ack(0xA9, expected_argument=0)
+                    if (
+                        ack is None
+                        or not ack["verified"]
+                        or ack["loff_p"] != 0
+                        or ack["loff_n"] != 0
+                        or ack["loff_config"] != 0
+                    ):
+                        error = "ADS1299 未确认 LOFF 已关闭"
         except Exception as exc:
             error = str(exc)
         finally:

@@ -1,5 +1,5 @@
 /*
-  ESP32-C3 + ADS1299：SRB1 EEG 可靠 BLE 数据流 V3（软件 SPI）
+  ESP32-C3 + ADS1299：SRB1 EEG 固件 V19（软件 SPI）
 
   本固件目标是把采集链路状态完整、可验证地呈现出来：
     1. 完全保留软件 SPI，不调用 SPI.begin()；
@@ -18,10 +18,11 @@
     建议 Arduino-ESP32 Core 3.3.11 或同系列 3.x
 
   BLE GATT：
-    设备名：OmniBCI-C3-SRB1-V3
+    设备名：OmniBCI-C3-SRB1-V19
     DATA：Notify，4 帧组成一个带 block sequence/CRC 的可靠块；GUI 累计 ACK，缺块 NACK 重传
     CONTROL：Write / Write No Response；命令字节与原串口完全相同
-    STATUS：Read / Notify；配置 ACK 与 BLE 状态走这里，不会污染 EEG DATA
+    STATUS：Read / Notify；周期状态与心跳
+    RESPONSE：Notify；V1 事务响应与 ADS1299 完整寄存器快照
     本机请求 MTU=247；可靠发送窗口、环形缓存与重传均在固件内完成
 
   引脚：
@@ -172,18 +173,42 @@ constexpr uint8_t SYNC_1 = 0xA5;
 constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
+constexpr uint8_t FIRMWARE_VERSION_MAJOR = 19;
+constexpr uint8_t FIRMWARE_VERSION_MINOR = 0;
+constexpr uint8_t FIRMWARE_VERSION_PATCH = 0;
+constexpr uint8_t DEVICE_PROTOCOL_VERSION = 1;
 
 // ============================ BLE reliable transport V4 / compact V2 ============================
-constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V3";
+constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V19";
 constexpr char BLE_SERVICE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0001";
 constexpr char BLE_DATA_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0002";
 constexpr char BLE_CONTROL_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0003";
 constexpr char BLE_STATUS_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0004";
+constexpr char BLE_RESPONSE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0005";
+
+constexpr uint8_t DEVICE_MAGIC_0 = 0xBC;
+constexpr uint8_t DEVICE_MAGIC_1 = 0x52;
+constexpr uint8_t DEVICE_MSG_HELLO = 0x01;
+constexpr uint8_t DEVICE_MSG_GET_CONFIG = 0x02;
+constexpr uint8_t DEVICE_MSG_SET_CONFIG = 0x03;
+constexpr uint8_t DEVICE_MSG_PING = 0x04;
+constexpr uint8_t DEVICE_MSG_RESPONSE = 0x80;
+constexpr uint8_t DEVICE_MAX_PAYLOAD_BYTES = 12;
+constexpr uint8_t DEVICE_RESULT_OK = 0;
+constexpr uint8_t DEVICE_RESULT_INVALID = 1;
+constexpr uint8_t DEVICE_RESULT_BUSY = 2;
+
+struct DeviceControlCommand {
+  uint8_t type;
+  uint16_t requestId;
+  uint16_t payloadLength;
+  uint8_t payload[DEVICE_MAX_PAYLOAD_BYTES];
+};
 
 constexpr uint16_t BLE_REQUESTED_MTU = 247;
 constexpr uint16_t BLE_MIN_STREAM_MTU = 100;
 constexpr uint16_t BLE_COMMAND_QUEUE_LENGTH = 512;
-constexpr size_t BLE_STATUS_BYTES = 72;
+constexpr size_t BLE_STATUS_BYTES = 76;
 constexpr bool ENABLE_USB_STREAM_WHEN_BLE_IDLE = true;
 constexpr bool MIRROR_STREAM_TO_USB_WHILE_BLE = false;
 
@@ -270,6 +295,7 @@ enum RunPhase : uint8_t {
 static QueueHandle_t frameQueue = nullptr;
 static QueueHandle_t bleCommandQueue = nullptr;
 static QueueHandle_t bleReliableCommandQueue = nullptr;
+static QueueHandle_t bleDeviceCommandQueue = nullptr;
 static TaskHandle_t adsTaskHandle = nullptr;
 static TaskHandle_t bleTxTaskHandle = nullptr;
 static SemaphoreHandle_t adsBusMutex = nullptr;
@@ -297,6 +323,7 @@ static BLEServer *bleServer = nullptr;
 static BLECharacteristic *bleDataCharacteristic = nullptr;
 static BLECharacteristic *bleControlCharacteristic = nullptr;
 static BLECharacteristic *bleStatusCharacteristic = nullptr;
+static BLECharacteristic *bleResponseCharacteristic = nullptr;
 #if defined(CONFIG_BLUEDROID_ENABLED)
 static BLE2902 *bleDataCccd = nullptr;
 #endif
@@ -314,6 +341,8 @@ volatile uint32_t bleCommandDropCount = 0;
 volatile uint32_t bleLastConfigAckMs = 0;
 static uint8_t bleLastConfigAck[12] = {0};
 volatile bool bleLastConfigAckValid = false;
+volatile uint32_t configurationGeneration = 0;
+static uint32_t firmwareBootId = 0;
 volatile uint32_t bleMtuBlockedFrameCount = 0;
 volatile uint32_t bleBlocksSent = 0;
 volatile uint32_t bleBytesSent = 0;
@@ -422,6 +451,9 @@ void printHelpAndDiagnostics();
 void clearDiagnostics();
 void printRegisterReadback();
 void sendConfigAck(uint8_t command, uint8_t argument);
+void handleDeviceControl(const DeviceControlCommand &command);
+void sendDeviceResponse(uint8_t requestType, uint16_t requestId, const uint8_t *payload, uint16_t payloadLength);
+void buildConfigSnapshot(uint8_t result, uint8_t *destination);
 
 bool initBle();
 bool bleDataNotificationsEnabled();
@@ -548,6 +580,34 @@ class EegBleControlCallbacks : public BLECharacteristicCallbacks {
     const size_t length = characteristic->getLength();
     if (!data || length == 0) return;
 
+    if (length >= 10 && data[0] == DEVICE_MAGIC_0 && data[1] == DEVICE_MAGIC_1) {
+      const uint16_t payloadLength = static_cast<uint16_t>(data[6]) |
+        static_cast<uint16_t>(data[7] << 8);
+      const size_t expectedLength = 8u + payloadLength + 2u;
+      if (data[2] != DEVICE_PROTOCOL_VERSION ||
+          payloadLength > DEVICE_MAX_PAYLOAD_BYTES || length != expectedLength) {
+        bleReliableProtocolErrors++;
+        return;
+      }
+      const uint16_t receivedCrc = static_cast<uint16_t>(data[length - 2]) |
+        static_cast<uint16_t>(data[length - 1] << 8);
+      if (receivedCrc != crc16CcittFalse(data, length - 2)) {
+        bleReliableProtocolErrors++;
+        return;
+      }
+      DeviceControlCommand command = {};
+      command.type = data[3];
+      command.requestId = static_cast<uint16_t>(data[4]) |
+        static_cast<uint16_t>(data[5] << 8);
+      command.payloadLength = payloadLength;
+      if (payloadLength) memcpy(command.payload, &data[8], payloadLength);
+      if (!bleDeviceCommandQueue ||
+          xQueueSend(bleDeviceCommandQueue, &command, 0) != pdTRUE) {
+        bleCommandDropCount++;
+      }
+      return;
+    }
+
     // Reliable ACK/NACK packets are parsed as one characteristic write and
     // forwarded as a compact RTOS command. Ordinary GUI commands keep their
     // existing byte-stream behavior.
@@ -612,12 +672,6 @@ class EegBleStatusCallbacks : public BLECharacteristicCallbacks {
  public:
   void onRead(BLECharacteristic *characteristic) override {
     if (!characteristic) return;
-    // Keep the most recent configuration ACK readable for a short window.
-    // This lets the Windows GUI recover when the STATUS notify itself is lost.
-    if (bleLastConfigAckValid && (millis() - bleLastConfigAckMs) < 1500u) {
-      characteristic->setValue(bleLastConfigAck, sizeof(bleLastConfigAck));
-      return;
-    }
     uint8_t status[BLE_STATUS_BYTES] = {};
     buildBleStatus(status);
     characteristic->setValue(status, sizeof(status));
@@ -652,7 +706,8 @@ void setup() {
   frameQueue = xQueueCreate(FRAME_QUEUE_LENGTH, sizeof(StreamFrame));
   bleCommandQueue = xQueueCreate(BLE_COMMAND_QUEUE_LENGTH, sizeof(uint8_t));
   bleReliableCommandQueue = xQueueCreate(32, sizeof(ReliableControlCommand));
-  if (!frameQueue || !bleCommandQueue || !bleReliableCommandQueue) {
+  bleDeviceCommandQueue = xQueueCreate(16, sizeof(DeviceControlCommand));
+  if (!frameQueue || !bleCommandQueue || !bleReliableCommandQueue || !bleDeviceCommandQueue) {
     while (true) delay(1000);
   }
 
@@ -702,7 +757,9 @@ void setup() {
 
   // 这里只在尚未开始二进制数据流时打印。MATLAB 连接后会 flush 掉这些文字。
   Serial.println();
-  Serial.println("ESP32C3 ADS1299 SRB1 + RELIABLE BLE V18 SPLIT-TX READY");
+  firmwareBootId = esp_random();
+  if (firmwareBootId == 0) firmwareBootId = 1;
+  Serial.println("ESP32C3 ADS1299 SRB1 FIRMWARE V19 / PROTOCOL V1 READY");
   Serial.printf("BLE=%s name=%s requestedMTU=%u minStreamMTU=%u\n",
                 bleInitialized ? "READY" : "FAILED",
                 BLE_DEVICE_NAME,
@@ -820,6 +877,12 @@ void transportTask(void *argument) {
     uint8_t bleCommandByte = 0;
     while (bleCommandQueue && xQueueReceive(bleCommandQueue, &bleCommandByte, 0) == pdTRUE) {
       processSerialByte(static_cast<char>(bleCommandByte));
+    }
+
+    DeviceControlCommand deviceCommand = {};
+    while (bleDeviceCommandQueue &&
+           xQueueReceive(bleDeviceCommandQueue, &deviceCommand, 0) == pdTRUE) {
+      handleDeviceControl(deviceCommand);
     }
 
     while (Serial.available() > 0) {
@@ -1452,7 +1515,12 @@ bool initBle() {
     BLE_STATUS_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
   );
-  if (!bleDataCharacteristic || !bleControlCharacteristic || !bleStatusCharacteristic) {
+  bleResponseCharacteristic = service->createCharacteristic(
+    BLE_RESPONSE_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  if (!bleDataCharacteristic || !bleControlCharacteristic ||
+      !bleStatusCharacteristic || !bleResponseCharacteristic) {
     return false;
   }
 
@@ -1465,6 +1533,7 @@ bool initBle() {
   bleDataCccd = new BLE2902();
   bleDataCharacteristic->addDescriptor(bleDataCccd);
   bleStatusCharacteristic->addDescriptor(new BLE2902());
+  bleResponseCharacteristic->addDescriptor(new BLE2902());
 #endif
 
   uint8_t initialStatus[BLE_STATUS_BYTES] = {};
@@ -1985,6 +2054,7 @@ void buildBleStatus(uint8_t *destination) {
   writeU32LE(&destination[60], bleReliableOverflowBlocks);
   writeU32LE(&destination[64], bleReliableUnknownNacks);
   writeU32LE(&destination[68], bleReliableProtocolErrors);
+  writeU32LE(&destination[72], configurationGeneration);
 }
 
 void publishBleStatus(bool notifyClient) {
@@ -2269,6 +2339,118 @@ uint8_t readAdsRegister(uint8_t address) {
   return samples[4];
 }
 
+void sendDeviceResponse(
+  uint8_t requestType,
+  uint16_t requestId,
+  const uint8_t *payload,
+  uint16_t payloadLength
+) {
+  if (!bleInitialized || !bleConnected || !bleResponseCharacteristic ||
+      payloadLength > 32u) return;
+  uint8_t packet[42] = {};
+  packet[0] = DEVICE_MAGIC_0;
+  packet[1] = DEVICE_MAGIC_1;
+  packet[2] = DEVICE_PROTOCOL_VERSION;
+  packet[3] = static_cast<uint8_t>(DEVICE_MSG_RESPONSE | requestType);
+  writeU16LE(&packet[4], requestId);
+  writeU16LE(&packet[6], payloadLength);
+  if (payloadLength && payload) memcpy(&packet[8], payload, payloadLength);
+  const uint16_t crc = crc16CcittFalse(packet, 8u + payloadLength);
+  writeU16LE(&packet[8u + payloadLength], crc);
+  bleResponseCharacteristic->setValue(packet, 10u + payloadLength);
+  bleResponseCharacteristic->notify();
+}
+
+void buildConfigSnapshot(uint8_t result, uint8_t *destination) {
+  if (!destination) return;
+  memset(destination, 0, 26);
+  destination[0] = result;
+  writeU32LE(&destination[1], configurationGeneration);
+  destination[5] = static_cast<uint8_t>(currentMode);
+  destination[6] = configurationVerified ? 1u : 0u;
+  destination[7] = currentEnabledMask;
+  destination[8] = currentBiasSensPMask;
+  destination[9] = currentLeadOffMask;
+  if (result != DEVICE_RESULT_OK || runPhase == PHASE_STREAMING) return;
+
+  xSemaphoreTake(adsBusMutex, portMAX_DELAY);
+  destination[10] = readAdsRegister(0x01);
+  destination[11] = readAdsRegister(0x02);
+  destination[12] = readAdsRegister(0x03);
+  for (uint8_t ch = 0; ch < 8; ++ch) {
+    destination[13 + ch] = readAdsRegister(static_cast<uint8_t>(ADS_FIRST_CH_REG + ch));
+  }
+  destination[21] = readAdsRegister(0x0D);
+  destination[22] = readAdsRegister(0x0E);
+  destination[23] = readAdsRegister(0x0F);
+  destination[24] = readAdsRegister(0x10);
+  destination[25] = readAdsRegister(0x15);
+  xSemaphoreGive(adsBusMutex);
+}
+
+void handleDeviceControl(const DeviceControlCommand &command) {
+  if (command.type == DEVICE_MSG_HELLO) {
+    uint8_t payload[11] = {
+      DEVICE_RESULT_OK,
+      FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH,
+      DEVICE_PROTOCOL_VERSION,
+      0x0Fu, 0x00u,
+      0, 0, 0, 0
+    };
+    writeU32LE(&payload[7], firmwareBootId);
+    sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
+    return;
+  }
+
+  if (command.type == DEVICE_MSG_GET_CONFIG) {
+    uint8_t payload[26] = {};
+    buildConfigSnapshot(
+      runPhase == PHASE_STREAMING ? DEVICE_RESULT_BUSY : DEVICE_RESULT_OK,
+      payload
+    );
+    sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
+    return;
+  }
+
+  if (command.type == DEVICE_MSG_SET_CONFIG) {
+    uint8_t result = DEVICE_RESULT_INVALID;
+    if (runPhase == PHASE_STREAMING) {
+      result = DEVICE_RESULT_BUSY;
+    } else if (command.payloadLength == 12u && command.payload[0] <= MODE_INTERNAL_TEST) {
+      bool gainsValid = true;
+      for (uint8_t ch = 0; ch < 8; ++ch) {
+        uint8_t ignoredCode = 0;
+        gainsValid &= gainToCode(command.payload[4 + ch], ignoredCode);
+      }
+      if (!gainsValid) {
+        uint8_t payload[26] = {};
+        buildConfigSnapshot(result, payload);
+        sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
+        return;
+      }
+      uint8_t legacyPayload[12] = {
+        0,
+        command.payload[1], command.payload[2], 0,
+        command.payload[4], command.payload[5], command.payload[6], command.payload[7],
+        command.payload[8], command.payload[9], command.payload[10], command.payload[11]
+      };
+      currentMode = static_cast<FrontendMode>(command.payload[0]);
+      currentLeadOffMask = static_cast<uint8_t>(command.payload[3] & command.payload[1]);
+      if (setBulkChannelConfig(legacyPayload) && configurationVerified) {
+        configurationGeneration++;
+        result = DEVICE_RESULT_OK;
+      }
+    }
+    uint8_t payload[26] = {};
+    buildConfigSnapshot(result, payload);
+    sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
+    return;
+  }
+
+  uint8_t payload[1] = {DEVICE_RESULT_INVALID};
+  sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
+}
+
 // ============================ Diagnostics ============================
 void sendConfigAck(uint8_t command, uint8_t argument) {
   uint8_t reply[12] = {
@@ -2302,11 +2484,8 @@ void sendConfigAck(uint8_t command, uint8_t argument) {
   bleLastConfigAckValid = true;
   bleLastConfigAckMs = millis();
   if (Serial) Serial.write(reply, sizeof(reply));
-  if (bleInitialized && bleConnected && bleStatusCharacteristic) {
-    // ACK is isolated on STATUS, never inserted into the EEG DATA byte stream.
-    bleStatusCharacteristic->setValue(reply, sizeof(reply));
-    bleStatusCharacteristic->notify();
-  }
+  // V19 BLE configuration responses use the independent RESPONSE characteristic.
+  // The legacy ACK remains available on USB for older serial tools only.
 }
 
 void clearDiagnostics() {

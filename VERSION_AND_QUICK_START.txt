@@ -3,11 +3,11 @@ OMNIBCI VERSION AND QUICK START
 
 Current version
 ---------------
-OmniBCI ADS1299 GUI V18 BLE CONTINUITY + STALE-NACK HARDENING.
+OmniBCI ADS1299 GUI for SRB1-only firmware V19 and communication protocol V1.
 
-This is the Python-run version with V18 capture/TX isolation and ACK/NACK race
-suppression for long BLE recordings. Use the bundled V18 SRB1/SRB2 firmware for
-the complete fix.
+BLE is considered ready only after the firmware handshake and ADS1299 register
+snapshot succeed. Configuration responses use an independent RESPONSE Notify
+characteristic and matching request IDs.
 
 GUI
 ---
@@ -15,13 +15,14 @@ First run:  install_and_run.bat
 Later runs: run.bat
 Main file:  ads1299_eeg_gui_native.py
 
-V18 firmware
+V19 firmware
 -------------
 SRB1:
   firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino
 
-SRB2:
-  firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino
+Upload/diagnostic port on the current test PC: COM6
+
+SRB2 is not supported in this branch.
 
 Dependencies
 ------------
