@@ -22,4 +22,9 @@ GATT characteristics:
 The hardware has no battery measurement interface. STATUS therefore does not
 report battery voltage or percentage.
 
+STATUS V5 is 96 bytes: it preserves the reliable transport prefix and V19
+configuration generation, then appends missed-DRDY, late-read, mutex-busy,
+bad-status, and maximum-read-time counters. BLE DATA notify congestion is
+retried with bounded backoff instead of advancing the reliable sequence.
+
 The test board is currently connected as COM6 for USB upload/diagnostics.

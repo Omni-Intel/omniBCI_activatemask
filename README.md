@@ -132,6 +132,8 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 
 BLE 使用 `DATA`、`CONTROL`、`STATUS` 和独立的 `RESPONSE` 特征。配置请求包含事务 ID、长度和 CRC，固件通过 `RESPONSE` 返回相同事务 ID 和寄存器读回结果，避免旧 ACK 与周期状态包混淆。
 
+STATUS V5 为 96 字节：保留 V19 配置代次，并追加 missed DRDY、late read、mutex busy、bad STATUS 和最大读取耗时，用于区分 MCU 采样缺口与主机 BLE 缺口。
+
 ### V19 固件任务配置
 
 V19 使用以下连续性架构：
@@ -139,7 +141,9 @@ V19 使用以下连续性架构：
 - ADS 采集任务：优先级 5
 - `frameQueue` 到可靠保留环的打包任务：优先级 3
 - BLE DATA notify 任务：优先级 1
+- `frameQueue`：512 帧，约 2 秒短时缓冲
 - 可靠保留容量：384 个六帧块，约 9.2 秒（250 SPS）
+- BLE 拥塞时不推进未成功提交的块序号，而是有界退避后重试
 
 SRB2、运行时参考切换和其他历史固件已经从本分支移除。
 
@@ -291,7 +295,9 @@ dist\OmniBCI_V16\
 
 ### V15 Split-BIN Fix
 
-- 恢复每 60 秒自动切分原始 BIN：`MMDD_HHMM_ID_minuteNN.bin`。
+- 每次采集持续写入单个原始 BIN：`MMDD_HHMM_ID.bin`，避免分钟边界的新文件创建和杀毒扫描干扰。
+- GUI 每次启动会在 `logs/` 生成一个 JSONL 事件日志，关联按钮操作、固件状态、BLE Notify 长间隔、渲染卡顿、缓冲重同步和自动修复动作；日志由独立线程写入，不阻塞采集。
+- 可靠 BLE 控制采用单一合并队列，只保留最新累计 ACK/NACK；缺块修复窗口为 6 秒，并在每次新连接配置后清理旧可靠会话，避免慢速 Windows GATT 写入形成控制任务风暴和过早跳块。
 - 250 SPS 下每个完整分段为 720,000 字节 / 15,000 帧。
 - 每次会话生成 manifest，每个分段生成 sidecar metadata。
 - 分段、轮换、flush 与 JSON 元数据均在后台写盘线程中完成。

@@ -168,7 +168,10 @@
 constexpr uint32_t SERIAL_BAUD = 921600;
 constexpr size_t ADS_FRAME_BYTES = 27;
 constexpr size_t STREAM_FRAME_BYTES = 48;
-constexpr uint16_t FRAME_QUEUE_LENGTH = 256;
+// Two seconds of capture elasticity without taking so much heap that the
+// Bluedroid stack can fail to initialize. This is only a shock absorber; BLE
+// TX flow control below is what prevents a sustained backlog.
+constexpr uint16_t FRAME_QUEUE_LENGTH = 512;
 constexpr uint8_t SYNC_1 = 0xA5;
 constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -178,7 +181,7 @@ constexpr uint8_t FIRMWARE_VERSION_MINOR = 0;
 constexpr uint8_t FIRMWARE_VERSION_PATCH = 0;
 constexpr uint8_t DEVICE_PROTOCOL_VERSION = 1;
 
-// ============================ BLE reliable transport V4 / compact V2 ============================
+// ============================ BLE reliable transport STATUS V5 / DATA V2 ============================
 constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V19";
 constexpr char BLE_SERVICE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0001";
 constexpr char BLE_DATA_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0002";
@@ -208,7 +211,9 @@ struct DeviceControlCommand {
 constexpr uint16_t BLE_REQUESTED_MTU = 247;
 constexpr uint16_t BLE_MIN_STREAM_MTU = 100;
 constexpr uint16_t BLE_COMMAND_QUEUE_LENGTH = 512;
-constexpr size_t BLE_STATUS_BYTES = 76;
+// V19 keeps configurationGeneration at byte 72 and appends acquisition-side
+// diagnostics, allowing the host to distinguish DRDY loss from BLE loss.
+constexpr size_t BLE_STATUS_BYTES = 96;
 constexpr bool ENABLE_USB_STREAM_WHEN_BLE_IDLE = true;
 constexpr bool MIRROR_STREAM_TO_USB_WHILE_BLE = false;
 
@@ -336,6 +341,12 @@ volatile uint16_t bleConnectionId = 0xFFFF;
 volatile uint16_t blePeerMtu = 23;
 volatile uint32_t bleNotifySuccessCount = 0;
 volatile uint32_t bleNotifyErrorCount = 0;
+// Arduino-ESP32 Bluedroid reports whether notify() was accepted by the host
+// stack through onStatus() before notify() returns. Preserve that result so a
+// congested submission is retried instead of being falsely marked as sent.
+volatile int8_t bleDataLastNotifyResult = 0;  // 1 accepted, -1 rejected
+volatile uint8_t bleNotifyConsecutiveErrors = 0;
+volatile uint32_t bleNotifyBackoffUntilMs = 0;
 volatile bool bleStatusNotifyPending = false;
 volatile uint32_t bleCommandDropCount = 0;
 volatile uint32_t bleLastConfigAckMs = 0;
@@ -503,6 +514,9 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
     blePeerMtu = (server && bleConnectionId != 0xFFFF)
       ? server->getPeerMTU(bleConnectionId)
       : 23;
+    bleDataLastNotifyResult = 0;
+    bleNotifyConsecutiveErrors = 0;
+    bleNotifyBackoffUntilMs = 0;
   }
 
   void markDisconnected() {
@@ -511,6 +525,9 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
     bleStatusNotifyPending = false;
     bleConnectionId = 0xFFFF;
     blePeerMtu = 23;
+    bleDataLastNotifyResult = 0;
+    bleNotifyConsecutiveErrors = 0;
+    bleNotifyBackoffUntilMs = 0;
     bleResetReliableRequested = true;
     // Restart advertising from transportTask, not from the BLE callback.
     bleRestartAdvertisingRequested = true;
@@ -650,8 +667,16 @@ class EegBleDataCallbacks : public BLECharacteristicCallbacks {
     (void)code;
     if (status == SUCCESS_NOTIFY) {
       bleNotifySuccessCount++;
+      bleDataLastNotifyResult = 1;
+      bleNotifyConsecutiveErrors = 0;
+      bleNotifyBackoffUntilMs = 0;
     } else {
       bleNotifyErrorCount++;
+      bleDataLastNotifyResult = -1;
+      if (bleNotifyConsecutiveErrors < 5u) bleNotifyConsecutiveErrors++;
+      uint32_t backoffMs = 10u << bleNotifyConsecutiveErrors;
+      if (backoffMs > 250u) backoffMs = 250u;
+      bleNotifyBackoffUntilMs = millis() + backoffMs;
     }
   }
 
@@ -914,14 +939,13 @@ void transportTask(void *argument) {
     if (bleInitialized &&
         (millis() - lastStatusRefreshMs) >= statusRefreshIntervalMs &&
         (millis() - bleLastConfigAckMs) >= 1000u) {
-      // STATUS notify is lower priority than EEG DATA/ACK. During a long
-      // recording only notify when the reliable in-flight window is quiet;
-      // otherwise update the characteristic value without adding radio work.
-      const bool statusNotifySafe = !streamingEnabled || reliableInFlightBlocks() <= 4u;
       // Build/update STATUS here, but let the low-priority BLE TX task perform
       // the actual notify so STATUS can never stall frameQueue draining.
       publishBleStatus(false);
-      if (bleConnected && statusNotifySafe) {
+      // One 92-byte packet every 30 s is negligible beside EEG DATA and is
+      // essential when the link is unhealthy: suppressing STATUS exactly when
+      // in-flight occupancy was high hid ring overflow/DRDY evidence from logs.
+      if (bleConnected) {
         bleStatusNotifyPending = true;
       }
       lastStatusRefreshMs = millis();
@@ -1455,6 +1479,10 @@ void startStreaming() {
   xSemaphoreGive(adsBusMutex);
   runPhase = PHASE_STREAMING;
   streamingEnabled = true;
+  if (bleConnected && bleStatusCharacteristic) {
+    publishBleStatus(false);
+    bleStatusNotifyPending = true;
+  }
 }
 
 void stopStreamingGracefully() {
@@ -1580,18 +1608,20 @@ bool sendBleBytes(const uint8_t *data, size_t length) {
   if (mtu < BLE_MIN_STREAM_MTU) return false;
 
   const size_t payloadCapacity = static_cast<size_t>(mtu - 3u);
-  size_t offset = 0;
-  while (offset < length) {
-    if (!bleConnected || !bleDataNotificationsEnabled()) return false;
+  // DATA V2 is designed to fit one negotiated MTU. Splitting here would
+  // destroy packet boundaries at the receiver.
+  if (length > payloadCapacity) return false;
+  if (!bleConnected || !bleDataNotificationsEnabled()) return false;
 
-    size_t chunk = length - offset;
-    if (chunk > payloadCapacity) chunk = payloadCapacity;
-    bleDataCharacteristic->setValue(data + offset, chunk);
-    bleDataCharacteristic->notify();
-    bleBytesSent += chunk;
-    offset += chunk;
-    vTaskDelay(1);
-  }
+  const uint32_t now = millis();
+  if (bleNotifyBackoffUntilMs != 0u &&
+      static_cast<int32_t>(now - bleNotifyBackoffUntilMs) < 0) return false;
+
+  bleDataLastNotifyResult = 0;
+  bleDataCharacteristic->setValue(data, length);
+  bleDataCharacteristic->notify();
+  if (bleDataLastNotifyResult != 1) return false;
+  bleBytesSent += length;
   return true;
 }
 
@@ -1898,6 +1928,8 @@ void serviceReliableBleTx() {
   if (refreshBlePeerMtu() < BLE_MIN_STREAM_MTU) return;
 
   const uint32_t now = millis();
+  if (bleNotifyBackoffUntilMs != 0u &&
+      static_cast<int32_t>(now - bleNotifyBackoffUntilMs) < 0) return;
   const uint32_t txPaceMs = reliableAdaptiveTxPaceMs();
   if ((now - bleReliableLastTxMs) < txPaceMs) return;
 
@@ -1905,8 +1937,11 @@ void serviceReliableBleTx() {
   if (bleReliableNackPending) {
     const uint32_t requested = bleReliableNackFirst;
     ReliableBleBlock *block = findReliableBlock(requested);
+    bool transmitted = false;
+    bool retryRequired = false;
     if (block) {
-      sendReliableBlock(*block, true);
+      transmitted = sendReliableBlock(*block, true);
+      retryRequired = !transmitted;
     } else {
       // Re-check at transmit time because an ACK may have released the block
       // after the NACK was queued. Only an unacked, already-produced block that
@@ -1921,9 +1956,14 @@ void serviceReliableBleTx() {
         bleReliableStaleControlCount++;
       } else {
         bleReliableUnknownNacks++;
-        if (sendReliableGapMarker(requested)) bleReliableLastTxMs = millis();
+        transmitted = sendReliableGapMarker(requested);
+        retryRequired = !transmitted;
+        if (transmitted) bleReliableLastTxMs = millis();
       }
     }
+    // A congested notify was not transmitted. Keep the NACK cursor on the
+    // same block so the next service turn retries it after backoff.
+    if (retryRequired) return;
     if (requested == bleReliableNackLast) {
       bleReliableNackPending = false;
     } else {
@@ -1961,10 +2001,15 @@ void serviceReliableBleTx() {
   while (reliableSeqLessOrEqual(bleReliableNextNewTxSequence, windowLast) &&
          reliableSeqLessOrEqual(bleReliableNextNewTxSequence,
            bleReliableNextBlockSequence - (bleReliableNextBlockSequence ? 1u : 0u))) {
-    const uint32_t seq = bleReliableNextNewTxSequence++;
+    const uint32_t seq = bleReliableNextNewTxSequence;
     ReliableBleBlock *block = findReliableBlock(seq);
-    if (!block || block->sent) continue;
-    sendReliableBlock(*block, false);
+    if (!block || block->sent) {
+      bleReliableNextNewTxSequence++;
+      continue;
+    }
+    // Only advance after Bluedroid accepted the notification. Previously an
+    // ESP_ERR congestion result permanently skipped this unsent block.
+    if (sendReliableBlock(*block, false)) bleReliableNextNewTxSequence++;
     return;
   }
 }
@@ -2019,7 +2064,7 @@ void buildBleStatus(uint8_t *destination) {
   memset(destination, 0, BLE_STATUS_BYTES);
   destination[0] = 0xBC;
   destination[1] = 0x53;  // 'S' = status
-  destination[2] = 0x04;  // reliable BLE status protocol V4 / compact DATA V2
+  destination[2] = 0x05;  // reliable BLE status protocol V5 / compact DATA V2
   destination[3] = static_cast<uint8_t>(runPhase);
   destination[4] = static_cast<uint8_t>(currentMode);
 
@@ -2055,6 +2100,11 @@ void buildBleStatus(uint8_t *destination) {
   writeU32LE(&destination[64], bleReliableUnknownNacks);
   writeU32LE(&destination[68], bleReliableProtocolErrors);
   writeU32LE(&destination[72], configurationGeneration);
+  writeU32LE(&destination[76], missedDrdyCount);
+  writeU32LE(&destination[80], lateDrdyCount);
+  writeU32LE(&destination[84], mutexBusyCount);
+  writeU32LE(&destination[88], badStatusCount);
+  writeU32LE(&destination[92], maxReadTimeUs);
 }
 
 void publishBleStatus(bool notifyClient) {
@@ -2261,8 +2311,10 @@ bool readAdsFrame(uint8_t *destination, bool &drdyWasLow) {
     return false;
   }
 
-  // 读取 216 bit 期间保持时钟边沿连续。采集与串口已经由队列解耦。
-  noInterrupts();
+  // Do not mask interrupts for the complete 216-bit software-SPI frame.
+  // It takes roughly 2.9 ms every 4 ms, which starves the ESP32 BLE stack and
+  // causes notify congestion plus frameQueue overflow. ADS1299 SCLK may pause
+  // while CS stays asserted, so an ISR can safely stretch a clock phase.
   selectAds();
   delayMicroseconds(1);
 
@@ -2271,7 +2323,6 @@ bool readAdsFrame(uint8_t *destination, bool &drdyWasLow) {
   }
 
   deselectAllSpi();
-  interrupts();
   xSemaphoreGive(adsBusMutex);
   return true;
 }
@@ -2498,6 +2549,9 @@ void clearDiagnostics() {
   maxReadTimeUs = 0;
   bleNotifySuccessCount = 0;
   bleNotifyErrorCount = 0;
+  bleDataLastNotifyResult = 0;
+  bleNotifyConsecutiveErrors = 0;
+  bleNotifyBackoffUntilMs = 0;
   bleCommandDropCount = 0;
   bleMtuBlockedFrameCount = 0;
   bleBlocksSent = 0;
