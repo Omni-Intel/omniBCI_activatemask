@@ -56,11 +56,19 @@ import json
 import secrets
 import queue
 import threading
+import logging
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Tuple
+
+from app_diagnostics import (
+    HangWatchdog,
+    configure_logging,
+    dump_all_thread_stacks,
+    shutdown_logging,
+)
 
 from onmibci_ble_protocol import (
     MSG_GET_CONFIG,
@@ -335,6 +343,9 @@ ASSET_DIR = RESOURCE_DIR / "assets"
 RECORDINGS_DIR = APP_DIR / "recordings"
 LOGO_PATH = ASSET_DIR / "omni_logo_cnen.png"
 APP_ICON_PATH = ASSET_DIR / "omni_logo_mark.png"
+LOG_DIR = APP_DIR / "logs"
+APP_LOGGER = logging.getLogger("onmibci")
+APP_LOG_PATH = LOG_DIR / "onmibci.log"
 OMNI_ORANGE = "#ff5a01"
 OMNI_ORANGE_DARK = "#c94700"
 OMNI_BLACK = "#080808"
@@ -3071,6 +3082,9 @@ class MainWindow(QtWidgets.QMainWindow):
         format_action = file_menu.addAction("导出 BDF/FIF…")
         format_action.triggered.connect(self.export_biosignal_formats)
         file_menu.addSeparator()
+        log_action = file_menu.addAction("打开日志目录")
+        log_action.triggered.connect(self.open_log_directory)
+        file_menu.addSeparator()
         file_menu.addAction("退出", self.close, QtGui.QKeySequence.Quit)
         view_menu = self.menuBar().addMenu("视图")
         mne_action = view_menu.addAction("打开 MNE 浏览器")
@@ -3567,6 +3581,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().addWidget(self.file_status, 1)
         self.statusBar().addPermanentWidget(self.range_status)
         self.statusBar().addPermanentWidget(self.filter_status)
+        self.log_status = QtWidgets.QLabel("日志")
+        self.log_status.setToolTip(str(APP_LOG_PATH))
+        self.statusBar().addPermanentWidget(self.log_status)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self.page(-1))
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self, activated=lambda: self.page(1))
 
@@ -4641,6 +4658,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_status(self, text: str):
         self.status_label.setText(text)
+        if text != getattr(self, "_last_logged_status", None):
+            APP_LOGGER.info("status: %s", text)
+            self._last_logged_status = text
+
+    def open_log_directory(self):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        APP_LOGGER.info("opening log directory: %s", LOG_DIR)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(LOG_DIR)))
 
     def selected_transport(self) -> str:
         if hasattr(self, "transport_combo"):
@@ -8012,6 +8037,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_info_text()
 
     def closeEvent(self, event):  # noqa: N802
+        APP_LOGGER.info("application close requested")
         try:
             self.stop_stream()
             if self.stream_server is not None:
@@ -8027,18 +8053,73 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.filter_worker is not None:
                 self.filter_worker.shutdown()
         finally:
+            APP_LOGGER.info("application resources closed")
             event.accept()
 
 
 def main():
+    global APP_LOGGER, APP_LOG_PATH
+    APP_LOGGER, APP_LOG_PATH = configure_logging(LOG_DIR)
+    APP_LOGGER.info("OmniBCI GUI firmware=V19 protocol=V1 source=%s frozen=%s", __file__, IS_FROZEN)
+
+    original_excepthook = sys.excepthook
+
+    def log_unhandled(exc_type, exc_value, exc_traceback):
+        APP_LOGGER.critical(
+            "unhandled main-thread exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+        original_excepthook(exc_type, exc_value, exc_traceback)
+
+    def log_thread_exception(args):
+        APP_LOGGER.critical(
+            "unhandled thread exception: %s",
+            args.thread.name if args.thread else "unknown",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    def log_qt_message(message_type, context, message):
+        level = {
+            QtCore.QtMsgType.QtDebugMsg: logging.DEBUG,
+            QtCore.QtMsgType.QtInfoMsg: logging.INFO,
+            QtCore.QtMsgType.QtWarningMsg: logging.WARNING,
+            QtCore.QtMsgType.QtCriticalMsg: logging.ERROR,
+            QtCore.QtMsgType.QtFatalMsg: logging.CRITICAL,
+        }.get(message_type, logging.WARNING)
+        location = f"{context.file}:{context.line}" if context and context.file else "Qt"
+        APP_LOGGER.log(level, "%s %s", location, message)
+
+    sys.excepthook = log_unhandled
+    threading.excepthook = log_thread_exception
+    QtCore.qInstallMessageHandler(log_qt_message)
+
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("全域智能 ADS1299 EEG 工作站")
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
     win = MainWindow()
     win.show()
-    sys.exit(app.exec())
+    watchdog = HangWatchdog(
+        5.0,
+        lambda elapsed: APP_LOGGER.critical(
+            "GUI unresponsive for %.1f seconds; stacks=%s",
+            elapsed,
+            dump_all_thread_stacks(LOG_DIR, elapsed),
+        ),
+    )
+    watchdog_stop = watchdog.start()
+    heartbeat_timer = QtCore.QTimer(app)
+    heartbeat_timer.setInterval(500)
+    heartbeat_timer.timeout.connect(watchdog.heartbeat)
+    heartbeat_timer.start()
+    APP_LOGGER.info("GUI event loop starting; log=%s", APP_LOG_PATH)
+    try:
+        return app.exec()
+    finally:
+        watchdog_stop.set()
+        APP_LOGGER.info("GUI event loop stopped")
+        shutdown_logging(APP_LOGGER)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

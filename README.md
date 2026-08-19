@@ -124,27 +124,34 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 
 ## 固件选择与兼容性
 
-长时间 BLE 采集应使用项目内配套的 V18 固件：
+当前分支只保留并支持一套固件：
 
-- SRB1：`firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE.ino`
-- SRB2：`firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE.ino`
+- `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`
 
-V18 沿用 compact reliable BLE DATA protocol V2 / STATUS V4，因而仍可连接 V16/V17 可靠传输固件。但旧固件不具备 V18 的采集/发送任务隔离；要获得完整的长时连续性修复，应同时使用 V18 GUI 和 V18 固件。
+该固件为 **SRB1-only V19**，设备控制通信协议为 **V1**。GUI 只有在完成版本握手并取得 ADS1299 完整寄存器快照后，才确认设备已经就绪。
 
-V18 stale-NACK 热修复未改变 DATA/CONTROL 线格式，也未改变 72 字节 STATUS V4 布局。新固件会忽略已被后续累计 ACK 超越的过时 ACK/NACK 控制。旧固件可能留下历史 unknown-NACK 计数；V18 GUI 仅在该计数持续增长时将其作为当前异常。
+BLE 使用 `DATA`、`CONTROL`、`STATUS` 和独立的 `RESPONSE` 特征。配置请求包含事务 ID、长度和 CRC，固件通过 `RESPONSE` 返回相同事务 ID 和寄存器读回结果，避免旧 ACK 与周期状态包混淆。
 
-### V18 固件任务配置
+### V19 固件任务配置
 
-SRB1 与 SRB2 BLE 固件使用相同的连续性架构：
+V19 使用以下连续性架构：
 
 - ADS 采集任务：优先级 5
 - `frameQueue` 到可靠保留环的打包任务：优先级 3
 - BLE DATA notify 任务：优先级 1
 - 可靠保留容量：384 个六帧块，约 9.2 秒（250 SPS）
 
-### SRB1 P-only 参考固件
+SRB2、运行时参考切换和其他历史固件已经从本分支移除。
 
-`firmware/ESP32C3_ADS1299_SRB1_PONLY_REFERENCE/` 是名称和行为固定的 SRB1 专用参考版本，不接受 SRB2 配置。
+## 运行日志与卡死诊断
+
+程序运行日志保存在项目或 EXE 同级的 `logs/onmibci.log`。日志文件达到
+10 MB 后自动滚动，最多保留 10 个历史文件。通过“文件 → 打开日志目录”
+可以直接打开该目录。
+
+如果 GUI 主线程连续 5 秒没有响应，后台监测线程会自动生成
+`logs/hang_YYYYMMDD_HHMMSS.log`，其中包含所有 Python 线程的调用栈。
+排查卡死时应同时提供 `onmibci.log` 和对应时间的 `hang_*.log`。
 
 电极接法：
 
@@ -311,8 +318,6 @@ dist\OmniBCI_V16\
 - `README_V16.md`
 - `README_CONTINUITY_FIX.md`
 - `CHANGELOG.md`
-- `firmware/ESP32C3_ADS1299_SRB1_BLE/ESP32C3_ADS1299_SRB1_BLE_README.md`
-- `firmware/ESP32C3_ADS1299_SRB2_BLE/ESP32C3_ADS1299_SRB2_BLE_README.md`
-- `firmware/ESP32C3_ADS1299_SRB1_PONLY_REFERENCE/ESP32C3_ADS1299_SRB1_PONLY_REFERENCE_README.md`
+- `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19_README.md`
 
 整理时同时修正了旧入口文档中指向不存在的 `CHANGELOG_V18.md` 与 `TEST_REPORT_V18.txt` 的提示；相关信息现已分别收录在本 README、`VERSION_AND_QUICK_START.txt`、`FIRMWARE_COMPATIBILITY.txt`、`EXE_BUILD_NOTES.txt` 和 `VALIDATION_REPORTS.txt` 中。
