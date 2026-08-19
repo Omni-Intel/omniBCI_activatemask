@@ -61,6 +61,44 @@ class _FakeEdfWriter:
 
 
 class BdfExportTests(unittest.TestCase):
+    def test_save_bdf_uses_session_channel_names(self):
+        fake_pyedflib = types.SimpleNamespace(
+            EdfWriter=_FakeEdfWriter,
+            FILETYPE_BDFPLUS=42,
+        )
+        previous = sys.modules.get("pyedflib")
+        sys.modules["pyedflib"] = fake_pyedflib
+        _FakeEdfWriter.instances.clear()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                window = MainWindow.__new__(MainWindow)
+                window.offline_uv = np.zeros((CHANNELS, 2), dtype=np.float32)
+                window.offline_valid = np.ones(2, dtype=bool)
+                window.channel_names = [f"INP{index}" for index in range(1, 9)]
+
+                window.save_bdf(Path(directory) / "named.bdf")
+
+                labels = [
+                    header["label"]
+                    for header in _FakeEdfWriter.instances[0].headers
+                ]
+                self.assertEqual(labels, window.channel_names)
+        finally:
+            if previous is None:
+                sys.modules.pop("pyedflib", None)
+            else:
+                sys.modules["pyedflib"] = previous
+
+    def test_channel_name_validation_rejects_invalid_or_duplicate_names(self):
+        window = MainWindow.__new__(MainWindow)
+        window.channel_names = [f"CH{index}" for index in range(1, 9)]
+
+        self.assertEqual(window.validated_channel_name(0, " Fp1 "), "Fp1")
+        for invalid in ("", "CH2", "\u989d\u6781", "12345678901234567"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    window.validated_channel_name(0, invalid)
+
     def test_export_recording_bdf_reads_all_segments_and_writes_markers(self):
         fake_pyedflib = types.SimpleNamespace(
             EdfWriter=_FakeEdfWriter,
@@ -79,6 +117,7 @@ class BdfExportTests(unittest.TestCase):
 
                 window = MainWindow.__new__(MainWindow)
                 window.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
+                window.channel_names = [f"EEG{index}" for index in range(1, 9)]
                 window.raw_writer = types.SimpleNamespace(
                     snapshot=lambda: {
                         "segments": [
@@ -107,6 +146,10 @@ class BdfExportTests(unittest.TestCase):
                 self.assertEqual(result["sample_count"], 2)
                 self.assertEqual(result["event_count"], 2)
                 self.assertEqual(len(_FakeEdfWriter.instances[0].samples[0]), 2)
+                self.assertEqual(
+                    [header["label"] for header in _FakeEdfWriter.instances[0].headers],
+                    window.channel_names,
+                )
                 self.assertEqual(len(_FakeEdfWriter.instances[0].annotations), 2)
                 self.assertTrue(
                     any(
@@ -135,6 +178,7 @@ class BdfExportTests(unittest.TestCase):
             )
             window = MainWindow.__new__(MainWindow)
             window.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
+            window.channel_names = [f"CH{index}" for index in range(1, 9)]
             window.raw_writer = types.SimpleNamespace(
                 snapshot=lambda: {"segments": [{"path": str(segment)}]}
             )

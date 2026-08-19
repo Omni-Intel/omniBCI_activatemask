@@ -2539,6 +2539,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.gain = 24  # legacy/global command value
         self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
+        self.channel_names = [f"CH{index}" for index in range(1, CHANNELS + 1)]
         self.channel_enabled = np.array([True] * 5 + [False] * 3, dtype=bool)
         self.channel_bias = np.array([True] * 5 + [False] * 3, dtype=bool)
         # Default: measurement electrodes on INxN and the common reference
@@ -3818,6 +3819,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "channel_buttons"):
             return
         for ch, button in enumerate(self.channel_buttons):
+            name = self.channel_names[ch]
             enabled = bool(self.channel_enabled[ch])
             bias = "BIAS✓" if self.channel_bias[ch] else "BIAS—"
             power = "ON" if enabled else "OFF"
@@ -3825,12 +3827,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 reference = "SRB2✓" if self.channel_srb2[ch] and enabled else "SRB2—"
             else:
                 reference = "SRB1全局"
-            button.setText(f"CH{ch+1}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {reference}")
+            button.setText(f"{name}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {reference}")
             icon = QtGui.QPixmap(11, 11)
             icon.fill(QtGui.QColor("#56bd31" if enabled else "#8b969e"))
             button.setIcon(QtGui.QIcon(icon))
             button.setToolTip(
-                f"CH{ch+1}: {'启用' if enabled else '禁用'}, PGA ×{int(self.channel_gains[ch])}, "
+                f"{name} (INP{ch+1}): {'启用' if enabled else '禁用'}, "
+                f"PGA ×{int(self.channel_gains[ch])}, "
                 f"{'参与' if self.channel_bias[ch] else '不参与'} {self.bias_register_name()}；"
                 + (
                     f"SRB2 {'接入' if self.channel_srb2[ch] and enabled else '断开'}"
@@ -3838,6 +3841,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     else "EEG 模式使用全局 SRB1"
                 )
             )
+            if hasattr(self, "channel_plots"):
+                self.channel_plots[ch].setLabel("left", name, units="uV")
+            self.channel_combo.setItemText(ch, name)
+            self.single_channel_combo.setItemText(ch, name)
+
+    def validated_channel_name(self, ch, name):
+        name = str(name).strip()
+        if not name:
+            raise ValueError("通道名称不能为空。")
+        if len(name) > 16:
+            raise ValueError("通道名称最多 16 个字符。")
+        if any(ord(char) < 32 or ord(char) > 126 for char in name):
+            raise ValueError("通道名称只能使用英文、数字和 ASCII 符号。")
+        duplicates = {
+            existing.casefold()
+            for index, existing in enumerate(self.channel_names)
+            if index != ch
+        }
+        if name.casefold() in duplicates:
+            raise ValueError("通道名称不能重复。")
+        return name
 
     def open_channel_settings(self, ch):
         self._select_channel(ch)
@@ -3845,6 +3869,9 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.setWindowTitle(f"CH{ch+1} 通道设置")
         dialog.setModal(True)
         form = QtWidgets.QFormLayout(dialog)
+        channel_name = QtWidgets.QLineEdit(self.channel_names[ch])
+        channel_name.setMaxLength(16)
+        form.addRow("通道名称", channel_name)
         summary = QtWidgets.QLabel()
         summary.setStyleSheet("background:#fff0e6;color:#b83c00;border:1px solid #ffb589;padding:8px;font-weight:bold;")
         form.addRow(summary)
@@ -3898,15 +3925,34 @@ class MainWindow(QtWidgets.QMainWindow):
         bias.toggled.connect(update_summary)
         srb2.toggled.connect(update_summary)
         update_summary()
+        selected_name = self.channel_names[ch]
+
+        def accept_settings():
+            nonlocal selected_name
+            try:
+                selected_name = self.validated_channel_name(ch, channel_name.text())
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(dialog, "通道名称无效", str(exc))
+                return
+            dialog.accept()
+
         buttons.rejected.connect(dialog.reject)
-        buttons.accepted.connect(dialog.accept)
+        buttons.accepted.connect(accept_settings)
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         self.apply_channel_settings(
-            ch, enabled.isChecked(), int(gain.currentText()), bias.isChecked(), srb2.isChecked()
+            ch,
+            enabled.isChecked(),
+            int(gain.currentText()),
+            bias.isChecked(),
+            srb2.isChecked(),
+            selected_name,
         )
 
-    def apply_channel_settings(self, ch, enabled, gain, bias, srb2=None):
+    def apply_channel_settings(self, ch, enabled, gain, bias, srb2=None, channel_name=None):
+        if channel_name is None:
+            channel_name = self.channel_names[ch]
+        channel_name = self.validated_channel_name(ch, channel_name)
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
         if srb2 is None:
@@ -3954,6 +4000,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.channel_gains[ch] = int(gain)
             self.channel_bias[ch] = bool(bias and enabled)
             self.channel_srb2[ch] = bool(srb2 and enabled)
+            self.channel_names[ch] = channel_name
             self.set_bias_checks(sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i]))
             self.refresh_channel_parameter_labels()
             # Start a fresh display/filter epoch for the new hardware channel
@@ -4212,7 +4259,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 peak = float(np.max(np.abs(finite))) if finite.size else 1.0
                 physical_peak = max(100, int(np.ceil(peak * 1.1)))
                 headers.append({
-                    "label": f"CH{ch + 1}",
+                    "label": self.channel_names[ch],
                     "dimension": "uV",
                     "sample_frequency": FS,
                     "physical_min": -physical_peak,
@@ -4294,7 +4341,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 peak = float(np.max(np.abs(finite))) if finite.size else 1.0
                 physical_peak = max(100, int(np.ceil(peak * 1.1)))
                 headers.append({
-                    "label": f"CH{ch + 1}",
+                    "label": self.channel_names[ch],
                     "dimension": "uV",
                     "sample_frequency": FS,
                     "physical_min": -physical_peak,
