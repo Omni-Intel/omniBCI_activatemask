@@ -2573,13 +2573,22 @@ class MainWindow(QtWidgets.QMainWindow):
             })
         if len(data) >= 76:
             status["config_generation"] = int.from_bytes(data[72:76], "little")
+        if len(data) >= 96:
+            status.update({
+                "missed_drdy": int.from_bytes(data[76:80], "little"),
+                "late_drdy": int.from_bytes(data[80:84], "little"),
+                "mutex_busy": int.from_bytes(data[84:88], "little"),
+                "bad_status": int.from_bytes(data[88:92], "little"),
+                "max_read_us": int.from_bytes(data[92:96], "little"),
+            })
 
         previous = dict(self.ble_status)
         counter_keys = (
             "queue_drop", "notify_error", "command_drop", "mtu_blocked", "blocks_sent",
             "reliable_ack_count", "reliable_nack_count", "reliable_retransmit",
             "reliable_recovered", "reliable_overflow", "reliable_unknown_nack",
-            "reliable_protocol_error",
+            "reliable_protocol_error", "missed_drdy", "late_drdy", "mutex_busy",
+            "bad_status",
         )
         delta = {}
         for key in counter_keys:
@@ -2598,7 +2607,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ble_peer_mtu = self.ble_status["mtu"]
         self.current_mode = int(self.ble_status["mode"])
         self._sync_internal_short_button(self.current_mode == 3)
-        if (len(data) < 76 or data[2] != 0x04) and not self.ble_protocol_warned:
+        if (len(data) < 96 or data[2] != 0x05) and not self.ble_protocol_warned:
             self.ble_protocol_warned = True
             self.set_status(
                 "BLE STATUS 格式不匹配：请烧录 SRB1-only 固件 V19。"
@@ -3650,6 +3659,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "reliable_stored", "reliable_outstanding", "reliable_ack_count",
             "reliable_nack_count", "reliable_retransmit", "reliable_recovered",
             "reliable_overflow", "reliable_unknown_nack", "reliable_protocol_error",
+            "missed_drdy", "late_drdy", "mutex_busy", "bad_status", "max_read_us",
         ):
             if key in self.ble_status:
                 self.ble_status[key] = 0
@@ -3658,11 +3668,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_stream(self):
         if not self.require_transport():
             return
-        if self.active_transport == "ble" and int(self.ble_status.get("status_protocol", 0)) not in (0x03, 0x04):
+        if self.active_transport == "ble" and int(self.ble_status.get("status_protocol", 0)) != 0x05:
             QtWidgets.QMessageBox.warning(
                 self,
                 "BLE 固件不匹配",
-                "V18 BLE 模式请使用本压缩包内配套 V18 固件。旧 reliable 固件可连接，但不包含采集/TX 隔离和过期 NACK 抑制。",
+                "请使用配套 SRB1-only V19 固件。旧固件可连接，但不包含当前 BLE 稳定性改进。",
             )
             return
         if (
@@ -5416,6 +5426,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("BLE MTU", str(self.ble_status.get('mtu', self.ble_peer_mtu) if self.active_transport == 'ble' else '---')),
             ("FW frameQ/notifyErr", f"{self.ble_status.get('queue_drop', 0)} / {self.ble_status.get('notify_error', 0)}"),
             ("FW cmd/MTU", f"{self.ble_status.get('command_drop', 0)} / {self.ble_status.get('mtu_blocked', 0)}"),
+            ("FW DRDY missed/late", f"{self.ble_status.get('missed_drdy', 0)} / {self.ble_status.get('late_drdy', 0)}"),
+            ("FW mutex/status/read", f"{self.ble_status.get('mutex_busy', 0)} / {self.ble_status.get('bad_status', 0)} / {self.ble_status.get('max_read_us', 0)} us"),
             ("Reliable RX", f"{reliable['blocks_received']} / {reliable['blocks_delivered']}"),
             ("Reliable pending", f"{reliable['pending_blocks']} / max {reliable['max_pending']}"),
             ("BLE decode Q/peak", f"{reliable['decode_queued_bytes']} / {reliable['decode_peak_bytes']} B"),
