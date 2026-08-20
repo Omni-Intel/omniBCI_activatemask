@@ -59,6 +59,35 @@ install_optional_exports.bat
 
 可选包安装失败不会阻止实时采集、滤波、绘图和 BIN 记录。
 
+## 代码结构与开发
+
+核心代码已拆分为 `omnibci/` 包，主入口 `ads1299_eeg_gui_native.py` 保留
+`MainWindow` 编排层与 `main()`，并对迁移符号做兼容 re-export（测试与同事
+脚本可继续从主模块导入）：
+
+| 模块 | 职责 |
+|---|---|
+| `omnibci/constants.py` | 全部常量、设备参数与路径 |
+| `omnibci/protocol.py` | 48 字节帧解析、CRC16、时间线展开 |
+| `omnibci/ring_buffer.py` | 原始/滤波时间线环形缓冲 |
+| `omnibci/filtering.py` | 实时 IIR 滤波线程 |
+| `omnibci/recording.py` | 异步分段 BIN 写盘与元数据 |
+| `omnibci/transport_serial.py` | 串口持续接收线程 |
+| `omnibci/transport_ble.py` | BLE asyncio 循环、可靠重组与 ACK/NACK |
+| `omnibci/ui_widgets.py` | 软 Trigger 窗口、时钟轴、PSD worker |
+
+开发依赖与检查：
+
+```powershell
+uv sync                      # 含 dev 组（ruff + pytest）
+uv run ruff check            # pyflakes 基线（未定义名/未使用导入等）
+uv run pytest                # 等价于 python -m unittest discover -s tests
+```
+
+CI（`.github/workflows/ci.yml`）在 Windows runner 上执行 ruff + pytest；
+EXE 构建 workflow 不变。程序使用 `QLockFile` 保证单实例运行，重复启动
+会提示“程序已在运行”并退出。
+
 ## 本地实时数据 API 与 Python SDK
 
 GUI 启动后会在本机 `127.0.0.1:8765` 提供 WebSocket 数据接口。接口只

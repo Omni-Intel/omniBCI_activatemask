@@ -221,3 +221,5 @@ __marimo__/
 
 # Custom
 recordings/
+logs/
+.workbuddy/

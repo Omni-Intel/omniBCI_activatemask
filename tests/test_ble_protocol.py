@@ -1,7 +1,6 @@
 import unittest
 
 from onmibci_ble_protocol import (
-    ConfigSnapshot,
     MSG_GET_CONFIG,
     MSG_RESPONSE,
     ProtocolError,

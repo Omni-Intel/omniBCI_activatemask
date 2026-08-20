@@ -174,7 +174,8 @@ constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
 constexpr uint8_t FIRMWARE_VERSION_MAJOR = 19;
-constexpr uint8_t FIRMWARE_VERSION_MINOR = 0;
+constexpr uint8_t FIRMWARE_VERSION_MINOR = 1;  // scan-response name fix, deferred
+                                               // conn-param update, 32-block TX window
 constexpr uint8_t FIRMWARE_VERSION_PATCH = 0;
 constexpr uint8_t DEVICE_PROTOCOL_VERSION = 1;
 
@@ -235,7 +236,12 @@ constexpr size_t BLE_RELIABLE_CRC_BYTES = 2;
 constexpr size_t BLE_RELIABLE_PACKET_MAX_BYTES = BLE_RELIABLE_HEADER_BYTES + BLE_RELIABLE_PAYLOAD_BYTES + BLE_RELIABLE_CRC_BYTES;
 static_assert(BLE_RELIABLE_PACKET_MAX_BYTES <= (BLE_REQUESTED_MTU - 3u), "compact BLE block must fit one MTU-247 notification");
 constexpr uint16_t BLE_RELIABLE_RING_BLOCKS = 384;       // about 9.22 s at 250 SPS
-constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 16;      // about 0.38 s unacked in flight
+constexpr uint16_t BLE_RELIABLE_WINDOW_BLOCKS = 32;      // about 0.77 s unacked in flight
+// V19.1: the window was 16 blocks (~0.38 s). Windows routinely batches the
+// GATT writes carrying our cumulative ACKs for several hundred milliseconds;
+// with the old window that fully stalled new transmissions (observed as
+// ~20% sample delivery right before a link drop). 32 blocks absorbs that
+// latency while staying far below the 384-block retention ring.
 constexpr uint32_t BLE_RELIABLE_TX_PACE_FAST_MS = 9;     // fast adapter / low in-flight occupancy
 constexpr uint32_t BLE_RELIABLE_TX_PACE_NORMAL_MS = 14;  // moderate Windows batching
 constexpr uint32_t BLE_RELIABLE_TX_PACE_SLOW_MS = 20;    // near-full in-flight window
@@ -333,6 +339,18 @@ volatile bool bleConnected = false;
 volatile bool bleDataSubscribed = false;
 volatile bool bleRestartAdvertisingRequested = false;
 volatile bool bleResetReliableRequested = false;
+// V19.1: connection-parameter update is deferred out of onConnect. Issuing
+// it from the callback races Windows' post-connect service discovery and
+// MTU exchange, which can destabilize or drop the fresh link. bleTxTask
+// performs the request BLE_CONN_PARAM_UPDATE_DELAY_MS after connect.
+static volatile bool bleConnParamUpdatePending = false;
+static uint32_t bleConnParamUpdateAtMs = 0;
+constexpr uint32_t BLE_CONN_PARAM_UPDATE_DELAY_MS = 2000;
+#if defined(CONFIG_BLUEDROID_ENABLED)
+static uint8_t bleConnParamBda[6] = {0};
+#else
+static volatile uint16_t bleConnParamHandle = 0xFFFF;
+#endif
 volatile uint16_t bleConnectionId = 0xFFFF;
 volatile uint16_t blePeerMtu = 23;
 volatile uint32_t bleNotifySuccessCount = 0;
@@ -513,6 +531,7 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
     bleConnectionId = 0xFFFF;
     blePeerMtu = 23;
     bleResetReliableRequested = true;
+    bleConnParamUpdatePending = false;
     // Restart advertising from transportTask, not from the BLE callback.
     bleRestartAdvertisingRequested = true;
   }
@@ -534,7 +553,12 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
       // 6..12 units = 7.5..15 ms. The Windows central may choose another
       // value, but requesting this range gives reliable EEG blocks
       // enough connection events instead of silently falling behind.
-      server->updateConnParams(param->connect.remote_bda, 6, 12, 0, 400);
+      // V19.1: the request itself is deferred to bleTxTask (see
+      // BLE_CONN_PARAM_UPDATE_DELAY_MS) because issuing it from this
+      // callback races Windows' service discovery / MTU exchange.
+      memcpy(bleConnParamBda, param->connect.remote_bda, sizeof(bleConnParamBda));
+      bleConnParamUpdateAtMs = millis() + BLE_CONN_PARAM_UPDATE_DELAY_MS;
+      bleConnParamUpdatePending = true;
     }
   }
 
@@ -554,7 +578,11 @@ class EegBleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server, ble_gap_conn_desc *description) override {
     markConnected(server);
     if (server && description) {
-      server->updateConnParams(description->conn_handle, 6, 12, 0, 400);
+      // V19.1: deferred to bleTxTask (see BLE_CONN_PARAM_UPDATE_DELAY_MS);
+      // the callback context may still be inside the central's discovery.
+      bleConnParamHandle = description->conn_handle;
+      bleConnParamUpdateAtMs = millis() + BLE_CONN_PARAM_UPDATE_DELAY_MS;
+      bleConnParamUpdatePending = true;
     }
   }
 
@@ -969,6 +997,22 @@ void transportTask(void *argument) {
 void bleTxTask(void *argument) {
   (void)argument;
   for (;;) {
+    // Deferred connection-parameter update (see onConnect): requesting the
+    // interval range from the BLE callback raced Windows' service discovery
+    // and MTU exchange; here it is issued on a quiet, connected link.
+    if (bleConnParamUpdatePending && bleConnected && bleServer) {
+      const uint32_t now = millis();
+      if ((int32_t)(now - bleConnParamUpdateAtMs) >= 0) {
+        bleConnParamUpdatePending = false;
+#if defined(CONFIG_BLUEDROID_ENABLED)
+        // 6..12 units = 7.5..15 ms; the Windows central may choose another value.
+        bleServer->updateConnParams(bleConnParamBda, 6, 12, 0, 400);
+#elif defined(CONFIG_NIMBLE_ENABLED)
+        bleServer->updateConnParams(bleConnParamHandle, 6, 12, 0, 400);
+#endif
+      }
+    }
+
     if (bleStatusNotifyPending && bleConnected && bleStatusCharacteristic) {
       bleStatusNotifyPending = false;
       bleStatusCharacteristic->notify();
@@ -1544,7 +1588,14 @@ bool initBle() {
   service->start();
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(BLE_SERVICE_UUID);
-  advertising->setScanResponse(false);
+  // V19.1: the 128-bit service UUID (18 B) + flags (3 B) leave only ~10 bytes
+  // of the 31-byte advertisement, which truncated the device name to
+  // "OmniBCI-" (8 chars). Every GUI scan reported "未看到已知的 OmniBCI 设备名"
+  // and users had to guess the device manually. With the scan response
+  // enabled, the complete name "OmniBCI-C3-SRB1-V19" goes into the separate
+  // 31-byte scan-response payload that active scanners (Windows/Bleak,
+  // nRF Connect) always read.
+  advertising->setScanResponse(true);
   // Do not force an advertising connection-interval hint; the central controls it.
   advertising->setMinPreferred(0x00);
   BLEDevice::startAdvertising();
@@ -1621,8 +1672,9 @@ uint16_t reliableInFlightBlocks() {
 
 uint32_t reliableAdaptiveTxPaceMs() {
   const uint16_t inFlight = reliableInFlightBlocks();
-  if (inFlight >= 12u) return BLE_RELIABLE_TX_PACE_SLOW_MS;
-  if (inFlight >= 8u) return BLE_RELIABLE_TX_PACE_NORMAL_MS;
+  // Thresholds track 50%/75% of BLE_RELIABLE_WINDOW_BLOCKS (see V19.1 note).
+  if (inFlight >= 24u) return BLE_RELIABLE_TX_PACE_SLOW_MS;
+  if (inFlight >= 16u) return BLE_RELIABLE_TX_PACE_NORMAL_MS;
   return BLE_RELIABLE_TX_PACE_FAST_MS;
 }
 

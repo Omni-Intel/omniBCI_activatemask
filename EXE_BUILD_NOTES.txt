@@ -1,39 +1,52 @@
-OMNIBCI WINDOWS EXE BUILD AND DISTRIBUTION
-==========================================
+OMNIBCI WINDOWS EXE BUILD AND DISTRIBUTION (V19)
+================================================
 
 Recommended format: PyInstaller ONEDIR.
 
 Build machine
 -------------
 Windows 10/11 x64.
-Python 3.12 x64 is recommended; Python 3.11 is also supported by build_exe.bat.
+Python 3.12 x64 (or the project .venv created by uv / install_and_run.bat).
 
 Option A - local one-click build
 --------------------------------
-1. Install 64-bit Python 3.12 on the build computer.
-2. Double-click build_exe.bat.
-3. Wait for BUILD SUCCESS.
-4. Open dist\OmniBCI_V16\.
-5. Send or zip the entire directory.
-6. On the target computer, run OmniBCI_V16.exe.
+1. Double-click build_exe.bat.
+2. Wait for BUILD SUCCESS.
+3. Open dist\OmniBCI_V19\.
+4. Send or zip the entire directory.
+5. On the target computer, run OmniBCI_V19.exe.
+
+Build modes:
+- build_exe.bat              full build, bundles mne + pyedflib
+                             (BDF+/FIF export and MNE browser work in the EXE)
+- build_exe.bat --slim       live acquisition only, smaller folder
+                             (no mne/pyedflib; BDF/FIF export disabled)
+
+How the build picks Python:
+- If the project .venv exists and has all dependencies (including mne/pyedflib
+  for full builds), it is reused and PyInstaller is added via uv.
+- Otherwise an isolated .buildvenv is created from requirements.txt
+  (+ requirements_optional_export.txt in full mode), using the SUSTech
+  PyPI mirror.
 
 Option B - GitHub Actions
 -------------------------
 1. Commit the project, including .github/workflows/build-v16-windows-exe.yml.
 2. Open the repository Actions page.
-3. Run "Build OmniBCI V16 Windows EXE".
-4. Download the OmniBCI_V16_Windows artifact.
+3. Run "Build OmniBCI V19 Windows EXE".
+4. Download the OmniBCI_V19_Windows artifact.
 
 Distribution rules
 ------------------
-- Send the ENTIRE dist\OmniBCI_V16\ directory.
-- Do not copy OmniBCI_V16.exe alone. The adjacent _internal directory contains
+- Send the ENTIRE dist\OmniBCI_V19\ directory.
+- Do not copy OmniBCI_V19.exe alone. The adjacent _internal directory contains
   the Python runtime, Qt libraries and scientific packages.
 - The target computer does not need Python, pip, pyserial, scipy, PySide6 or
   bleak.
-- Recordings are written to OmniBCI_V16\recordings\ beside the executable.
-- The live EXE excludes optional mne/pyedflib. Use the source/venv edition when
-  BDF/FIF export is required.
+- Recordings are written to OmniBCI_V19\recordings\{bin,bdf,fif}\ beside the
+  executable; logs go to OmniBCI_V19\logs\onmibci.log.
+- Full (default) builds include mne/pyedflib, so BDF/FIF export works.
+  Slim builds exclude them; live USB/BLE acquisition is unaffected either way.
 
 Why ONEDIR
 ----------
@@ -44,5 +57,6 @@ Why ONEDIR
 
 Naming note
 -----------
-The build assets still use OmniBCI_V16 names although the current source GUI is
-V18. Aligning artifact names with V18 is recommended before a formal release.
+Build artifacts were renamed from OmniBCI_V16 to OmniBCI_V19 to match the
+current GUI/firmware version (V19, SRB1-only, BLE device protocol V1).
+The old OmniBCI_V16.spec is kept for reference only and is no longer used.

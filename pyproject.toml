@@ -1,7 +1,7 @@
 [project]
 name = "onmibci-activatemask"
 version = "0.1.0"
-description = "Add your description here"
+description = "OmniBCI ADS1299 八通道 EEG 采集上位机：USB/BLE 实时采集、实时滤波与 PSD、BIN/BDF+ 记录导出、本地 WebSocket SDK"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -21,6 +21,33 @@ export = [
     "mne>=1.6",
     "pyedflib>=0.1.39",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+# Ruff 基线：F（pyflakes）抓真实缺陷——未定义名、重复定义、未使用导入。
+# 暂不做风格类强制（E/W/I/UP/B），存量 GUI 代码噪音太大，后续逐步收紧。
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F"]
+
+[tool.ruff.lint.per-file-ignores]
+# ads1299_eeg_gui_native.py 是兼容门脸（facade）：从 omnibci 包 star-import
+# 常量并显式 re-export 类/函数，供 tests 与同事脚本继续从主模块导入。
+# F401/F403/F405 是该模式的固有噪音；F841 为 5 处存量死变量，另行清理。
+"ads1299_eeg_gui_native.py" = ["F401", "F403", "F405", "F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# unittest 风格的测试 pytest 可直接收集运行；离线 Qt 环境由测试自身设置
+# QT_QPA_PLATFORM=offscreen。
+addopts = "-q"
 
 [[tool.uv.index]]
 url = "https://mirrors.sustech.edu.cn/pypi/web/simple"

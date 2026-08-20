@@ -1,12 +1,16 @@
-name: Build OmniBCI V16 Windows EXE
+name: Build OmniBCI V19 Windows EXE
 
 on:
   workflow_dispatch:
   push:
     paths:
       - 'ads1299_eeg_gui_native.py'
+      - 'app_diagnostics.py'
+      - 'onmibci_*.py'
+      - 'omnibci/**'
       - 'requirements.txt'
-      - 'OmniBCI_V16.spec'
+      - 'requirements_optional_export.txt'
+      - 'OmniBCI_V19.spec'
       - 'assets/**'
       - 'firmware/**'
       - '.github/workflows/build-v16-windows-exe.yml'
@@ -30,24 +34,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements.txt
+          python -m pip install -r requirements_optional_export.txt
           python -m pip install "pyinstaller>=6.10,<7"
 
       - name: Build ONEDIR EXE
         shell: pwsh
+        env:
+          OMNIBCI_BUNDLE_EXPORTS: '1'
         run: |
-          python -m PyInstaller --noconfirm --clean OmniBCI_V16.spec
-          New-Item -ItemType Directory -Force dist\OmniBCI_V16\recordings | Out-Null
-          Copy-Item -Recurse -Force firmware dist\OmniBCI_V16\firmware
-          Copy-Item README.md dist\OmniBCI_V16\README.md
-          Copy-Item VERSION_AND_QUICK_START.txt dist\OmniBCI_V16\VERSION_AND_QUICK_START.txt
-          Copy-Item FIRMWARE_COMPATIBILITY.txt dist\OmniBCI_V16\FIRMWARE_COMPATIBILITY.txt
-          Copy-Item EXE_BUILD_NOTES.txt dist\OmniBCI_V16\EXE_BUILD_NOTES.txt
-          Copy-Item VALIDATION_REPORTS.txt dist\OmniBCI_V16\VALIDATION_REPORTS.txt
-          Compress-Archive -Path dist\OmniBCI_V16 -DestinationPath OmniBCI_V16_Windows.zip -Force
+          python -m PyInstaller --noconfirm --clean OmniBCI_V19.spec
+          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings\bin | Out-Null
+          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings\bdf | Out-Null
+          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings\fif | Out-Null
+          New-Item -ItemType Directory -Force dist\OmniBCI_V19\logs | Out-Null
+          # Release package intentionally contains only the executable runtime.
+          Compress-Archive -Path dist\OmniBCI_V19 -DestinationPath OmniBCI_V19_Windows.zip -Force
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: OmniBCI_V16_Windows
-          path: OmniBCI_V16_Windows.zip
+          name: OmniBCI_V19_Windows
+          path: OmniBCI_V19_Windows.zip
           if-no-files-found: error
