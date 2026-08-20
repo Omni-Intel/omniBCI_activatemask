@@ -281,6 +281,15 @@ class BleTransportWorker(QtCore.QThread):
         self._reliable_last_delivery_monotonic = 0.0
         self._watchdog_reconnects = 0
         self._watchdog_last_reconnect_monotonic = 0.0
+        self._peer_status_protocol = 0
+        self._legacy_v4_ack_retries = 0
+        self._legacy_v4_ack_probes = 0
+        self._legacy_v4_reliable_resets = 0
+        self._legacy_v4_fast_forward_events = 0
+        self._legacy_v4_fast_forward_blocks = 0
+        self._legacy_v4_last_retry_monotonic = 0.0
+        self._legacy_v4_last_probe_monotonic = 0.0
+        self._legacy_v4_last_reset_monotonic = 0.0
         self._gatt_write_lock = None
         self._control_pending_lock = threading.Lock()
         self._pending_ack_packet: Optional[bytes] = None
@@ -515,8 +524,10 @@ class BleTransportWorker(QtCore.QThread):
                 # cumulative ACK makes the firmware report an "unknown NACK"
                 # even though no data was actually lost.
                 packet_to_send = bytes(packet)
+                is_ack = kind in ("ack", "ack_retry")
+                is_nack = kind == "nack"
                 if (
-                    kind in ("ack", "nack")
+                    (is_ack or is_nack)
                     and len(packet_to_send) == BLE_CTRL_PACKET_BYTES
                     and packet_to_send[:2] == BLE_CTRL_MAGIC
                     and packet_to_send[2] == BLE_CTRL_VERSION
@@ -525,13 +536,13 @@ class BleTransportWorker(QtCore.QThread):
                     with self._reliable_lock:
                         current_session = self._reliable_session_id
                         if current_session is None or int(session_id) != int(current_session):
-                            if kind == "nack":
+                            if is_nack:
                                 self._reliable_stale_nack_suppressed += 1
                             else:
                                 self._reliable_stale_ack_suppressed += 1
                             return
 
-                        if kind == "nack":
+                        if is_nack:
                             expected = int(self._reliable_expected_block)
                             pending_keys = sorted(self._reliable_pending)
                             has_hole = bool(pending_keys and pending_keys[0] > expected)
@@ -550,20 +561,34 @@ class BleTransportWorker(QtCore.QThread):
                         else:
                             ack_seq = int(seq_a)
                             last_wire = int(self._reliable_last_ack_wire)
-                            if last_wire != 0xFFFFFFFF and ack_seq <= last_wire:
+                            if kind == "ack" and last_wire != 0xFFFFFFFF and ack_seq <= last_wire:
                                 self._reliable_stale_ack_suppressed += 1
                                 return
+                            # A V4 retry deliberately repeats the latest
+                            # cumulative ACK. Never let an older queued retry
+                            # move the firmware acknowledgement backwards.
+                            if kind != "ack" and last_wire != 0xFFFFFFFF and ack_seq < last_wire:
+                                ack_seq = last_wire
+                                packet_to_send = self._make_reliable_control_packet(
+                                    BLE_CTRL_ACK, current_session, ack_seq
+                                )
 
-                # ACK and NACK are tiny CRC-protected, idempotent/repeated
-                # controls. Write-without-response keeps them out of the Windows
-                # response queue and prevents a repair request from blocking
-                # later cumulative ACKs. RESET remains write-with-response.
+                # ACK/NACK are CRC-protected, idempotent controls and stay out of
+                # the Windows response queue. The legacy V4 stack can also hold
+                # RESET write-with-response for seconds when resources are
+                # exhausted, so only that compatibility profile sends RESET
+                # without a response. V5 keeps the stronger acknowledged RESET.
+                response_required = kind == "reset" and self._peer_status_protocol != 0x04
                 await client.write_gatt_char(
-                    BLE_CONTROL_UUID, packet_to_send, response=(kind not in ("ack", "nack"))
+                    BLE_CONTROL_UUID,
+                    packet_to_send,
+                    response=response_required,
                 )
             with self._reliable_lock:
-                if kind == "ack":
+                if kind in ("ack", "ack_retry"):
                     self._reliable_ack_sent += 1
+                    if kind == "ack_retry":
+                        self._legacy_v4_ack_retries += 1
                     if len(packet_to_send) >= 12:
                         self._reliable_last_ack_wire = struct.unpack_from("<I", packet_to_send, 8)[
                             0
@@ -758,6 +783,14 @@ class BleTransportWorker(QtCore.QThread):
                 self._reliable_watchdog_nacks = 0
                 self._reliable_forced_skips = 0
                 self._watchdog_reconnects = 0
+                self._legacy_v4_ack_retries = 0
+                self._legacy_v4_ack_probes = 0
+                self._legacy_v4_reliable_resets = 0
+                self._legacy_v4_fast_forward_events = 0
+                self._legacy_v4_fast_forward_blocks = 0
+            self._legacy_v4_last_retry_monotonic = 0.0
+            self._legacy_v4_last_probe_monotonic = 0.0
+            self._legacy_v4_last_reset_monotonic = 0.0
         with self._control_pending_lock:
             self._pending_ack_packet = None
             self._pending_nack_packet = None
@@ -784,6 +817,12 @@ class BleTransportWorker(QtCore.QThread):
                 "watchdog_nacks": int(self._reliable_watchdog_nacks),
                 "forced_skips": int(self._reliable_forced_skips),
                 "watchdog_reconnects": int(self._watchdog_reconnects),
+                "status_protocol": int(self._peer_status_protocol),
+                "legacy_v4_ack_retries": int(self._legacy_v4_ack_retries),
+                "legacy_v4_ack_probes": int(self._legacy_v4_ack_probes),
+                "legacy_v4_reliable_resets": int(self._legacy_v4_reliable_resets),
+                "legacy_v4_fast_forward_events": int(self._legacy_v4_fast_forward_events),
+                "legacy_v4_fast_forward_blocks": int(self._legacy_v4_fast_forward_blocks),
                 "session_id": None
                 if self._reliable_session_id is None
                 else int(self._reliable_session_id),
@@ -830,7 +869,10 @@ class BleTransportWorker(QtCore.QThread):
         # ACK is a tiny write-without-response and must stay prompt even when
         # Windows batches DATA notifications. Stretching ACK to 350 ms made the
         # ESP32 retain too many otherwise healthy blocks during long recordings.
-        ack_interval = BLE_RELIABLE_ACK_MAX_INTERVAL_S
+        legacy_v4 = int(self._peer_status_protocol) == 0x04
+        ack_interval = (
+            BLE_V4_ACK_MAX_INTERVAL_S if legacy_v4 else BLE_RELIABLE_ACK_MAX_INTERVAL_S
+        )
         nack_repeat = min(BLE_ADAPTIVE_NACK_MAX_S, max(BLE_RELIABLE_NACK_REPEAT_S, base * 1.6))
         hole_reconnect = min(
             BLE_ADAPTIVE_HOLE_RECONNECT_MAX_S,
@@ -854,9 +896,9 @@ class BleTransportWorker(QtCore.QThread):
         else:
             profile = "batched"
         self._adaptive_profile = profile
-        ack_every = BLE_RELIABLE_ACK_EVERY_BLOCKS
+        ack_every = BLE_V4_ACK_EVERY_BLOCKS if legacy_v4 else BLE_RELIABLE_ACK_EVERY_BLOCKS
         return {
-            "profile": profile,
+            "profile": "legacy-v4-rescue" if legacy_v4 else profile,
             "samples": len(gaps),
             "p95_s": float(p95),
             "p99_s": float(p99),
@@ -967,6 +1009,24 @@ class BleTransportWorker(QtCore.QThread):
                 self._reliable_retransmitted_received += 1
 
             expected = self._reliable_expected_block
+            legacy_v4 = int(self._peer_status_protocol) == 0x04
+            if legacy_v4 and block_seq > expected:
+                # V4 marks a congested notify as sent even when Bluedroid
+                # rejected it. Waiting for or NACKing that phantom block creates
+                # a retransmission storm and freezes the visible stream. Treat
+                # DATA V4 as a loss-tolerant live feed: advance immediately and
+                # let the ADS sample sequence expose the exact missing interval.
+                skipped = int(block_seq - expected)
+                self._reliable_forced_skips += skipped
+                self._reliable_gap_markers += skipped
+                self._legacy_v4_fast_forward_events += 1
+                self._legacy_v4_fast_forward_blocks += skipped
+                self._reliable_expected_block = int(block_seq)
+                self._reliable_pending.clear()
+                self._reliable_gap_sequence = None
+                self._reliable_gap_first_seen = 0.0
+                self._reliable_last_nack = None
+                expected = int(block_seq)
             if block_seq < expected:
                 self._reliable_duplicates += 1
                 now = time.monotonic()
@@ -1135,6 +1195,7 @@ class BleTransportWorker(QtCore.QThread):
                     expected = int(self._reliable_expected_block)
                     pending_keys = sorted(self._reliable_pending)
                     has_hole = bool(pending_keys and pending_keys[0] > expected)
+                    legacy_v4 = int(self._peer_status_protocol) == 0x04
                     if has_hole:
                         if self._reliable_gap_sequence != expected:
                             self._reliable_gap_sequence = expected
@@ -1213,6 +1274,43 @@ class BleTransportWorker(QtCore.QThread):
                             self._reliable_last_nack = None
                             self._reliable_last_delivery_monotonic = now
 
+                    # STATUS V4 firmware may fill its 16-block window and then
+                    # wait forever when the last write-without-response ACK is
+                    # lost. No new DATA means the normal decoder cannot create
+                    # another ACK, so the watchdog must repeat it proactively.
+                    stream_age_anchor = max(
+                        float(self._reliable_last_delivery_monotonic),
+                        float(self._streaming_hint_started_monotonic),
+                    )
+                    quiet_age = max(0.0, now - stream_age_anchor)
+                    can_ack = (
+                        legacy_v4
+                        and self._streaming_hint
+                        and self._reliable_session_id is not None
+                        and expected > 0
+                        and not has_hole
+                    )
+                    if (
+                        can_ack
+                        and quiet_age >= BLE_V4_ACK_RETRY_IDLE_S
+                        and (
+                            self._legacy_v4_last_retry_monotonic <= 0.0
+                            or now - self._legacy_v4_last_retry_monotonic
+                            >= BLE_V4_ACK_RETRY_INTERVAL_S
+                        )
+                    ):
+                        controls.append(
+                            (
+                                self._make_reliable_control_packet(
+                                    BLE_CTRL_ACK,
+                                    self._reliable_session_id or 0,
+                                    expected - 1,
+                                ),
+                                "ack_retry",
+                            )
+                        )
+                        self._legacy_v4_last_retry_monotonic = now
+
                     # V18 deliberately does not call client.disconnect() merely
                     # because DATA is temporarily quiet. Real disconnections still
                     # enter _on_disconnected() and use the normal reconnect loop.
@@ -1234,6 +1332,10 @@ class BleTransportWorker(QtCore.QThread):
     def set_streaming_hint(self, active: bool):
         self._streaming_hint = bool(active)
         self._streaming_hint_started_monotonic = time.monotonic() if self._streaming_hint else 0.0
+
+    def set_peer_status_protocol(self, protocol: int):
+        """Select the transport profile advertised by STATUS."""
+        self._peer_status_protocol = int(protocol) & 0xFF
 
     def timing_metrics(self) -> Tuple[float, float, int, int]:
         with self._timing_lock:

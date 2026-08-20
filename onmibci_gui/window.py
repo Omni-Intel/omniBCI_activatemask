@@ -469,7 +469,10 @@ class MainWindow(
         # Antialiasing eight continuously moving traces is expensive and adds
         # no useful EEG detail at screen resolution.
         pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#424245")
-        self.setWindowTitle("全域智能 | ADS1299 EEG 工作站 | V18 | split BLE TX / capture pipeline")
+        self.setWindowTitle(
+            f"全域智能 | ADS1299 EEG 工作站 | V{APP_RELEASE_VERSION} | "
+            "split BLE TX / capture pipeline"
+        )
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1050, 680)

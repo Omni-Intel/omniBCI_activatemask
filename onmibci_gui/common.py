@@ -134,7 +134,7 @@ from onmibci_stream import (
 
 FS = 250
 CHANNELS = 8
-APP_RELEASE_VERSION = 18
+APP_RELEASE_VERSION = int(os.environ.get("OMNIBCI_APP_RELEASE_VERSION", "18"))
 MNE_CHANNEL_TYPE = "eeg"
 BAUD = 921600
 FRAME_BYTES = 48
@@ -219,6 +219,13 @@ BLE_CTRL_RESET = 3
 BLE_CTRL_PACKET_BYTES = 18
 BLE_RELIABLE_ACK_EVERY_BLOCKS = 3
 BLE_RELIABLE_ACK_MAX_INTERVAL_S = 0.08
+# STATUS V4 firmware can stop after exactly one 16-block transmit window when
+# the final cumulative ACK is lost.  Keep its window shallow and resend the
+# same idempotent ACK even when no new DATA notification arrives.
+BLE_V4_ACK_EVERY_BLOCKS = 3
+BLE_V4_ACK_MAX_INTERVAL_S = 0.06
+BLE_V4_ACK_RETRY_IDLE_S = 0.50
+BLE_V4_ACK_RETRY_INTERVAL_S = 0.50
 BLE_RELIABLE_NACK_REPEAT_S = 0.12
 BLE_RELIABLE_MAX_PENDING_BLOCKS = 384
 # Long-run continuity policy: a protocol hole may not hold the entire live

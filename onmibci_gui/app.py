@@ -19,8 +19,9 @@ def main():
     if not instance_lock.acquire():
         QtWidgets.QMessageBox.warning(
             None,
-            "OmniBCI V18 已在运行",
-            "已经有一个 OmniBCI V18 窗口正在运行。\n请使用现有窗口，或先退出该窗口后再启动。",
+            f"OmniBCI V{APP_RELEASE_VERSION} 已在运行",
+            f"已经有一个 OmniBCI V{APP_RELEASE_VERSION} 窗口正在运行。\n"
+            "请使用现有窗口，或先退出该窗口后再启动。",
         )
         return 0
     atexit.register(instance_lock.release)

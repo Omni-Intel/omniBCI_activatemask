@@ -426,6 +426,8 @@ class TransportControlMixin:
         data = bytes(payload)
         if len(data) < 32 or data[:2] != b"\xbc\x53":
             return
+        if self.ble_worker is not None:
+            self.ble_worker.set_peer_status_protocol(data[2])
         flags = data[5]
         status = {
             "status_protocol": data[2],
@@ -506,9 +508,14 @@ class TransportControlMixin:
         self.ble_peer_mtu = self.ble_status["mtu"]
         self.current_mode = int(self.ble_status["mode"])
         self._sync_internal_short_button(self.current_mode == 3)
-        if (len(data) < 96 or data[2] != 0x05) and not self.ble_protocol_warned:
+        if data[2] == 0x04 and not self.ble_protocol_warned:
             self.ble_protocol_warned = True
-            self.set_status("BLE STATUS 格式不匹配：请烧录 SRB1-only STATUS V5 固件 V19。")
+            self.set_status(
+                "已识别 STATUS V4 固件：启用低延迟容错与 ACK 心跳；坏块显示真实缺口。"
+            )
+        elif (len(data) < 76 or data[2] not in (0x04, 0x05)) and not self.ble_protocol_warned:
+            self.ble_protocol_warned = True
+            self.set_status("BLE STATUS 格式不匹配：需要 SRB1-only STATUS V4/V5 固件 V19。")
         if self.ble_peer_mtu >= BLE_MIN_STREAM_MTU:
             self.ble_low_mtu_warned = False
         if self.ble_peer_mtu < BLE_MIN_STREAM_MTU and not self.ble_low_mtu_warned:
