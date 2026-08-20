@@ -110,9 +110,7 @@ class LocalClientTests(unittest.TestCase):
             client = connect_local(port=server.port)
             iterator = client.stream_filtered()
             raw = self.make_batch("raw", session_id=server.session_id)
-            filtered = self.make_batch(
-                "filtered", generation=7, session_id=server.session_id
-            )
+            filtered = self.make_batch("filtered", generation=7, session_id=server.session_id)
             server.publish(raw)
             server.publish(filtered)
 

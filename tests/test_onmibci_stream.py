@@ -22,7 +22,7 @@ class _CaptureServer:
 
 class StreamBatchTests(unittest.TestCase):
     def test_gui_recording_lifecycle_keeps_one_marker_path_for_usb_and_ble(self):
-        source = Path(__file__).resolve().parents[1] / "ads1299_eeg_gui_native.py"
+        source = Path(__file__).resolve().parents[1] / "onmibci_gui" / "acquisition.py"
         text = source.read_text(encoding="utf-8")
 
         self.assertIn("self.stream_server.begin_recording(", text)
@@ -75,9 +75,7 @@ class StreamBatchTests(unittest.TestCase):
 
     def test_marker_rejects_complex_value_and_negative_duration(self):
         with self.assertRaises(ValueError):
-            MarkerEvent(
-                "e", "s", "r", "x", {"not": "scalar"}, 1.0, None, 0.0, ""
-            )
+            MarkerEvent("e", "s", "r", "x", {"not": "scalar"}, 1.0, None, 0.0, "")
         with self.assertRaises(ValueError):
             MarkerEvent("e", "s", "r", "x", 1, 1.0, None, -1.0, "")
 

@@ -24,13 +24,13 @@ def configure_logging(log_dir: Path):
     for handler in list(logger.handlers):
         handler.close()
         logger.removeHandler(handler)
-    handler = RotatingFileHandler(
-        path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8"
+    handler = RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)s [%(threadName)s] %(message)s",
+            "%Y-%m-%d %H:%M:%S",
+        )
     )
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s.%(msecs)03d %(levelname)s [%(threadName)s] %(message)s",
-        "%Y-%m-%d %H:%M:%S",
-    ))
     logger.addHandler(handler)
     logger.info("application logging started")
     logger.info("python=%s executable=%s", sys.version.replace("\n", " "), sys.executable)

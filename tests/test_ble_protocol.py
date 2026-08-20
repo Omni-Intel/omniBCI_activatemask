@@ -1,7 +1,6 @@
 import unittest
 
 from onmibci_ble_protocol import (
-    ConfigSnapshot,
     MSG_GET_CONFIG,
     MSG_RESPONSE,
     ProtocolError,
@@ -49,11 +48,35 @@ class BleProtocolTests(unittest.TestCase):
         self.assertEqual(payload, bytes((1, 0x1F, 0x1F, 0x03, 24, 24, 24, 24, 24, 24, 24, 24)))
 
     def test_full_register_snapshot_decodes(self):
-        payload = bytes((0,)) + (9).to_bytes(4, "little") + bytes((
-            1, 1, 0x1F, 0x1F, 0x03, 0x96, 0xC0, 0xEC,
-            0x60, 0x60, 0x60, 0x60, 0x60, 0xE0, 0xE0, 0xE0,
-            0x1F, 0x00, 0x03, 0x00, 0x20,
-        ))
+        payload = (
+            bytes((0,))
+            + (9).to_bytes(4, "little")
+            + bytes(
+                (
+                    1,
+                    1,
+                    0x1F,
+                    0x1F,
+                    0x03,
+                    0x96,
+                    0xC0,
+                    0xEC,
+                    0x60,
+                    0x60,
+                    0x60,
+                    0x60,
+                    0x60,
+                    0xE0,
+                    0xE0,
+                    0xE0,
+                    0x1F,
+                    0x00,
+                    0x03,
+                    0x00,
+                    0x20,
+                )
+            )
+        )
 
         snapshot = decode_config_snapshot(payload)
 

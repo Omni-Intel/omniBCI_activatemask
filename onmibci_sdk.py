@@ -210,7 +210,7 @@ class LocalClient:
         request = dict(request)
         request_id = uuid.uuid4().hex
         request["request_id"] = request_id
-        connect_options = {
+        connect_options: dict[str, Any] = {
             "open_timeout": self.timeout,
             "close_timeout": self.timeout,
             "max_size": None,
@@ -253,7 +253,7 @@ class LocalClient:
     def _open_stream(self, stream: str) -> _StreamIterator:
         from websockets.sync.client import connect
 
-        connect_options = {
+        connect_options: dict[str, Any] = {
             "open_timeout": self.timeout,
             "close_timeout": self.timeout,
             "max_size": None,
@@ -287,19 +287,21 @@ class LocalClient:
             raise ProtocolError("API hello must be a JSON object")
         if hello.get("type") != "hello":
             raise ProtocolError("API did not send hello")
-        if hello.get("schema_version") != SCHEMA_VERSION or not isinstance(
-            hello.get("schema_version"), int
-        ) or isinstance(hello.get("schema_version"), bool):
+        if (
+            hello.get("schema_version") != SCHEMA_VERSION
+            or not isinstance(hello.get("schema_version"), int)
+            or isinstance(hello.get("schema_version"), bool)
+        ):
             raise ProtocolError("API hello has an unsupported schema version")
         if hello.get("stream") != stream:
             raise ProtocolError("API hello stream does not match subscription")
-        if not isinstance(hello.get("session_id"), str) or not hello.get(
-            "session_id"
-        ):
+        if not isinstance(hello.get("session_id"), str) or not hello.get("session_id"):
             raise ProtocolError("API hello has no session_id")
-        if hello.get("sample_rate") != SAMPLE_RATE or not isinstance(
-            hello.get("sample_rate"), int
-        ) or isinstance(hello.get("sample_rate"), bool):
+        if (
+            hello.get("sample_rate") != SAMPLE_RATE
+            or not isinstance(hello.get("sample_rate"), int)
+            or isinstance(hello.get("sample_rate"), bool)
+        ):
             raise ProtocolError("API hello has an unsupported sample rate")
         if hello.get("channels") != list(DEFAULT_CHANNELS):
             raise ProtocolError("API hello has unsupported channels")

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-MAGIC = b"\xBC\x52"
+MAGIC = b"\xbc\x52"
 PROTOCOL_VERSION = 1
 HEADER_BYTES = 8
 CRC_BYTES = 2
@@ -58,11 +58,18 @@ def encode_packet(message_type: int, request_id: int, payload: bytes = b"") -> b
     payload = bytes(payload)
     if len(payload) > 0xFFFF:
         raise ProtocolError("payload length exceeds 65535 bytes")
-    header = bytes((
-        MAGIC[0], MAGIC[1], PROTOCOL_VERSION, message_type & 0xFF,
-        request_id & 0xFF, (request_id >> 8) & 0xFF,
-        len(payload) & 0xFF, (len(payload) >> 8) & 0xFF,
-    ))
+    header = bytes(
+        (
+            MAGIC[0],
+            MAGIC[1],
+            PROTOCOL_VERSION,
+            message_type & 0xFF,
+            request_id & 0xFF,
+            (request_id >> 8) & 0xFF,
+            len(payload) & 0xFF,
+            (len(payload) >> 8) & 0xFF,
+        )
+    )
     body = header + payload
     return body + crc16_ccitt(body).to_bytes(2, "little")
 
@@ -89,15 +96,15 @@ def decode_packet(data: bytes) -> Packet:
     )
 
 
-def encode_set_config(mode: int, enabled_mask: int, bias_mask: int,
-                      lead_off_mask: int, gains) -> bytes:
+def encode_set_config(
+    mode: int, enabled_mask: int, bias_mask: int, lead_off_mask: int, gains
+) -> bytes:
     gains = tuple(int(value) for value in gains)
     if len(gains) != 8:
         raise ProtocolError("SET_CONFIG requires eight gains")
     if any(value not in (1, 2, 4, 6, 8, 12, 24) for value in gains):
         raise ProtocolError("invalid ADS1299 gain")
-    return bytes((mode & 0xFF, enabled_mask & 0xFF, bias_mask & 0xFF,
-                  lead_off_mask & 0xFF, *gains))
+    return bytes((mode & 0xFF, enabled_mask & 0xFF, bias_mask & 0xFF, lead_off_mask & 0xFF, *gains))
 
 
 def decode_config_snapshot(payload: bytes) -> ConfigSnapshot:

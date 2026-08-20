@@ -36,11 +36,10 @@ class LocalStreamServerTests(unittest.TestCase):
         server.start()
         server.begin_recording("rec-1", started_at=100.0)
         try:
-            with connect(
-                f"ws://127.0.0.1:{server.port}/v1/stream"
-            ) as stream_ws, connect(
-                f"ws://127.0.0.1:{server.port}/v1/control"
-            ) as control_ws:
+            with (
+                connect(f"ws://127.0.0.1:{server.port}/v1/stream") as stream_ws,
+                connect(f"ws://127.0.0.1:{server.port}/v1/control") as control_ws,
+            ):
                 self.subscribe(stream_ws, "raw")
                 control_ws.send(
                     json.dumps(
@@ -69,12 +68,8 @@ class LocalStreamServerTests(unittest.TestCase):
         server = LocalStreamServer(port=0)
         server.start()
         try:
-            with connect(
-                f"ws://127.0.0.1:{server.port}/v1/control"
-            ) as control_ws:
-                control_ws.send(
-                    json.dumps({"type": "marker", "code": "x", "value": 1})
-                )
+            with connect(f"ws://127.0.0.1:{server.port}/v1/control") as control_ws:
+                control_ws.send(json.dumps({"type": "marker", "code": "x", "value": 1}))
                 response = json.loads(control_ws.recv())
                 self.assertFalse(response["ok"])
                 self.assertEqual(response["error"]["code"], "not_recording")
@@ -102,12 +97,8 @@ class LocalStreamServerTests(unittest.TestCase):
         try:
             with ExitStack() as stack:
                 clients = [
-                    stack.enter_context(
-                        connect(f"ws://127.0.0.1:{server.port}/v1/stream")
-                    ),
-                    stack.enter_context(
-                        connect(f"ws://127.0.0.1:{server.port}/v1/stream")
-                    ),
+                    stack.enter_context(connect(f"ws://127.0.0.1:{server.port}/v1/stream")),
+                    stack.enter_context(connect(f"ws://127.0.0.1:{server.port}/v1/stream")),
                 ]
                 for ws in clients:
                     self.subscribe(ws, "raw")
@@ -117,9 +108,7 @@ class LocalStreamServerTests(unittest.TestCase):
                 decoded_batches = [
                     StreamBatch.from_messages(ws.recv(), ws.recv()) for ws in clients
                 ]
-                np.testing.assert_array_equal(
-                    decoded_batches[0].values, decoded_batches[1].values
-                )
+                np.testing.assert_array_equal(decoded_batches[0].values, decoded_batches[1].values)
                 np.testing.assert_array_equal(
                     decoded_batches[0].sequence, decoded_batches[1].sequence
                 )
@@ -156,12 +145,8 @@ class LocalStreamServerTests(unittest.TestCase):
 
     def test_bounded_subscriber_queue_reports_dropped_batches(self):
         subscriber = _Subscriber("raw", queue_size=1)
-        self.assertTrue(
-            subscriber.enqueue(_WirePacket("first", b"", samples=2))
-        )
-        self.assertFalse(
-            subscriber.enqueue(_WirePacket("second", b"", samples=3))
-        )
+        self.assertTrue(subscriber.enqueue(_WirePacket("first", b"", samples=2)))
+        self.assertFalse(subscriber.enqueue(_WirePacket("second", b"", samples=3)))
 
         gap = subscriber.take_gap()
 

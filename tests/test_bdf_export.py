@@ -24,7 +24,7 @@ def make_frame(sequence: int, count: int) -> bytes:
     for channel in range(CHANNELS):
         value = int(count + channel)
         offset = 16 + channel * 3
-        frame[offset:offset + 3] = value.to_bytes(3, "big", signed=True)
+        frame[offset : offset + 3] = value.to_bytes(3, "big", signed=True)
     frame[43] = 0
     frame[46:48] = int(crc16_ccitt(frame[:46])).to_bytes(2, "little")
     return bytes(frame)
@@ -78,10 +78,7 @@ class BdfExportTests(unittest.TestCase):
 
                 window.save_bdf(Path(directory) / "named.bdf")
 
-                labels = [
-                    header["label"]
-                    for header in _FakeEdfWriter.instances[0].headers
-                ]
+                labels = [header["label"] for header in _FakeEdfWriter.instances[0].headers]
                 self.assertEqual(labels, window.channel_names)
         finally:
             if previous is None:
@@ -130,12 +127,26 @@ class BdfExportTests(unittest.TestCase):
                     output,
                     (
                         MarkerEvent(
-                            "e1", "api", "rec", "stimulus_on", 1,
-                            100.0, 100, 0.0, "start",
+                            "e1",
+                            "api",
+                            "rec",
+                            "stimulus_on",
+                            1,
+                            100.0,
+                            100,
+                            0.0,
+                            "start",
                         ),
                         MarkerEvent(
-                            "e2", "api", "rec", "stimulus_off", 0,
-                            100.1, 101, 0.0, "stop",
+                            "e2",
+                            "api",
+                            "rec",
+                            "stimulus_off",
+                            0,
+                            100.1,
+                            101,
+                            0.0,
+                            "stop",
                         ),
                     ),
                     recording_id="rec",
@@ -173,9 +184,7 @@ class BdfExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             segment = Path(directory) / "minute01.bin"
             output = Path(directory) / "recording.bdf"
-            segment.write_bytes(
-                b"".join(make_frame(100 + index, index) for index in range(500))
-            )
+            segment.write_bytes(b"".join(make_frame(100 + index, index) for index in range(500)))
             window = MainWindow.__new__(MainWindow)
             window.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
             window.channel_names = [f"CH{index}" for index in range(1, 9)]
@@ -186,12 +195,26 @@ class BdfExportTests(unittest.TestCase):
                 output,
                 (
                     MarkerEvent(
-                        "e1", "api", "rec", "stimulus_on", 1,
-                        100.0, 100, 0.0, "start",
+                        "e1",
+                        "api",
+                        "rec",
+                        "stimulus_on",
+                        1,
+                        100.0,
+                        100,
+                        0.0,
+                        "start",
                     ),
                     MarkerEvent(
-                        "e2", "api", "rec", "stimulus_off", 0,
-                        100.1, None, 0.0, "stop",
+                        "e2",
+                        "api",
+                        "rec",
+                        "stimulus_off",
+                        0,
+                        100.1,
+                        None,
+                        0.0,
+                        "stop",
                     ),
                 ),
                 recording_id="rec",
@@ -206,9 +229,7 @@ class BdfExportTests(unittest.TestCase):
             self.assertTrue(any("stimulus_on" in text for text in descriptions))
             self.assertTrue(any("stimulus_off" in text for text in descriptions))
             off_index = next(
-                index
-                for index, text in enumerate(descriptions)
-                if "stimulus_off" in text
+                index for index, text in enumerate(descriptions) if "stimulus_off" in text
             )
             self.assertAlmostEqual(float(onsets[off_index]), 0.1, places=3)
 

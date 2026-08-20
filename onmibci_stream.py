@@ -10,7 +10,7 @@ import math
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 import uuid
 
 import numpy as np
@@ -45,9 +45,7 @@ def _integer_array(
     if array.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional")
     if array.size:
-        if not np.issubdtype(array.dtype, np.integer) or np.issubdtype(
-            array.dtype, np.bool_
-        ):
+        if not np.issubdtype(array.dtype, np.integer) or np.issubdtype(array.dtype, np.bool_):
             raise ValueError(f"{name} must contain integers")
         if np.any(array < 0) or np.any(array > maximum):
             raise ValueError(f"{name} contains an out-of-range value")
@@ -116,18 +114,22 @@ class MarkerEvent:
         if isinstance(self.value, float) and not math.isfinite(self.value):
             raise ValueError("marker value must be finite")
 
-        if not isinstance(self.timestamp, (int, float)) or isinstance(
-            self.timestamp, bool
-        ) or not math.isfinite(float(self.timestamp)):
+        if (
+            not isinstance(self.timestamp, (int, float))
+            or isinstance(self.timestamp, bool)
+            or not math.isfinite(float(self.timestamp))
+        ):
             raise ValueError("timestamp must be finite")
         if self.sequence is not None and (
-            not _is_integer(self.sequence)
-            or not 0 <= self.sequence <= 0xFFFFFFFF
+            not _is_integer(self.sequence) or not 0 <= self.sequence <= 0xFFFFFFFF
         ):
             raise ValueError("sequence must be a uint32 or None")
-        if not isinstance(self.duration, (int, float)) or isinstance(
-            self.duration, bool
-        ) or not math.isfinite(float(self.duration)) or self.duration < 0:
+        if (
+            not isinstance(self.duration, (int, float))
+            or isinstance(self.duration, bool)
+            or not math.isfinite(float(self.duration))
+            or self.duration < 0
+        ):
             raise ValueError("duration must be a non-negative finite number")
 
         object.__setattr__(self, "timestamp", float(self.timestamp))
@@ -197,17 +199,17 @@ def bdf_annotation_for_marker(
 
     if not _is_integer(sample_rate) or sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
-    if not isinstance(recording_started_at, (int, float)) or isinstance(
-        recording_started_at, bool
-    ) or not math.isfinite(float(recording_started_at)):
+    if (
+        not isinstance(recording_started_at, (int, float))
+        or isinstance(recording_started_at, bool)
+        or not math.isfinite(float(recording_started_at))
+    ):
         raise ValueError("recording_started_at must be finite")
     if first_sequence is not None and (
         not _is_integer(first_sequence) or not 0 <= first_sequence <= 0xFFFFFFFF
     ):
         raise ValueError("first_sequence must be a uint32 or None")
-    if sample_count is not None and (
-        not _is_integer(sample_count) or sample_count < 0
-    ):
+    if sample_count is not None and (not _is_integer(sample_count) or sample_count < 0):
         raise ValueError("sample_count must be non-negative or None")
 
     onset: float
@@ -256,9 +258,7 @@ class StreamBatch:
             channels = tuple(self.channels)
         except TypeError as exc:
             raise ValueError("channels must be a sequence of strings") from exc
-        if not channels or any(
-            not isinstance(channel, str) or not channel for channel in channels
-        ):
+        if not channels or any(not isinstance(channel, str) or not channel for channel in channels):
             raise ValueError("channels must not be empty")
 
         values = np.asarray(self.values)
@@ -380,13 +380,13 @@ class StreamBatch:
 
         values = np.frombuffer(payload, dtype=_WIRE_FLOAT_DTYPE).reshape(shape).copy()
         return cls(
-            stream=metadata.get("stream"),
+            stream=cast(str, metadata.get("stream")),
             values=values,
-            sequence=metadata.get("sequence"),
-            valid=metadata.get("valid"),
-            modes=metadata.get("modes"),
+            sequence=cast(np.ndarray, metadata.get("sequence")),
+            valid=cast(np.ndarray, metadata.get("valid")),
+            modes=cast(np.ndarray, metadata.get("modes")),
             generation=metadata.get("generation"),
-            session_id=metadata.get("session_id"),
+            session_id=cast(str, metadata.get("session_id")),
             sample_rate=metadata.get("sample_rate", SAMPLE_RATE),
             channels=metadata.get("channels", DEFAULT_CHANNELS),
             unit=metadata.get("unit", UNIT_UV),
@@ -540,9 +540,11 @@ class LocalStreamServer:
             raise ValueError("recording_id must not be empty")
         if started_at is None:
             started_at = time.time()
-        if not isinstance(started_at, (int, float)) or isinstance(
-            started_at, bool
-        ) or not math.isfinite(float(started_at)):
+        if (
+            not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+            or not math.isfinite(float(started_at))
+        ):
             raise ValueError("started_at must be finite")
         with self._recording_lock:
             self._recording_id = recording_id
@@ -615,9 +617,7 @@ class LocalStreamServer:
             return
         with self._subscribers_lock:
             subscribers = tuple(
-                subscriber
-                for subscriber in self._subscribers
-                if subscriber.stream == batch.stream
+                subscriber for subscriber in self._subscribers if subscriber.stream == batch.stream
             )
         if not subscribers:
             return
@@ -653,7 +653,7 @@ class LocalStreamServer:
                 event_id=request.get("event_id") or uuid.uuid4().hex,
                 session_id=self.session_id,
                 recording_id=self._recording_id,
-                code=request.get("code"),
+                code=cast(str, request.get("code")),
                 value=request.get("value"),
                 timestamp=request.get("timestamp", time.time()),
                 sequence=request.get("sequence"),
@@ -733,7 +733,8 @@ class LocalStreamServer:
                 process_request=self._process_request,
                 max_size=64 * 1024,
             ) as server:
-                self.port = int(server.sockets[0].getsockname()[1])
+                server_socket = next(iter(server.sockets))
+                self.port = int(server_socket.getsockname()[1])
                 self._ready.set()
                 await self._stop_event.wait()
         finally:
