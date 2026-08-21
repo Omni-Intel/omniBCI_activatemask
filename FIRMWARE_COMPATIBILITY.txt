@@ -6,7 +6,7 @@ This branch supports only the bundled SRB1 BLE firmware V19:
   firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino
 
 Required handshake:
-  firmware version V19.0.0
+  firmware version V19.1.0
   device-control protocol V1
 
 V19 is SRB1-only. SRB2 firmware, reference switching and A8 probing have been

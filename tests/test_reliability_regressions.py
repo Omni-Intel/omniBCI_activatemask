@@ -78,6 +78,38 @@ class ReliabilityRegressionTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_reliable_controls_are_coalesced_and_ack_is_sent_first(self):
+        class FakeLoop:
+            def __init__(self):
+                self.callbacks = []
+
+            def call_soon_threadsafe(self, callback):
+                self.callbacks.append(callback)
+
+        worker = gui.BleTransportWorker()
+        worker._loop = FakeLoop()
+        worker._closing = False
+        ack_10 = worker._make_reliable_control_packet(gui.BLE_CTRL_ACK, 7, 10)
+        ack_12 = worker._make_reliable_control_packet(gui.BLE_CTRL_ACK, 7, 12)
+        nack = worker._make_reliable_control_packet(gui.BLE_CTRL_NACK_RANGE, 7, 13, 14)
+
+        worker._schedule_reliable_control(ack_10, "ack_keepalive")
+        worker._schedule_reliable_control(ack_12, "ack")
+        worker._schedule_reliable_control(nack, "nack")
+
+        self.assertEqual(len(worker._loop.callbacks), 1)
+        self.assertEqual(struct.unpack_from("<I", worker._pending_ack_packet, 8)[0], 12)
+
+        sent = []
+
+        async def fake_send(packet, kind):
+            sent.append((packet, kind))
+
+        worker._send_reliable_control = fake_send
+        asyncio.run(worker._drain_reliable_controls())
+
+        self.assertEqual([kind for _packet, kind in sent], ["ack", "nack"])
+
     def test_saturation_percent_uses_actual_eligible_samples(self):
         self.assertEqual(gui.saturation_percent(4, 2000), 0.2)
         self.assertEqual(gui.saturation_percent(4, 0), 0.0)
@@ -148,6 +180,35 @@ class ReliabilityRegressionTests(unittest.TestCase):
             result = window._ble_write_bulk_config(gui.REFERENCE_SRB1)
 
         self.assertTrue(result["verified"])
+
+    def test_ble_status_v5_exposes_capture_diagnostics(self):
+        window = gui.MainWindow.__new__(gui.MainWindow)
+        window.ble_status = {}
+        window.ble_status_delta = {}
+        window.ble_protocol_warned = False
+        window.ble_low_mtu_warned = False
+        window._sync_internal_short_button = lambda active: None
+        window.set_status = lambda text: None
+        payload = bytearray(96)
+        payload[0:2] = b"\xBC\x53"
+        payload[2] = 0x05
+        payload[4] = 1
+        payload[6:8] = (247).to_bytes(2, "little")
+        payload[76:80] = (3).to_bytes(4, "little")
+        payload[80:84] = (4).to_bytes(4, "little")
+        payload[84:88] = (5).to_bytes(4, "little")
+        payload[88:92] = (6).to_bytes(4, "little")
+        payload[92:96] = (2900).to_bytes(4, "little")
+
+        window.on_ble_status(payload)
+
+        self.assertEqual(window.ble_status["status_protocol"], 0x05)
+        self.assertEqual(window.ble_status["missed_drdy"], 3)
+        self.assertEqual(window.ble_status["late_drdy"], 4)
+        self.assertEqual(window.ble_status["mutex_busy"], 5)
+        self.assertEqual(window.ble_status["bad_status"], 6)
+        self.assertEqual(window.ble_status["max_read_us"], 2900)
+        self.assertFalse(window.ble_protocol_warned)
 
 
 if __name__ == "__main__":

@@ -243,6 +243,11 @@ class BleTransportWorker(QtCore.QThread):
         self._watchdog_reconnects = 0
         self._watchdog_last_reconnect_monotonic = 0.0
         self._gatt_write_lock = None
+        self._control_pending_lock = threading.Lock()
+        self._pending_ack_packet: Optional[bytes] = None
+        self._pending_ack_kind = "ack"
+        self._pending_nack_packet: Optional[bytes] = None
+        self._control_drain_scheduled = False
 
     def run(self):
         self._loop = asyncio.new_event_loop()
@@ -567,25 +572,72 @@ class BleTransportWorker(QtCore.QThread):
                 self._reliable_control_errors += 1
 
     def _schedule_reliable_control(self, packet: bytes, kind: str):
-        """Schedule a GATT control write from either asyncio or decoder thread."""
+        """Coalesce reliable controls into one bounded async drain task."""
         loop = self._loop
         if loop is None or self._closing:
             return
         payload = bytes(packet)
         control_kind = str(kind)
+        spawn = False
+        with self._control_pending_lock:
+            if control_kind in ("ack", "ack_keepalive"):
+                current = self._pending_ack_packet
+                replace = current is None
+                if current is not None and len(current) >= 12 and len(payload) >= 12:
+                    current_session, current_seq = struct.unpack_from("<II", current, 4)
+                    new_session, new_seq = struct.unpack_from("<II", payload, 4)
+                    replace = new_session != current_session or new_seq > current_seq
+                    if new_session == current_session and new_seq == current_seq:
+                        replace = control_kind == "ack" and self._pending_ack_kind != "ack"
+                if replace:
+                    self._pending_ack_packet = payload
+                    self._pending_ack_kind = control_kind
+            elif control_kind == "nack":
+                self._pending_nack_packet = payload
+            else:
+                self._pending_nack_packet = payload
+            if not self._control_drain_scheduled:
+                self._control_drain_scheduled = True
+                spawn = True
+
+        if not spawn:
+            return
 
         def _spawn():
             if self._closing:
+                with self._control_pending_lock:
+                    self._control_drain_scheduled = False
                 return
             try:
-                asyncio.create_task(self._send_reliable_control(payload, control_kind))
+                asyncio.create_task(self._drain_reliable_controls())
             except RuntimeError:
-                pass
+                with self._control_pending_lock:
+                    self._control_drain_scheduled = False
 
         try:
             loop.call_soon_threadsafe(_spawn)
         except RuntimeError:
-            pass
+            with self._control_pending_lock:
+                self._control_drain_scheduled = False
+
+    async def _drain_reliable_controls(self):
+        while not self._closing:
+            packet = None
+            kind = ""
+            with self._control_pending_lock:
+                if self._pending_ack_packet is not None:
+                    packet = self._pending_ack_packet
+                    self._pending_ack_packet = None
+                    kind = self._pending_ack_kind
+                    self._pending_ack_kind = "ack"
+                elif self._pending_nack_packet is not None:
+                    packet = self._pending_nack_packet
+                    self._pending_nack_packet = None
+                    kind = "nack"
+                else:
+                    self._control_drain_scheduled = False
+                    return
+            await self._send_reliable_control(packet, kind)
 
     def _enqueue_notify_for_decode(self, payload: bytes):
         payload = bytes(payload)
@@ -1427,5 +1479,4 @@ class BleTransportWorker(QtCore.QThread):
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._loop.stop)
         self.wait(3000)
-
 
