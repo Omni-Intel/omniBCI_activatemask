@@ -1,0 +1,58 @@
+name: Build OmniBCI V19 Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ads1299_eeg_gui_v19.py'
+      - 'onmibci_gui/**'
+      - 'app_diagnostics.py'
+      - 'onmibci_ble_protocol.py'
+      - 'onmibci_stream.py'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'OmniBCI_V19.spec'
+      - 'assets/**'
+      - 'firmware/**'
+      - '.github/workflows/build-v19-windows-exe.yml'
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade uv
+          uv sync --frozen --dev
+
+      - name: Build ONEDIR EXE
+        shell: pwsh
+        run: |
+          uv run pyinstaller --noconfirm --clean OmniBCI_V19.spec
+          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings | Out-Null
+          Copy-Item -Recurse -Force firmware dist\OmniBCI_V19\firmware
+          Copy-Item README.md dist\OmniBCI_V19\README.md
+          Copy-Item VERSION_AND_QUICK_START.txt dist\OmniBCI_V19\VERSION_AND_QUICK_START.txt
+          Copy-Item FIRMWARE_COMPATIBILITY.txt dist\OmniBCI_V19\FIRMWARE_COMPATIBILITY.txt
+          Copy-Item EXE_BUILD_NOTES.txt dist\OmniBCI_V19\EXE_BUILD_NOTES.txt
+          Copy-Item VALIDATION_REPORTS.txt dist\OmniBCI_V19\VALIDATION_REPORTS.txt
+          Compress-Archive -Path dist\OmniBCI_V19 -DestinationPath OmniBCI_V19_Windows.zip -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniBCI_V19_Windows
+          path: OmniBCI_V19_Windows.zip
+          if-no-files-found: error

@@ -1,0 +1,20 @@
+/* E73-2G4M08S1C connections on the current PCB. */
+&pinctrl {
+	spis2_default: spis2_default {
+		group1 {
+			psels = <NRF_PSEL(SPIS_SCK, 0, 13)>,
+				<NRF_PSEL(SPIS_MOSI, 0, 20)>,
+				<NRF_PSEL(SPIS_MISO, 0, 17)>,
+				<NRF_PSEL(SPIS_CSN, 0, 22)>;
+		};
+	};
+};
+
+&spi2 {
+	compatible = "nordic,nrf-spis";
+	/delete-property/ pinctrl-1;
+	def-char = <0xff>;
+	pinctrl-0 = <&spis2_default>;
+	pinctrl-names = "default";
+	status = "okay";
+};

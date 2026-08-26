@@ -1,9 +1,9 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title OmniBCI V16 - first time setup
+title OmniBCI V19 - first time setup
 
-echo [OmniBCI V16] Preparing an isolated Python environment...
+echo [OmniBCI V19] Preparing an isolated Python environment...
 echo.
 
 set "PY_CMD="
@@ -56,7 +56,7 @@ echo Verifying core modules ...
 if errorlevel 1 goto :pipfail
 
 echo.
-echo Starting OmniBCI V16 ...
+echo Starting OmniBCI V19 ...
 "%VPY%" ads1299_eeg_gui_native.py
 set "APP_RC=%ERRORLEVEL%"
 if not "%APP_RC%"=="0" (

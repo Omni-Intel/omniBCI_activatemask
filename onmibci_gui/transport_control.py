@@ -214,6 +214,11 @@ class TransportControlMixin:
         if not port:
             QtWidgets.QMessageBox.warning(self, "串口", "请先点击“扫描串口”，并选择一个设备。")
             return
+        self.transport_connecting = True
+        self.connect_btn.setEnabled(False)
+        self.connect_btn.setText("同步配置中…")
+        self.port_combo.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
         try:
             self.ser = serial.Serial(
                 port,
@@ -245,15 +250,25 @@ class TransportControlMixin:
             self.port_combo.setEnabled(False)
             self.refresh_btn.setEnabled(False)
             self.apply_reference_mode()
+            if not self.apply_sample_rate(silent=True):
+                raise RuntimeError("采样率配置未得到 STM32 寄存器回读确认")
             self.set_status(
-                f"已打开 {port}，并同步 {self.reference_short_name()} 参考与通道参数。"
+                f"已打开 {port}，并同步 {self.reference_short_name()} 参考、通道参数和 "
+                f"{self.sample_rate_hz} SPS。"
                 "现在可以点击“开始采集”。"
             )
+            self.connect_btn.setEnabled(True)
         except Exception as exc:
             self.ser = None
             self.active_transport = None
             self.transport_combo.setEnabled(True)
+            self.port_combo.setEnabled(True)
+            self.refresh_btn.setEnabled(True)
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setText("打开串口")
             QtWidgets.QMessageBox.critical(self, "连接失败", str(exc))
+        finally:
+            self.transport_connecting = False
 
     def on_ble_connecting(self, _key: str):
         self.set_status("正在连接并订阅 DATA/STATUS 特征…")

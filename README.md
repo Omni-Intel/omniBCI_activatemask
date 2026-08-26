@@ -4,6 +4,11 @@
 
 OmniBCI 是面向 ADS1299 的原生 Python EEG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线只支持 **SRB1-only 固件 V19 / 设备控制协议 V1**。
 
+STM32 + E73 + USB Dongle 串口链路支持在设备控制栏交互选择
+250/500/1000 SPS。GUI 会发送 `AA CODE`，校验 ADS1299 CONFIG1 回读，并
+同步重建时间轴、实时缓冲、滤波器、PSD 与导出采样率。正在记录时切换会
+先封口当前 BIN，再自动开始一个新记录会话，避免同一文件混用两种采样率。
+
 V19 延续并加固了长时间 BLE 连续性设计：当 Windows/BLE 通知链路出现抖动或拥塞时，固件的采集/打包路径不会被 BLE DATA notify 拖死，未成功提交的数据块也不会被误标为已发送。
 
 关键数据路径为：
@@ -73,6 +78,31 @@ run.bat
 ```
 
 主程序文件为 `ads1299_eeg_gui_native.py`。为保证环境可复现，不建议通过 Windows 文件关联直接双击 `.py` 文件。
+
+`ads1299_eeg_gui_native.py` 现在只保留兼容启动入口，实际实现位于 `onmibci_gui/`：
+
+- `common.py`：运行参数、依赖和资源路径；
+- `frames.py`：ADS 帧、CRC、时间线和环形缓冲；
+- `filtering.py`：实时滤波和 PSD worker；
+- `recording.py`：异步事件日志与连续 BIN 写入；
+- `transports.py`：串口和 BLE worker；
+- `channel_config.py`、`transport_control.py`：设备配置与连接控制；
+- `acquisition.py`：采集、阻抗和数据处理；
+- `display.py`、`window.py`：显示逻辑和 Qt 界面组合；
+- `exports.py`：CSV/BDF/MNE 导出；`app.py`：应用启动和诊断生命周期。
+- `single_instance.py`：跨进程单实例锁，防止两个 GUI 同时争用 BLE/串口设备。
+
+开发质量检查统一使用 uv：
+
+```powershell
+uv sync --dev
+uv run ruff check .
+uv run ruff format --check *.py onmibci_gui tests
+uv run mypy
+uv run python -m unittest discover -s tests -v
+```
+
+GitHub Actions 会在 push 和 pull request 上执行相同的 lint、类型检查和测试。
 
 如果直接使用 uv，项目已经提交了 `uv.lock`，可在项目根目录执行：
 
@@ -162,11 +192,14 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 
 ## 固件选择与兼容性
 
-当前分支只保留并支持一套固件：
+当前分支支持两套 SRB1-only V19 硬件链路：
 
 - `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`
+- `firmware/STM32_E73_DONGLE_V19/`：STM32H563VGT6 + E73-2G4M08S1C + nRF52840 USB dongle
 
-该固件为 **SRB1-only V19**，设备控制通信协议为 **V1**。GUI 只有在完成版本握手并取得 ADS1299 完整寄存器快照后，才确认设备已经就绪。
+两套固件均为 **SRB1-only V19**，设备控制通信协议为 **V1**。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式；dongle 以 USB CDC 虚拟串口向 GUI 提供数据并把配置命令反向传给 STM32。GUI 只有在完成版本握手并取得 ADS1299 完整寄存器快照后，才确认设备已经就绪。
+
+STM32 兼容固件默认启用 CH1～CH8，支持 250/500/1000 SPS、逐通道启用/PGA/BIAS、内部短接、内部测试和阻抗检测；PE5 输出 200 kHz、50% 占空比 PWM 驱动 NSC1002，PA1 用作流式工作指示灯。可直接烧录的 HEX、源代码、哈希和烧录顺序见 `firmware/STM32_E73_DONGLE_V19/README.md`。
 
 BLE 使用 `DATA`、`CONTROL`、`STATUS` 和独立的 `RESPONSE` 特征。配置请求包含事务 ID、长度和 CRC，固件通过 `RESPONSE` 返回相同事务 ID 和寄存器读回结果，避免旧 ACK 与周期状态包混淆。
 
@@ -211,11 +244,11 @@ IN1N～IN8N        -> 不作为外部公共参考使用
 - 正常 EEG 模式：`MISC1(0x15) = 0x20`，全局开启 SRB1。
 - 短路噪声和内部测试模式：`MISC1(0x15) = 0x00`。
 - 所有 `CHnSET.SRB2` 位始终为 0；`A7` 命令中的 bit2 会被忽略。
-- 默认启用 CH1～CH5、PGA 24、`BIAS_SENSP=0x1F`、`BIAS_SENSN=0x00`。
+- 默认启用 CH1～CH8、PGA 24、`BIAS_SENSP=0xFF`、`BIAS_SENSN=0x00`。
 - GUI 与固件均按当前启用通道掩码过滤 `BIAS_SENSP`。
 - `A7 CH GAIN FLAGS` 中 bit0 表示启用通道，bit1 表示加入 `BIAS_SENSP`，bit2 在本固件中忽略。
 
-烧录时在 Arduino IDE 中选择 ESP32-C3，启用 `USB CDC On Boot`，打开 `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`；串口波特率为 921600。
+ESP32-C3 版本烧录时在 Arduino IDE 中启用 `USB CDC On Boot`，打开 `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`；串口波特率为 921600。STM32 兼容版本按其目录 README 使用 J-Link 分别烧录三个 HEX。
 
 连接人体电极时必须使用电池供电和符合要求的电气隔离，不得让未隔离 USB 或市电设备形成到人体的导电通路。
 
@@ -286,12 +319,12 @@ BLE/USB receive -> raw BIN writer -> live filter -> waveform -> PSD
 构建后必须分发整个目录：
 
 ```text
-dist\OmniBCI_V16\
+dist\OmniBCI_V19\
 ```
 
-目标电脑启动 `OmniBCI_V16.exe`，不需要安装 Python 或依赖包。不能只复制 EXE，因为相邻 `_internal` 目录包含 Python 运行时、Qt 与科学计算库。记录文件写入可执行文件旁的 `recordings\`。
+目标电脑启动 `OmniBCI_V19.exe`，不需要安装 Python 或依赖包。不能只复制 EXE，因为相邻 `_internal` 目录包含 Python 运行时、Qt 与科学计算库。记录文件写入可执行文件旁的 `recordings\`。
 
-当前构建资产仍沿用 `OmniBCI_V16` 命名，但代码与配套固件已进入 V19；正式发布前应统一 EXE、spec、输出目录和用户文档的版本命名。
+当前桌面应用发布版本为 `OmniBCI V19`；同时兼容原 ESP32-C3 SRB1 固件，以及 STM32H563 + E73 + USB dongle 链路，设备控制协议为 V1。
 
 ## 版本变更摘要
 

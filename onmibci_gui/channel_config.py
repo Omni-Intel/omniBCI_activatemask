@@ -74,6 +74,9 @@ class ChannelConfigMixin:
             "mode": packet[8],
             "verified": bool(packet[9] & 0x01),
             "enabled_mask": packet[10],
+            "config1": packet[3],
+            "sample_rate_hz": packet[4] | (packet[5] << 8),
+            "sample_rate_code": packet[6],
         }
 
     def read_config_ack(

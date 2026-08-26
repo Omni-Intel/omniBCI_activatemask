@@ -601,6 +601,37 @@ class DisplayMixin:
         finally:
             self._plot_update_busy = False
 
+    @staticmethod
+    def _live_plot_envelope(t: np.ndarray, y: np.ndarray):
+        """Peak-preserving screen decimation without touching stored samples."""
+        t = np.asarray(t)
+        y = np.asarray(y)
+        count = min(t.size, y.size)
+        if count <= LIVE_PLOT_MAX_POINTS:
+            return t[:count], y[:count]
+
+        # Emit the minimum and maximum of each time bucket.  This retains short
+        # EEG spikes/artifacts that ordinary stride decimation could hide while
+        # capping the QPainter path to roughly the horizontal pixel budget.
+        bucket_count = max(1, LIVE_PLOT_MAX_POINTS // 2)
+        step = max(1, int(np.ceil(count / bucket_count)))
+        starts = np.arange(0, count, step, dtype=np.intp)
+        ends = np.minimum(starts + step - 1, count - 1)
+        finite_y = np.asarray(y[:count], dtype=float)
+        finite = np.isfinite(finite_y)
+        lows = np.minimum.reduceat(np.where(finite, finite_y, np.inf), starts)
+        highs = np.maximum.reduceat(np.where(finite, finite_y, -np.inf), starts)
+        valid_bucket = np.add.reduceat(finite.astype(np.int32), starts) > 0
+        lows[~valid_bucket] = np.nan
+        highs[~valid_bucket] = np.nan
+        out_t = np.empty(starts.size * 2, dtype=t.dtype)
+        out_y = np.empty(starts.size * 2, dtype=float)
+        out_t[0::2] = t[starts]
+        out_t[1::2] = t[ends]
+        out_y[0::2] = lows
+        out_y[1::2] = highs
+        return out_t, out_y
+
     def _render_fast_plots(self, display_end_sample: Optional[int] = None):
         """Render eight independent channel plots with per-channel y-scales."""
         seconds = float(self.win_spin.value())
@@ -706,7 +737,8 @@ class DisplayMixin:
             if differential:
                 single_signal = single_signal - np.asarray(arr[differential_b], dtype=float)
             single_y = np.clip(single_signal, -single_scale, single_scale)
-            self.single_curve.setData(t, single_y)
+            plot_t, plot_y = self._live_plot_envelope(t, single_y)
+            self.single_curve.setData(plot_t, plot_y)
             self.single_plot.setXRange(start_s, start_s + seconds, padding=0)
             single_key = (single_ch, single_scale)
             if self._last_single_y_range != single_key:
@@ -716,7 +748,8 @@ class DisplayMixin:
             for c, curve in enumerate(self.stack_curves):
                 scale = float(self.channel_scales[c].value())
                 y_plot = np.clip(np.asarray(arr[c], dtype=float), -scale, scale)
-                curve.setData(t, y_plot)
+                plot_t, plot_y = self._live_plot_envelope(t, y_plot)
+                curve.setData(plot_t, plot_y)
                 if self._last_channel_y_ranges[c] != scale:
                     self.channel_plots[c].setYRange(-scale, scale, padding=0)
                     self._last_channel_y_ranges[c] = scale
@@ -1542,7 +1575,7 @@ class DisplayMixin:
                 return "USB 序号有缺口但 MCU 未报告 pending/queue drop：检查 Serial worker 与 OS 串口缓存。"
 
         if np.isfinite(self.fs_est) and abs(self.fs_est - FS) > 2:
-            return f"采样率 {self.fs_est:.1f} Hz 偏离 250 Hz。"
+            return f"采样率 {self.fs_est:.1f} Hz 偏离当前设置 {FS} Hz。"
         if saturation > 0.1:
             return "有样本接近满量程：V18 会继续采集/保存，并只隔离该通道的实时绘图负担；仍需检查参考、BIAS 或电极。"
         if np.isfinite(self.latest_line_ratio) and self.latest_line_ratio > 0.25:

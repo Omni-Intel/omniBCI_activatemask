@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title Build OmniBCI V16 Windows EXE
+title Build OmniBCI V19 Windows EXE
 
 echo ============================================================
-echo   OmniBCI V16 - Windows EXE builder (recommended ONEDIR)
+echo   OmniBCI V19 - Windows EXE builder (recommended ONEDIR)
 echo ============================================================
 echo.
 
@@ -56,36 +56,36 @@ echo Verifying modules...
 if errorlevel 1 goto :fail
 
 echo.
-echo Building OmniBCI_V16.exe ...
+echo Building OmniBCI_V19.exe ...
 if exist build rmdir /s /q build
-if exist "dist\OmniBCI_V16" rmdir /s /q "dist\OmniBCI_V16"
-"%BPY%" -m PyInstaller --noconfirm --clean OmniBCI_V16.spec
+if exist "dist\OmniBCI_V19" rmdir /s /q "dist\OmniBCI_V19"
+"%BPY%" -m PyInstaller --noconfirm --clean OmniBCI_V19.spec
 if errorlevel 1 goto :fail
 
-if not exist "dist\OmniBCI_V16\OmniBCI_V16.exe" (
+if not exist "dist\OmniBCI_V19\OmniBCI_V19.exe" (
     echo ERROR: PyInstaller completed but EXE was not found.
     goto :fail
 )
 
-mkdir "dist\OmniBCI_V16\recordings" >nul 2>&1
-if exist firmware xcopy /E /I /Y firmware "dist\OmniBCI_V16\firmware" >nul
-copy /Y README.md "dist\OmniBCI_V16\README.md" >nul
-copy /Y VERSION_AND_QUICK_START.txt "dist\OmniBCI_V16\VERSION_AND_QUICK_START.txt" >nul
-copy /Y FIRMWARE_COMPATIBILITY.txt "dist\OmniBCI_V16\FIRMWARE_COMPATIBILITY.txt" >nul
-copy /Y EXE_BUILD_NOTES.txt "dist\OmniBCI_V16\EXE_BUILD_NOTES.txt" >nul
-copy /Y VALIDATION_REPORTS.txt "dist\OmniBCI_V16\VALIDATION_REPORTS.txt" >nul
+mkdir "dist\OmniBCI_V19\recordings" >nul 2>&1
+if exist firmware xcopy /E /I /Y firmware "dist\OmniBCI_V19\firmware" >nul
+copy /Y README.md "dist\OmniBCI_V19\README.md" >nul
+copy /Y VERSION_AND_QUICK_START.txt "dist\OmniBCI_V19\VERSION_AND_QUICK_START.txt" >nul
+copy /Y FIRMWARE_COMPATIBILITY.txt "dist\OmniBCI_V19\FIRMWARE_COMPATIBILITY.txt" >nul
+copy /Y EXE_BUILD_NOTES.txt "dist\OmniBCI_V19\EXE_BUILD_NOTES.txt" >nul
+copy /Y VALIDATION_REPORTS.txt "dist\OmniBCI_V19\VALIDATION_REPORTS.txt" >nul
 
 echo.
 echo ============================================================
 echo BUILD SUCCESS
 echo.
 echo Send the WHOLE folder below to another Windows computer:
-echo   %CD%\dist\OmniBCI_V16
+echo   %CD%\dist\OmniBCI_V19
 echo.
 echo Run:
-echo   OmniBCI_V16.exe
+echo   OmniBCI_V19.exe
 echo ============================================================
-explorer "%CD%\dist\OmniBCI_V16"
+explorer "%CD%\dist\OmniBCI_V19"
 pause
 exit /b 0
 

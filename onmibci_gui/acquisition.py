@@ -328,7 +328,11 @@ class AcquisitionMixin:
         if cleaned.size < FS * 4:
             return False, "不足 4 秒", metrics
         nperseg = min(cleaned.size, FS * 4)
-        nfft = 1024
+        # scipy requires nfft >= nperseg.  A fixed 1024 worked at 250 SPS
+        # (four seconds == 1000 samples) but made every 1000 SPS live PSD job
+        # fail because nperseg becomes 4000.  Keep a power-of-two FFT at every
+        # supported runtime rate: 1024 / 2048 / 4096 for 250 / 500 / 1000 SPS.
+        nfft = max(1024, 1 << int(np.ceil(np.log2(nperseg))))
         noverlap = min(nperseg // 2, nperseg - 1)
         raw_f, raw_p = signal.welch(
             cleaned,
@@ -1169,6 +1173,106 @@ class AcquisitionMixin:
                 self.set_status(f"PGA 指令发送失败：{exc}")
         else:
             self.set_status(f"仅修改本地解码 PGA={new_gain}，LSB={self.lsb_uv:.6g} uV/code。")
+
+    def _apply_sample_rate_locally(self, sample_rate_hz: int):
+        rate = set_runtime_sample_rate(sample_rate_hz)
+        self.sample_rate_hz = rate
+        self.ring = RingBuffer(CHANNELS, rate * 90)
+        self.filtered_ring = RingBuffer(CHANNELS, rate * 90)
+        self.parser.reset()
+
+        nyquist = rate / 2.0
+        lp_max = min(120.0, nyquist - 1.0)
+        self.lp_spin.blockSignals(True)
+        self.lp_spin.setMaximum(lp_max)
+        if self.lp_spin.value() > lp_max:
+            self.lp_spin.setValue(lp_max)
+        self.lp_spin.blockSignals(False)
+        hp = min(float(self.hp_spin.value()), max(0.1, lp_max - 0.5))
+        lp = max(hp + 0.5, float(self.lp_spin.value()))
+        self.sos_display_band = signal.butter(
+            2, [hp, lp], btype="bandpass", fs=rate, output="sos"
+        )
+        notch_sections = []
+        for notch_hz in (50.0, 100.0):
+            if notch_hz < nyquist:
+                notch_b, notch_a = signal.iirnotch(notch_hz, 30.0, fs=rate)
+                notch_sections.append(signal.tf2sos(notch_b, notch_a))
+        self.sos_notch = (
+            np.vstack(notch_sections) if notch_sections else np.empty((0, 6), dtype=float)
+        )
+        if hasattr(self, "psd_max_spin"):
+            old_psd_max = float(self.psd_max_spin.value())
+            self.psd_max_spin.setRange(10.0, nyquist)
+            self.psd_max_spin.setValue(min(old_psd_max, nyquist))
+
+        self.reset_processing_state()
+        self.reset_display_jitter_buffer()
+        self.last_seq = None
+        self.first_seq = None
+        self.first_clock = None
+        self.fs_est = np.nan
+        self._plot_time_cache.clear()
+        self.app_settings.setValue("sample_rate_hz", rate)
+        self.app_settings.sync()
+
+    def apply_sample_rate(self, _checked=False, silent: bool = False) -> bool:
+        rate = int(self.sample_rate_combo.currentData())
+        if rate not in SUPPORTED_SAMPLE_RATES:
+            return False
+        if not self.require_transport():
+            return False
+        if self.active_transport != "serial":
+            message = "动态采样率当前用于 STM32+E73+Dongle 串口链路；ESP32 BLE 固件不支持 AA 命令。"
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "采样率", message)
+            self.set_status(message)
+            return False
+
+        code = SAMPLE_RATE_TO_CODE[rate]
+        was_streaming = bool(self.streaming)
+        try:
+            if was_streaming:
+                # Never mix two physical sample rates in one raw BIN session.
+                self.stop_stream(offer_export=False)
+                QtWidgets.QApplication.processEvents()
+                time.sleep(0.10)
+            self.transport_write(b"s")
+            self.streaming = False
+            time.sleep(0.06)
+            self.transport_reset_input_buffer()
+            self.transport_write(bytes((0xAA, code)))
+            ack = self.read_config_ack(0xAA, expected_argument=code)
+            if (
+                ack is None
+                or not ack["verified"]
+                or ack["config1"] != SAMPLE_RATE_CONFIG1[rate]
+                or ack["sample_rate_hz"] != rate
+                or ack["sample_rate_code"] != code
+            ):
+                raise RuntimeError("固件未返回匹配的 CONFIG1/采样率读回，请先烧录配套 STM32 固件。")
+
+            self._apply_sample_rate_locally(rate)
+            if was_streaming:
+                self.start_stream()
+            self.set_status(
+                f"采样率已切换为 {rate} SPS，ADS1299 CONFIG1=0x{ack['config1']:02X} 已回读确认。"
+                + (" 已自动开始新的 BIN 记录会话。" if was_streaming else "")
+            )
+            return True
+        except Exception as exc:
+            current_index = self.sample_rate_combo.findData(self.sample_rate_hz)
+            if current_index >= 0:
+                self.sample_rate_combo.setCurrentIndex(current_index)
+            if was_streaming and not self.streaming:
+                try:
+                    self.start_stream()
+                except Exception:
+                    pass
+            if not silent:
+                QtWidgets.QMessageBox.critical(self, "采样率切换失败", str(exc))
+            self.set_status(f"采样率切换失败：{exc}")
+            return False
 
     def _ble_pending_bytes(self) -> int:
         queued = len(self.ble_rx_buffer)

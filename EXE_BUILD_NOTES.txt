@@ -13,25 +13,25 @@ Option A - local one-click build
 1. Install 64-bit Python 3.12 on the build computer.
 2. Double-click build_exe.bat.
 3. Wait for BUILD SUCCESS.
-4. Open dist\OmniBCI_V16\.
+4. Open dist\OmniBCI_V19\.
 5. Send or zip the entire directory.
-6. On the target computer, run OmniBCI_V16.exe.
+6. On the target computer, run OmniBCI_V19.exe.
 
 Option B - GitHub Actions
 -------------------------
-1. Commit the project, including .github/workflows/build-v16-windows-exe.yml.
+1. Commit the project, including .github/workflows/build-v19-windows-exe.yml.
 2. Open the repository Actions page.
-3. Run "Build OmniBCI V16 Windows EXE".
-4. Download the OmniBCI_V16_Windows artifact.
+3. Run "Build OmniBCI V19 Windows EXE".
+4. Download the OmniBCI_V19_Windows artifact.
 
 Distribution rules
 ------------------
-- Send the ENTIRE dist\OmniBCI_V16\ directory.
-- Do not copy OmniBCI_V16.exe alone. The adjacent _internal directory contains
+- Send the ENTIRE dist\OmniBCI_V19\ directory.
+- Do not copy OmniBCI_V19.exe alone. The adjacent _internal directory contains
   the Python runtime, Qt libraries and scientific packages.
 - The target computer does not need Python, pip, pyserial, scipy, PySide6 or
   bleak.
-- Recordings are written to OmniBCI_V16\recordings\ beside the executable.
+- Recordings are written to OmniBCI_V19\recordings\ beside the executable.
 - The live EXE excludes optional mne/pyedflib. Use the source/venv edition when
   BDF/FIF export is required.
 
@@ -44,5 +44,6 @@ Why ONEDIR
 
 Naming note
 -----------
-The build assets still use OmniBCI_V16 names although the current source GUI is
-V18. Aligning artifact names with V18 is recommended before a formal release.
+The desktop application release is OmniBCI V19. It supports both the original
+ESP32-C3 SRB1 firmware and the STM32H563 + E73 + USB dongle compatibility
+firmware using device-control protocol V1.

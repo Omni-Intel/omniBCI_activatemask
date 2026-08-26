@@ -1,0 +1,13 @@
+identifier: bciband_h563vg
+name: BCI-Band STM32H563VG
+type: mcu
+arch: arm
+ram: 640
+flash: 1024
+toolchain:
+  - zephyr
+supported:
+  - gpio
+  - pwm
+  - spi
+  - usb_device

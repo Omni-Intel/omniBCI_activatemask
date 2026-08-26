@@ -222,3 +222,7 @@ __marimo__/
 # Custom
 recordings/
 logs/
+build_output_*/
+build_work_*/
+staging_build_*/
+staging_dist_*/

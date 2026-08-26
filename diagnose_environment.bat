@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-echo ===== OmniBCI V16 environment diagnostic =====
+echo ===== OmniBCI V19 environment diagnostic =====
 echo Folder: %CD%
 echo.
 where py 2>nul

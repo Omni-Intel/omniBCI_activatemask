@@ -42,6 +42,11 @@ FLAGS bit2 controls the per-channel SRB2 switch.
 Reference command:
   A8 MODE
 where MODE 0 selects SRB1 and MODE 1 selects SRB2.
+
+Sample-rate command (STM32 radio/CDC firmware):
+  AA CODE
+where CODE 0/1/2 selects 250/500/1000 SPS. The device returns the normal
+12-byte BC ACK with CONFIG1 and the applied rate readback.
 """
 
 from __future__ import annotations
@@ -133,8 +138,11 @@ from onmibci_stream import (
 
 
 FS = 250
+SUPPORTED_SAMPLE_RATES = (250, 500, 1000)
+SAMPLE_RATE_TO_CODE = {250: 0, 500: 1, 1000: 2}
+SAMPLE_RATE_CONFIG1 = {250: 0x96, 500: 0x95, 1000: 0x94}
 CHANNELS = 8
-APP_RELEASE_VERSION = int(os.environ.get("OMNIBCI_APP_RELEASE_VERSION", "18"))
+APP_RELEASE_VERSION = int(os.environ.get("OMNIBCI_APP_RELEASE_VERSION", "19"))
 MNE_CHANNEL_TYPE = "eeg"
 BAUD = 921600
 FRAME_BYTES = 48
@@ -281,6 +289,9 @@ FILTER_BACKLOG_PAUSE_PLOT_S = 2.0  # diagnostic only; live paint is never intent
 FILTER_BACKLOG_PAUSE_PSD_S = 0.30
 PSD_LIVE_REFRESH_MS = 1500
 PSD_LIVE_WINDOW_S = 6.0
+# Bound only the number of points handed to Qt for each live curve.  The raw
+# ring, filtering worker and BIN writer always retain the full sample stream.
+LIVE_PLOT_MAX_POINTS = 2400
 # ADS rail samples are not useful EEG and can create a pathological Qt paint
 # path when a disconnected electrode toggles rapidly between positive and
 # negative full scale. Raw BIN bytes stay untouched; only the live filter and
@@ -329,6 +340,31 @@ LEAD_OFF_FREQUENCY_HZ = FS / 8.0
 LEAD_OFF_CURRENT_NA = 6.0
 LEAD_OFF_SERIES_SRB1_KOHM = 9.98
 LEAD_OFF_SERIES_SRB2_KOHM = 4.40
+
+
+def set_runtime_sample_rate(sample_rate_hz: int) -> int:
+    """Synchronize sample-rate globals across the already imported mixins."""
+    rate = int(sample_rate_hz)
+    if rate not in SUPPORTED_SAMPLE_RATES:
+        raise ValueError(f"unsupported sample rate: {rate}")
+    values = {
+        "FS": rate,
+        "BYTES_PER_SECOND": FRAME_BYTES * rate,
+        "BLE_PLOT_PAUSE_BACKLOG_BYTES": int(FRAME_BYTES * rate * 0.50),
+        "BLE_PSD_PAUSE_BACKLOG_BYTES": int(FRAME_BYTES * rate * 0.30),
+        "LIVE_TIMELINE_MAX_FILL_SAMPLES": int(round(LIVE_TIMELINE_MAX_FILL_S * rate)),
+        "LEAD_OFF_FREQUENCY_HZ": rate / 8.0,
+    }
+    globals().update(values)
+    for module_name, module in tuple(sys.modules.items()):
+        if module is None or not (
+            module_name == "onmibci_gui" or module_name.startswith("onmibci_gui.")
+        ):
+            continue
+        for name, value in values.items():
+            if hasattr(module, name):
+                setattr(module, name, value)
+    return rate
 REFERENCE_SRB1 = 0
 REFERENCE_SRB2 = 1
 REFERENCE_ITEMS = [("SRB1 全局参考（信号接 INxP）", REFERENCE_SRB1)]

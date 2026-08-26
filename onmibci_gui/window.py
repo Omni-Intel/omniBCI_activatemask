@@ -46,9 +46,18 @@ class MainWindow(
         self.gain = 24  # legacy/global command value
         self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
         self.app_settings = QtCore.QSettings("OmniBCI", "ADS1299EEGWorkbench")
+        try:
+            saved_sample_rate = int(self.app_settings.value("sample_rate_hz", 250))
+        except (TypeError, ValueError):
+            saved_sample_rate = 250
+        if saved_sample_rate not in SUPPORTED_SAMPLE_RATES:
+            saved_sample_rate = 250
+        self.sample_rate_hz = set_runtime_sample_rate(saved_sample_rate)
         self.channel_names = self._load_channel_names()
-        self.channel_enabled = np.array([True] * 5 + [False] * 3, dtype=bool)
-        self.channel_bias = np.array([True] * 5 + [False] * 3, dtype=bool)
+        # V19 defaults to the complete ADS1299 front end.  Users can still
+        # power down individual channels later from the channel dialog.
+        self.channel_enabled = np.ones(CHANNELS, dtype=bool)
+        self.channel_bias = np.ones(CHANNELS, dtype=bool)
         # The GUI intentionally exposes only the fixed SRB1 wiring profile:
         # measurement electrodes on INxP and the common reference on SRB1.
         self.reference_mode = REFERENCE_SRB1
@@ -609,7 +618,7 @@ class MainWindow(
         self.notch_check = QtWidgets.QCheckBox("50/100 Hz 谐波陷波")
         self.notch_check.setChecked(True)
         self.notch_check.setToolTip(
-            "级联抑制 50 Hz 和 100 Hz；采样率为 250 SPS 时，150 Hz 会混叠到 100 Hz。"
+            "级联抑制 50 Hz 和 100 Hz；滤波器会随当前采样率重新设计。"
         )
         self.hp_spin.valueChanged.connect(self._filter_settings_changed)
         self.lp_spin.valueChanged.connect(self._filter_settings_changed)
@@ -651,6 +660,16 @@ class MainWindow(
             "再次点击会恢复进入短接前的 EEG/BIAS 模式。"
         )
         self.internal_short_btn.toggled.connect(self.toggle_internal_short)
+        self.sample_rate_combo = QtWidgets.QComboBox()
+        for rate in SUPPORTED_SAMPLE_RATES:
+            self.sample_rate_combo.addItem(f"{rate} SPS", rate)
+        sample_rate_index = self.sample_rate_combo.findData(self.sample_rate_hz)
+        self.sample_rate_combo.setCurrentIndex(max(0, sample_rate_index))
+        self.sample_rate_combo.setToolTip(
+            "修改 ADS1299 CONFIG1；切换时会安全停止当前采集并重新开始一个记录会话。"
+        )
+        self.sample_rate_apply_btn = QtWidgets.QPushButton("应用采样率")
+        self.sample_rate_apply_btn.clicked.connect(self.apply_sample_rate)
         self.reference_combo = QtWidgets.QComboBox()
         for label, value in REFERENCE_ITEMS:
             self.reference_combo.addItem(label, value)
@@ -683,6 +702,8 @@ class MainWindow(
         serial_layout.addWidget(self.impedance_btn)
         serial_layout.addWidget(self.channel_names_btn)
         serial_layout.addWidget(self.internal_short_btn)
+        serial_layout.addWidget(self.sample_rate_combo)
+        serial_layout.addWidget(self.sample_rate_apply_btn)
         self.reference_fixed_label = QtWidgets.QLabel("参考：SRB1 固定（INxP−SRB1）")
         self.reference_fixed_label.setToolTip("GUI 已移除 SRB2 切换功能")
         serial_layout.addWidget(self.reference_fixed_label)
