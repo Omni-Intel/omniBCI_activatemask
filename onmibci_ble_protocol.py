@@ -12,6 +12,7 @@ MSG_HELLO = 0x01
 MSG_GET_CONFIG = 0x02
 MSG_SET_CONFIG = 0x03
 MSG_PING = 0x04
+MSG_SET_SAMPLE_RATE = 0x06
 MSG_RESPONSE = 0x80
 
 
@@ -43,6 +44,8 @@ class ConfigSnapshot:
     lead_off_p: int
     lead_off_n: int
     misc1: int
+    sample_rate_code: int = 0
+    sample_rate_hz: int = 250
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -109,8 +112,8 @@ def encode_set_config(
 
 def decode_config_snapshot(payload: bytes) -> ConfigSnapshot:
     payload = bytes(payload)
-    if len(payload) != 26:
-        raise ProtocolError(f"config snapshot length {len(payload)} != 26")
+    if len(payload) not in (26, 29):
+        raise ProtocolError(f"config snapshot length {len(payload)} is not 26 or 29")
     if payload[0] != 0:
         raise ProtocolError(f"device rejected request with result {payload[0]}")
     return ConfigSnapshot(
@@ -129,4 +132,6 @@ def decode_config_snapshot(payload: bytes) -> ConfigSnapshot:
         lead_off_p=payload[23],
         lead_off_n=payload[24],
         misc1=payload[25],
+        sample_rate_code=payload[26] if len(payload) >= 29 else 0,
+        sample_rate_hz=int.from_bytes(payload[27:29], "little") if len(payload) >= 29 else 250,
     )

@@ -383,6 +383,11 @@ class TransportControlMixin:
             if snapshot is None:
                 raise RuntimeError("未收到 ADS1299 寄存器快照")
             self.apply_ble_config_snapshot(snapshot)
+            if snapshot.sample_rate_hz in SUPPORTED_SAMPLE_RATES:
+                self._apply_sample_rate_locally(snapshot.sample_rate_hz)
+                index = self.sample_rate_combo.findData(snapshot.sample_rate_hz)
+                if index >= 0:
+                    self.sample_rate_combo.setCurrentIndex(index)
             self.refresh_channel_parameter_labels()
             self.mode_before_internal_short = (
                 self.current_mode if self.current_mode in (0, 1, 2) else 1
@@ -395,7 +400,8 @@ class TransportControlMixin:
             protocol = info.get("protocol", 1) if info else 1
             self.set_status(
                 f"BLE {action}并确认设备就绪：{name}，MTU={mtu}，"
-                f"固件 V{firmware[0]}.{firmware[1]}.{firmware[2]}，协议 V{protocol}，固定 SRB1。"
+                f"固件 V{firmware[0]}.{firmware[1]}.{firmware[2]}，协议 V{protocol}，"
+                f"参考固定由固件决定，{self.sample_rate_hz} SPS。"
                 + ("采集已恢复。" if reconnected and self.streaming else "点击“开始采集”。")
             )
         except Exception as exc:

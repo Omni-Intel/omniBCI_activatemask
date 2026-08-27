@@ -2,9 +2,9 @@
 
 ## 项目概览
 
-OmniBCI 是面向 ADS1299 的原生 Python EEG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线只支持 **SRB1-only 固件 V19 / 设备控制协议 V1**。
+OmniBCI 是面向 ADS1299 的原生 Python EEG/EMG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线支持固定 SRB1 EEG 和固定 SRB2 肌电两种 ESP32 V19 固件，参考拓扑由固件决定。
 
-STM32 + E73 + USB Dongle 串口链路支持在设备控制栏交互选择
+STM32 + E73 + USB Dongle 串口链路和新版 ESP32 BLE 固件均支持在设备控制栏交互选择
 250/500/1000 SPS。GUI 会发送 `AA CODE`，校验 ADS1299 CONFIG1 回读，并
 同步重建时间轴、实时缓冲、滤波器、PSD 与导出采样率。正在记录时切换会
 先封口当前 BIN，再自动开始一个新记录会话，避免同一文件混用两种采样率。
@@ -26,7 +26,7 @@ GUI 同时使用固件完整的 32 位 `queue_drop` 计数器进行丢帧归因�
 ### 已完成功能
 
 - **采集与硬件控制**：USB 串口与 BLE 采集、V19/V1 版本握手、ADS1299 完整寄存器快照、通道开关/PGA/BIAS、内部短接、内部测试和电极阻抗检测。
-- **SRB1-only**：GUI 与固件均移除 SRB2 切换入口；测量电极接 INxP，公共参考接 SRB1。
+- **固定参考固件**：GUI 不做运行时 SRB 切换；SRB1 EEG 与 SRB2 肌电板分别烧录对应 `.ino`。
 - **BLE 可靠传输**：六帧 compact block、384 块保留环、累计 ACK/NACK 修复、旧控制抑制、拥塞退避重试、512 帧采集队列和可分离 MCU/主机丢帧的 STATUS V5 诊断。
 - **实时显示**：8 通道波形、自定义通道名、单通道视图、`A - B` 派生差分波形与 PSD、实时滤波、陷波、Welch PSD、阿尔法峰和信号质量指标。差分仅影响显示/分析，不篡改原始记录。
 - **录制与导出**：每次采集写入一个连续 BIN，同时生成 manifest/sidecar 元数据；防止重复点击“开始”覆盖当前会话；支持 CSV、BDF+、FIF/MNE 导出和 BDF+ Annotation 事件标记。
@@ -192,12 +192,13 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 
 ## 固件选择与兼容性
 
-当前分支支持两套 SRB1-only V19 硬件链路：
+当前分支支持三套 V19 硬件链路：
 
 - `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`
+- `firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino`
 - `firmware/STM32_E73_DONGLE_V19/`：STM32H563VGT6 + E73-2G4M08S1C + nRF52840 USB dongle
 
-两套固件均为 **SRB1-only V19**，设备控制通信协议为 **V1**。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式；dongle 以 USB CDC 虚拟串口向 GUI 提供数据并把配置命令反向传给 STM32。GUI 只有在完成版本握手并取得 ADS1299 完整寄存器快照后，才确认设备已经就绪。
+两个 ESP32 sketch 共用同一份经过验证的 V19 核心，仅固定参考侧和默认通道数不同，不在 GUI 中切换 SRB。两者都支持 250/500/1000 SPS 事务命令和 CONFIG1 读回。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式。
 
 STM32 兼容固件默认启用 CH1～CH8，支持 250/500/1000 SPS、逐通道启用/PGA/BIAS、内部短接、内部测试和阻抗检测；PE5 输出 200 kHz、50% 占空比 PWM 驱动 NSC1002，PA1 用作流式工作指示灯。可直接烧录的 HEX、源代码、哈希和烧录顺序见 `firmware/STM32_E73_DONGLE_V19/README.md`。
 
@@ -248,7 +249,7 @@ IN1N～IN8N        -> 不作为外部公共参考使用
 - GUI 与固件均按当前启用通道掩码过滤 `BIAS_SENSP`。
 - `A7 CH GAIN FLAGS` 中 bit0 表示启用通道，bit1 表示加入 `BIAS_SENSP`，bit2 在本固件中忽略。
 
-ESP32-C3 版本烧录时在 Arduino IDE 中启用 `USB CDC On Boot`，打开 `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`；串口波特率为 921600。STM32 兼容版本按其目录 README 使用 J-Link 分别烧录三个 HEX。
+ESP32-C3 版本烧录时在 Arduino IDE 中启用 `USB CDC On Boot`：EEG 板打开 SRB1 sketch，`myEMGpcb` 打开 SRB2 sketch；串口波特率为 921600。STM32 兼容版本按其目录 README 使用 J-Link 分别烧录三个 HEX。
 
 连接人体电极时必须使用电池供电和符合要求的电气隔离，不得让未隔离 USB 或市电设备形成到人体的导电通路。
 

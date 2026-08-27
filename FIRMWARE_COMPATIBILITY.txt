@@ -1,17 +1,20 @@
 OMNIBCI V19 FIRMWARE COMPATIBILITY
 ==================================
 
-This branch supports only the bundled SRB1 BLE firmware V19:
+This branch supports two fixed-reference ESP32-C3 BLE V19 builds:
 
   firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino
+  firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino
 
 Required handshake:
-  firmware version V19.0.0
+  firmware version V19.1.0 (GUI accepts V19.x)
   device-control protocol V1
 
-V19 is SRB1-only. SRB2 firmware, reference switching and A8 probing have been
-removed. The GUI reports a BLE connection as ready only after HELLO succeeds and
-an ADS1299 register snapshot has been received.
+Reference selection is intentionally a firmware-build choice, not a GUI control.
+The SRB1 build keeps MISC1.SRB1 enabled; the myEMGpcb SRB2 build enables every
+active CHnSET.SRB2 switch and keeps MISC1.SRB1 disabled. Both builds support
+runtime 250/500/1000 SPS through a transaction-correlated command followed by
+CONFIG1 and applied-rate readback.
 
 GATT characteristics:
   DATA      reliable EEG blocks

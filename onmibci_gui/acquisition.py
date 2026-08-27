@@ -1222,13 +1222,6 @@ class AcquisitionMixin:
             return False
         if not self.require_transport():
             return False
-        if self.active_transport != "serial":
-            message = "动态采样率当前用于 STM32+E73+Dongle 串口链路；ESP32 BLE 固件不支持 AA 命令。"
-            if not silent:
-                QtWidgets.QMessageBox.warning(self, "采样率", message)
-            self.set_status(message)
-            return False
-
         code = SAMPLE_RATE_TO_CODE[rate]
         was_streaming = bool(self.streaming)
         try:
@@ -1239,18 +1232,38 @@ class AcquisitionMixin:
                 time.sleep(0.10)
             self.transport_write(b"s")
             self.streaming = False
+            if self.active_transport == "ble" and self.ble_worker is not None:
+                self.ble_worker.set_streaming_hint(False)
             time.sleep(0.06)
-            self.transport_reset_input_buffer()
-            self.transport_write(bytes((0xAA, code)))
-            ack = self.read_config_ack(0xAA, expected_argument=code)
-            if (
-                ack is None
-                or not ack["verified"]
-                or ack["config1"] != SAMPLE_RATE_CONFIG1[rate]
-                or ack["sample_rate_hz"] != rate
-                or ack["sample_rate_code"] != code
-            ):
-                raise RuntimeError("固件未返回匹配的 CONFIG1/采样率读回，请先烧录配套 STM32 固件。")
+            if self.active_transport == "ble":
+                info = self.ble_worker.device_info if self.ble_worker is not None else {}
+                if not (int((info or {}).get("capabilities", 0)) & BLE_CAP_SAMPLE_RATE):
+                    raise RuntimeError("当前 ESP32 固件不支持动态采样率，请烧录配套 V19 通用固件。")
+                snapshot = decode_config_snapshot(
+                    self.ble_worker.request_blocking(
+                        MSG_SET_SAMPLE_RATE, bytes((code,)), timeout=4.0
+                    )
+                )
+                self.ble_worker.config_snapshot = snapshot
+                if (
+                    not snapshot.verified
+                    or snapshot.config1 != SAMPLE_RATE_CONFIG1[rate]
+                    or snapshot.sample_rate_hz != rate
+                    or snapshot.sample_rate_code != code
+                ):
+                    raise RuntimeError("ESP32 未返回匹配的 CONFIG1/采样率读回。")
+            else:
+                self.transport_reset_input_buffer()
+                self.transport_write(bytes((0xAA, code)))
+                ack = self.read_config_ack(0xAA, expected_argument=code)
+                if (
+                    ack is None
+                    or not ack["verified"]
+                    or ack["config1"] != SAMPLE_RATE_CONFIG1[rate]
+                    or ack["sample_rate_hz"] != rate
+                    or ack["sample_rate_code"] != code
+                ):
+                    raise RuntimeError("固件未返回匹配的 CONFIG1/采样率读回，请先烧录配套 STM32 固件。")
 
             self._apply_sample_rate_locally(rate)
             if was_streaming:

@@ -95,6 +95,10 @@
     - The default EEG mode uses BIAS_SENSP only; BIAS_SENSN is 0.
 */
 
+#ifndef OMNIBCI_FIXED_REFERENCE_SRB2
+#define OMNIBCI_FIXED_REFERENCE_SRB2 0
+#endif
+
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
@@ -106,6 +110,8 @@
 
 // ============================ ADS1299 ============================
 #define CONFIG1_250SPS       0x96
+#define CONFIG1_500SPS       0x95
+#define CONFIG1_1000SPS      0x94
 #define CONFIG2_NORMAL       0xC0
 #define CONFIG2_TEST_SLOW    0xD1
 #define CONFIG3_INTERNAL_REF 0xEC
@@ -130,7 +136,10 @@
 
 // 默认只启用 CH1-CH5；CH6-CH8 写 PD=1 禁用。
 // BIAS_SENSP / BIAS_SENSN 只允许把有效通道位纳入 BIAS 环路。
-#define ADS_ACTIVE_CH_MASK   0x1F  // bit0-bit4 = CH1-CH5
+#ifndef OMNIBCI_ACTIVE_CH_MASK
+#define OMNIBCI_ACTIVE_CH_MASK 0x1F
+#endif
+#define ADS_ACTIVE_CH_MASK   OMNIBCI_ACTIVE_CH_MASK
 #define ADS_FIRST_CH_REG     0x05
 #define ADS_LAST_CH_REG      0x0C
 #define ADS_LAST_ACTIVE_REG  0x09  // CH5SET
@@ -177,12 +186,16 @@ constexpr uint8_t SYNC_2 = 0x5A;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FRAME_TYPE_DATA = 1;
 constexpr uint8_t FIRMWARE_VERSION_MAJOR = 19;
-constexpr uint8_t FIRMWARE_VERSION_MINOR = 0;
+constexpr uint8_t FIRMWARE_VERSION_MINOR = 1;
 constexpr uint8_t FIRMWARE_VERSION_PATCH = 0;
 constexpr uint8_t DEVICE_PROTOCOL_VERSION = 1;
 
 // ============================ BLE reliable transport STATUS V5 / DATA V2 ============================
+#if OMNIBCI_FIXED_REFERENCE_SRB2
+constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB2-V19";
+#else
 constexpr char BLE_DEVICE_NAME[] = "OmniBCI-C3-SRB1-V19";
+#endif
 constexpr char BLE_SERVICE_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0001";
 constexpr char BLE_DATA_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0002";
 constexpr char BLE_CONTROL_UUID[] = "79f60000-3a7d-4b11-9f4e-4c57a50d0003";
@@ -195,6 +208,7 @@ constexpr uint8_t DEVICE_MSG_HELLO = 0x01;
 constexpr uint8_t DEVICE_MSG_GET_CONFIG = 0x02;
 constexpr uint8_t DEVICE_MSG_SET_CONFIG = 0x03;
 constexpr uint8_t DEVICE_MSG_PING = 0x04;
+constexpr uint8_t DEVICE_MSG_SET_SAMPLE_RATE = 0x06;
 constexpr uint8_t DEVICE_MSG_RESPONSE = 0x80;
 constexpr uint8_t DEVICE_MAX_PAYLOAD_BYTES = 12;
 constexpr uint8_t DEVICE_RESULT_OK = 0;
@@ -311,6 +325,9 @@ volatile bool adsConversionsRunning = false;
 volatile bool configurationVerified = false;
 volatile RunPhase runPhase = PHASE_CONFIG;
 volatile FrontendMode currentMode = MODE_EEG_BIAS_P_ONLY;
+volatile uint8_t currentSampleRateCode = 0;
+volatile uint16_t currentSampleRateHz = 250;
+volatile uint8_t currentConfig1 = CONFIG1_250SPS;
 volatile uint32_t acquisitionSequence = 0;
 volatile uint32_t drdyCount = 0;
 volatile uint32_t missedDrdyCount = 0;
@@ -455,6 +472,7 @@ void setBiasSensPMask(uint8_t mask);
 void setChannelConfig(uint8_t channel, uint8_t gain, uint8_t flags);
 bool setBulkChannelConfig(const uint8_t *payload);
 void setLeadOffMask(uint8_t mask);
+bool setSampleRateCode(uint8_t code);
 bool gainToCode(uint8_t gain, uint8_t &code);
 uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux);
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode);
@@ -1206,8 +1224,8 @@ bool gainToCode(uint8_t gain, uint8_t &code) {
 }
 
 uint8_t makeChannelSetting(uint8_t gainCode, uint8_t mux) {
-  // SRB2 (CHnSET bit3) is intentionally never set in the SRB1-only variant.
-  return static_cast<uint8_t>(((gainCode & 0x07u) << 4) | (mux & 0x07u));
+  const uint8_t srb2 = OMNIBCI_FIXED_REFERENCE_SRB2 && mux == CH_MUX_NORMAL ? 0x08u : 0x00u;
+  return static_cast<uint8_t>(((gainCode & 0x07u) << 4) | srb2 | (mux & 0x07u));
 }
 
 uint8_t makePoweredDownChannelSetting(uint8_t gainCode) {
@@ -1306,6 +1324,29 @@ void setLeadOffMask(uint8_t mask) {
   configureFrontend(static_cast<FrontendMode>(currentMode));
 }
 
+bool setSampleRateCode(uint8_t code) {
+  if (runPhase == PHASE_STREAMING || code > 2u) return false;
+  switch (code) {
+    case 0:
+      currentConfig1 = CONFIG1_250SPS;
+      currentSampleRateHz = 250;
+      break;
+    case 1:
+      currentConfig1 = CONFIG1_500SPS;
+      currentSampleRateHz = 500;
+      break;
+    case 2:
+      currentConfig1 = CONFIG1_1000SPS;
+      currentSampleRateHz = 1000;
+      break;
+    default:
+      return false;
+  }
+  currentSampleRateCode = code;
+  configureFrontend(static_cast<FrontendMode>(currentMode));
+  return configurationVerified;
+}
+
 // ============================ Frontend modes ============================
 void configureFrontend(FrontendMode mode) {
   if (runPhase == PHASE_STREAMING) return;
@@ -1326,7 +1367,7 @@ void configureFrontendLocked(FrontendMode mode) {
   configurationVerified = false;
   stopAdsConversionsLocked();
 
-  writeAdsRegister(0x01, CONFIG1_250SPS);
+  writeAdsRegister(0x01, currentConfig1);
   writeAdsRegister(0x03, CONFIG3_INTERNAL_REF);
 
   uint8_t config2 = CONFIG2_NORMAL;
@@ -1342,8 +1383,8 @@ void configureFrontendLocked(FrontendMode mode) {
 
     case MODE_EEG_BIAS_P_ONLY:
       config2 = CONFIG2_NORMAL;
-      biasP = currentBiasSensPMask;
-      biasN = 0x00;
+      biasP = OMNIBCI_FIXED_REFERENCE_SRB2 ? 0x00 : currentBiasSensPMask;
+      biasN = OMNIBCI_FIXED_REFERENCE_SRB2 ? currentBiasSensPMask : 0x00;
       break;
 
     case MODE_EEG_BIAS_OFF:
@@ -1370,12 +1411,13 @@ void configureFrontendLocked(FrontendMode mode) {
   uint8_t selectedMux = CH_MUX_NORMAL;
   if (mode == MODE_INPUT_SHORTED) selectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) selectedMux = CH_MUX_TEST;
-  const bool srb1Enabled =
+  const bool normalInputMode =
     mode == MODE_EEG_BIAS_PN ||
     mode == MODE_EEG_BIAS_P_ONLY ||
     mode == MODE_EEG_BIAS_OFF;
+  const bool srb1Enabled = normalInputMode && !OMNIBCI_FIXED_REFERENCE_SRB2;
   const uint8_t leadOffMask =
-    srb1Enabled ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
+    normalInputMode ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
   biasP &= currentEnabledMask;
   biasN &= currentEnabledMask;
   for (uint8_t address = ADS_FIRST_CH_REG; address <= ADS_LAST_CH_REG; address++) {
@@ -1389,8 +1431,8 @@ void configureFrontendLocked(FrontendMode mode) {
   writeAdsRegister(0x0D, biasP);
   writeAdsRegister(0x0E, biasN);
   writeAdsRegister(0x04, leadOffMask ? LOFF_AC_6NA_31HZ : 0x00);
-  writeAdsRegister(0x0F, leadOffMask);  // LOFF_SENSP
-  writeAdsRegister(0x10, 0x00);         // LOFF_SENSN
+  writeAdsRegister(0x0F, OMNIBCI_FIXED_REFERENCE_SRB2 ? 0x00 : leadOffMask);
+  writeAdsRegister(0x10, OMNIBCI_FIXED_REFERENCE_SRB2 ? leadOffMask : 0x00);
   writeAdsRegister(0x11, 0x00);         // LOFF_FLIP
   writeAdsRegister(0x15, srb1Enabled ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
 
@@ -1407,23 +1449,28 @@ bool verifyFrontendLocked(FrontendMode mode) {
   uint8_t expectedMux = CH_MUX_NORMAL;
   uint8_t expectedBiasP = currentBiasSensPMask;
   uint8_t expectedBiasN = 0x00;
-  const bool expectedSrb1 =
+  const bool expectedNormalInput =
     mode == MODE_EEG_BIAS_PN ||
     mode == MODE_EEG_BIAS_P_ONLY ||
     mode == MODE_EEG_BIAS_OFF;
+  const bool expectedSrb1 = expectedNormalInput && !OMNIBCI_FIXED_REFERENCE_SRB2;
   const uint8_t expectedLeadOffMask =
-    expectedSrb1 ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
+    expectedNormalInput ? static_cast<uint8_t>(currentLeadOffMask & currentEnabledMask) : 0x00;
 
   if (mode == MODE_INPUT_SHORTED) expectedMux = CH_MUX_SHORTED;
   if (mode == MODE_INTERNAL_TEST) expectedMux = CH_MUX_TEST;
   if (mode == MODE_EEG_BIAS_PN) expectedBiasN = currentBiasSensPMask;
+  if (mode == MODE_EEG_BIAS_P_ONLY && OMNIBCI_FIXED_REFERENCE_SRB2) {
+    expectedBiasP = 0x00;
+    expectedBiasN = currentBiasSensPMask;
+  }
   if (mode == MODE_EEG_BIAS_OFF || mode == MODE_INPUT_SHORTED || mode == MODE_INTERNAL_TEST) {
     expectedBiasP = 0x00;
     expectedBiasN = 0x00;
   }
 
   bool ok = true;
-  ok &= readAdsRegister(0x01) == CONFIG1_250SPS;
+  ok &= readAdsRegister(0x01) == currentConfig1;
   ok &= readAdsRegister(0x02) == expectedConfig2;
   ok &= readAdsRegister(0x03) == CONFIG3_INTERNAL_REF;
   expectedBiasP &= currentEnabledMask;
@@ -1438,8 +1485,8 @@ bool verifyFrontendLocked(FrontendMode mode) {
   ok &= readAdsRegister(0x0D) == expectedBiasP;
   ok &= readAdsRegister(0x0E) == expectedBiasN;
   ok &= readAdsRegister(0x04) == (expectedLeadOffMask ? LOFF_AC_6NA_31HZ : 0x00);
-  ok &= readAdsRegister(0x0F) == expectedLeadOffMask;
-  ok &= readAdsRegister(0x10) == 0x00;
+  ok &= readAdsRegister(0x0F) == (OMNIBCI_FIXED_REFERENCE_SRB2 ? 0x00 : expectedLeadOffMask);
+  ok &= readAdsRegister(0x10) == (OMNIBCI_FIXED_REFERENCE_SRB2 ? expectedLeadOffMask : 0x00);
   ok &= readAdsRegister(0x11) == 0x00;
   ok &= readAdsRegister(0x15) == (expectedSrb1 ? MISC1_SRB1_ON : MISC1_SRB1_OFF);
   return ok;
@@ -1650,6 +1697,19 @@ uint16_t reliableInFlightBlocks() {
 
 uint32_t reliableAdaptiveTxPaceMs() {
   const uint16_t inFlight = reliableInFlightBlocks();
+  // One block contains six samples. 500/1000 SPS therefore require a shorter
+  // submission cadence than the original 250 SPS-only build. BLE congestion
+  // is still governed by notify status, backoff and the 16-block ACK window.
+  if (currentSampleRateHz >= 1000u) {
+    if (inFlight >= 12u) return 6u;
+    if (inFlight >= 8u) return 4u;
+    return 2u;
+  }
+  if (currentSampleRateHz >= 500u) {
+    if (inFlight >= 12u) return 12u;
+    if (inFlight >= 8u) return 8u;
+    return 5u;
+  }
   if (inFlight >= 12u) return BLE_RELIABLE_TX_PACE_SLOW_MS;
   if (inFlight >= 8u) return BLE_RELIABLE_TX_PACE_NORMAL_MS;
   return BLE_RELIABLE_TX_PACE_FAST_MS;
@@ -2151,9 +2211,10 @@ void buildStreamFrame(
     flags |= (1u << 5);
   }
   if (currentMode == MODE_EEG_BIAS_PN) flags |= (1u << 6);
-  if (currentMode == MODE_EEG_BIAS_PN ||
+  if (!OMNIBCI_FIXED_REFERENCE_SRB2 &&
+      (currentMode == MODE_EEG_BIAS_PN ||
       currentMode == MODE_EEG_BIAS_P_ONLY ||
-      currentMode == MODE_EEG_BIAS_OFF) {
+      currentMode == MODE_EEG_BIAS_OFF)) {
     flags |= (1u << 7); // SRB1 ON only for normal EEG input modes
   }
   p[15] = flags;
@@ -2414,7 +2475,7 @@ void sendDeviceResponse(
 
 void buildConfigSnapshot(uint8_t result, uint8_t *destination) {
   if (!destination) return;
-  memset(destination, 0, 26);
+  memset(destination, 0, 29);
   destination[0] = result;
   writeU32LE(&destination[1], configurationGeneration);
   destination[5] = static_cast<uint8_t>(currentMode);
@@ -2437,6 +2498,8 @@ void buildConfigSnapshot(uint8_t result, uint8_t *destination) {
   destination[24] = readAdsRegister(0x10);
   destination[25] = readAdsRegister(0x15);
   xSemaphoreGive(adsBusMutex);
+  destination[26] = currentSampleRateCode;
+  writeU16LE(&destination[27], currentSampleRateHz);
 }
 
 void handleDeviceControl(const DeviceControlCommand &command) {
@@ -2445,7 +2508,7 @@ void handleDeviceControl(const DeviceControlCommand &command) {
       DEVICE_RESULT_OK,
       FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH,
       DEVICE_PROTOCOL_VERSION,
-      0x0Fu, 0x00u,
+      0x2Fu, 0x00u,
       0, 0, 0, 0
     };
     writeU32LE(&payload[7], firmwareBootId);
@@ -2454,7 +2517,7 @@ void handleDeviceControl(const DeviceControlCommand &command) {
   }
 
   if (command.type == DEVICE_MSG_GET_CONFIG) {
-    uint8_t payload[26] = {};
+    uint8_t payload[29] = {};
     buildConfigSnapshot(
       runPhase == PHASE_STREAMING ? DEVICE_RESULT_BUSY : DEVICE_RESULT_OK,
       payload
@@ -2474,7 +2537,7 @@ void handleDeviceControl(const DeviceControlCommand &command) {
         gainsValid &= gainToCode(command.payload[4 + ch], ignoredCode);
       }
       if (!gainsValid) {
-        uint8_t payload[26] = {};
+        uint8_t payload[29] = {};
         buildConfigSnapshot(result, payload);
         sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
         return;
@@ -2492,7 +2555,21 @@ void handleDeviceControl(const DeviceControlCommand &command) {
         result = DEVICE_RESULT_OK;
       }
     }
-    uint8_t payload[26] = {};
+    uint8_t payload[29] = {};
+    buildConfigSnapshot(result, payload);
+    sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
+    return;
+  }
+
+  if (command.type == DEVICE_MSG_SET_SAMPLE_RATE) {
+    uint8_t result = DEVICE_RESULT_INVALID;
+    if (runPhase == PHASE_STREAMING) {
+      result = DEVICE_RESULT_BUSY;
+    } else if (command.payloadLength == 1u && setSampleRateCode(command.payload[0])) {
+      configurationGeneration++;
+      result = DEVICE_RESULT_OK;
+    }
+    uint8_t payload[29] = {};
     buildConfigSnapshot(result, payload);
     sendDeviceResponse(command.type, command.requestId, payload, sizeof(payload));
     return;

@@ -3,7 +3,7 @@ OMNIBCI VERSION AND QUICK START
 
 Current version
 ---------------
-OmniBCI ADS1299 GUI for SRB1-only firmware V19 and communication protocol V1.
+OmniBCI ADS1299 GUI for fixed-reference SRB1/SRB2 firmware V19 and protocol V1.
 
 BLE is considered ready only after the firmware handshake and ADS1299 register
 snapshot succeed. Configuration responses use an independent RESPONSE Notify
@@ -19,6 +19,9 @@ V19 firmware
 -------------
 SRB1:
   firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino
+
+SRB2 myEMGpcb:
+  firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino
 
 Upload/diagnostic port on the current test PC: COM6
 

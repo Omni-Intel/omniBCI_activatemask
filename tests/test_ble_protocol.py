@@ -85,6 +85,24 @@ class BleProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot.channel_registers, (0x60,) * 5 + (0xE0,) * 3)
         self.assertEqual(snapshot.misc1, 0x20)
 
+    def test_extended_snapshot_decodes_runtime_sample_rate(self):
+        payload = bytearray(29)
+        payload[0] = 0
+        payload[5] = 1
+        payload[6] = 1
+        payload[7] = 0xFF
+        payload[10] = 0x94
+        payload[13:21] = bytes((0x60,)) * 8
+        payload[25] = 0x20
+        payload[26] = 2
+        payload[27:29] = (1000).to_bytes(2, "little")
+
+        snapshot = decode_config_snapshot(payload)
+
+        self.assertEqual(snapshot.config1, 0x94)
+        self.assertEqual(snapshot.sample_rate_code, 2)
+        self.assertEqual(snapshot.sample_rate_hz, 1000)
+
 
 if __name__ == "__main__":
     unittest.main()
