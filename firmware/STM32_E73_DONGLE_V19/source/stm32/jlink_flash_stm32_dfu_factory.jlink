@@ -1,0 +1,10 @@
+device STM32H563VG
+if SWD
+speed 4000
+connect
+r
+h
+loadfile release_dfu/bciband_stm32_v19_1_usb_dfu_factory.hex
+r
+g
+exit

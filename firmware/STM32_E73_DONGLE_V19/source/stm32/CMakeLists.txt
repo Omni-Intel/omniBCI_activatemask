@@ -4,4 +4,4 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(bciband_stm32_production)
 
 target_sources(app PRIVATE src/main.c)
-target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../protocol)
+target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../protocol)

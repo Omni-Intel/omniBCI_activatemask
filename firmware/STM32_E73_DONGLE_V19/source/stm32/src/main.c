@@ -10,6 +10,7 @@
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/dfu/mcuboot.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/usb/usb_device.h>
@@ -762,6 +763,14 @@ int main(void)
 	while (!ads_initialize()) {
 		LOG_ERR("ADS1299 register verification failed; retrying");
 		k_sleep(K_SECONDS(2));
+	}
+	if (!boot_is_img_confirmed()) {
+		err = boot_write_img_confirmed();
+		if (err != 0) {
+			LOG_ERR("MCUboot image confirmation failed: %d", err);
+		} else {
+			LOG_INF("MCUboot image confirmed after ADS1299 self-check");
+		}
 	}
 	ads_start_streaming();
 	LOG_INF("ADS1299 V19 control ready: 250/500/1000 SPS, SRB1, runtime channel/gain/BIAS/LOFF/modes");
