@@ -1223,6 +1223,7 @@ class AcquisitionMixin:
         if not self.require_transport():
             return False
         code = SAMPLE_RATE_TO_CODE[rate]
+        confirmed_config1 = SAMPLE_RATE_CONFIG1[rate]
         was_streaming = bool(self.streaming)
         try:
             if was_streaming:
@@ -1252,6 +1253,7 @@ class AcquisitionMixin:
                     or snapshot.sample_rate_code != code
                 ):
                     raise RuntimeError("ESP32 未返回匹配的 CONFIG1/采样率读回。")
+                confirmed_config1 = snapshot.config1
             else:
                 self.transport_reset_input_buffer()
                 self.transport_write(bytes((0xAA, code)))
@@ -1263,13 +1265,18 @@ class AcquisitionMixin:
                     or ack["sample_rate_hz"] != rate
                     or ack["sample_rate_code"] != code
                 ):
-                    raise RuntimeError("固件未返回匹配的 CONFIG1/采样率读回，请先烧录配套 STM32 固件。")
+                    raise RuntimeError(
+                        f"{('ESP32-C3' if self.selected_mcu() == MCU_ESP32 else 'STM32H563/E73')} "
+                        "未返回匹配的 CONFIG1/采样率读回。"
+                    )
+                confirmed_config1 = ack["config1"]
 
             self._apply_sample_rate_locally(rate)
             if was_streaming:
                 self.start_stream()
             self.set_status(
-                f"采样率已切换为 {rate} SPS，ADS1299 CONFIG1=0x{ack['config1']:02X} 已回读确认。"
+                f"采样率已切换为 {rate} SPS，"
+                f"ADS1299 CONFIG1=0x{confirmed_config1:02X} 已回读确认。"
                 + (" 已自动开始新的 BIN 记录会话。" if was_streaming else "")
             )
             return True

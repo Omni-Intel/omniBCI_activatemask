@@ -44,6 +44,32 @@ class GuiArchitectureTests(unittest.TestCase):
             app.processEvents()
             window_module.BLE_AVAILABLE = previous_ble_available
 
+    def test_mcu_selector_separates_stm32_and_esp32_transports(self):
+        previous_ble_available = window_module.BLE_AVAILABLE
+        window_module.BLE_AVAILABLE = False
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = None
+        try:
+            window = window_module.MainWindow()
+            stm32_index = window.mcu_combo.findData(window_module.MCU_STM32)
+            esp32_index = window.mcu_combo.findData(window_module.MCU_ESP32)
+            self.assertGreaterEqual(stm32_index, 0)
+            self.assertGreaterEqual(esp32_index, 0)
+
+            window.mcu_combo.setCurrentIndex(stm32_index)
+            self.assertEqual(window.selected_mcu(), window_module.MCU_STM32)
+            self.assertEqual(window.selected_transport(), "serial")
+            self.assertFalse(window.transport_combo.isEnabled())
+
+            window.mcu_combo.setCurrentIndex(esp32_index)
+            self.assertEqual(window.selected_mcu(), window_module.MCU_ESP32)
+            self.assertTrue(window.transport_combo.isEnabled())
+        finally:
+            if window is not None:
+                window.close()
+            app.processEvents()
+            window_module.BLE_AVAILABLE = previous_ble_available
+
     def test_live_psd_result_reaches_gui_and_updates_curve(self):
         previous_ble_available = window_module.BLE_AVAILABLE
         window_module.BLE_AVAILABLE = False

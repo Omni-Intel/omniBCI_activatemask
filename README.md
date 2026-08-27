@@ -4,8 +4,9 @@
 
 OmniBCI 是面向 ADS1299 的原生 Python EEG/EMG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线支持固定 SRB1 EEG 和固定 SRB2 肌电两种 ESP32 V19 固件，参考拓扑由固件决定。
 
-STM32 + E73 + USB Dongle 串口链路和新版 ESP32 BLE 固件均支持在设备控制栏交互选择
-250/500/1000 SPS。GUI 会发送 `AA CODE`，校验 ADS1299 CONFIG1 回读，并
+设备控制栏先明确选择 `ESP32-C3` 或 `STM32H563 + E73`，再选择该主控支持的
+USB/BLE 传输。两套固件都支持交互选择 250/500/1000 SPS：STM32/E73 和
+ESP32 USB CDC 使用 `AA CODE`，ESP32 BLE 使用 V1 事务命令，并都校验 ADS1299 CONFIG1 回读。
 同步重建时间轴、实时缓冲、滤波器、PSD 与导出采样率。正在记录时切换会
 先封口当前 BIN，再自动开始一个新记录会话，避免同一文件混用两种采样率。
 
@@ -200,6 +201,9 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 
 两个 ESP32 sketch 都是可独立打开和编译的完整源码，分别固定 SRB1 和 SRB2，不在 GUI 中切换 SRB。两者都支持 250/500/1000 SPS 事务命令和 CONFIG1 读回。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式。
 
+GUI 的主控下拉框不会靠端口名称硬猜协议：选择 STM32H563 时仅提供串口链路；
+选择 ESP32-C3 时可再选 USB 串口或 BLE。已知 VID 会显示 MCU 提示并阻止明显的错选。
+
 STM32 兼容固件默认启用 CH1～CH8，支持 250/500/1000 SPS、逐通道启用/PGA/BIAS、内部短接、内部测试和阻抗检测；PE5 输出 200 kHz、50% 占空比 PWM 驱动 NSC1002，PA1 用作流式工作指示灯。可直接烧录的 HEX、源代码、哈希和烧录顺序见 `firmware/STM32_E73_DONGLE_V19/README.md`。
 
 BLE 使用 `DATA`、`CONTROL`、`STATUS` 和独立的 `RESPONSE` 特征。配置请求包含事务 ID、长度和 CRC，固件通过 `RESPONSE` 返回相同事务 ID 和寄存器读回结果，避免旧 ACK 与周期状态包混淆。
@@ -217,7 +221,7 @@ V19 使用以下连续性架构：
 - 可靠保留容量：384 个六帧块，约 9.2 秒（250 SPS）
 - BLE 拥塞时不推进未成功提交的块序号，而是有界退避后重试
 
-SRB2、运行时参考切换和其他历史固件已经从本分支移除。
+运行时参考切换和其他历史固件已经从本分支移除；SRB1/SRB2 由两个独立 sketch 固定。
 
 ## 运行日志与卡死诊断
 
@@ -249,7 +253,7 @@ IN1N～IN8N        -> 不作为外部公共参考使用
 - GUI 与固件均按当前启用通道掩码过滤 `BIAS_SENSP`。
 - `A7 CH GAIN FLAGS` 中 bit0 表示启用通道，bit1 表示加入 `BIAS_SENSP`，bit2 在本固件中忽略。
 
-ESP32-C3 版本烧录时在 Arduino IDE 中启用 `USB CDC On Boot`：EEG 板打开 SRB1 sketch，`myEMGpcb` 打开 SRB2 sketch；串口波特率为 921600。STM32 兼容版本按其目录 README 使用 J-Link 分别烧录三个 HEX。
+ESP32-C3 需要直接用 USB 串口控制时，在 Arduino IDE 中启用 `USB CDC On Boot`：EEG 板打开 SRB1 sketch，`myEMGpcb` 打开 SRB2 sketch；串口波特率为 921600。仅使用 BLE 时该选项不是强制项。STM32 兼容版本按其目录 README 使用 J-Link 分别烧录三个 HEX。
 
 连接人体电极时必须使用电池供电和符合要求的电气隔离，不得让未隔离 USB 或市电设备形成到人体的导电通路。
 

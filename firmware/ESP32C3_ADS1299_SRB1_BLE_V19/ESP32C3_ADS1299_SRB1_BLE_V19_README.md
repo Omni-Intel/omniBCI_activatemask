@@ -3,6 +3,10 @@
 V19 is the only supported BLE firmware in this branch. It is fixed to SRB1 and
 uses device-control protocol V1.
 
+For direct COM control, build with `USB CDC On Boot = Enabled`. BLE-only builds
+may leave it disabled; COM upload can still work in that configuration, but the
+running sketch will not expose the same USB serial control channel.
+
 - ADS acquisition task: priority 5
 - frameQueue -> reliable retention pack task: priority 3
 - BLE DATA notify task: priority 1
@@ -19,6 +23,8 @@ uses device-control protocol V1.
 - SET_CONFIG writes and reads back the complete relevant ADS1299 register set.
 - SET_SAMPLE_RATE selects 250/500/1000 SPS and returns CONFIG1 plus the applied
   rate in the extended register snapshot.
+- USB CDC serial accepts `AA <sample-rate-code>` and returns the same 12-byte
+  CONFIG1/readback acknowledgement used by the STM32-compatible GUI.
 - STATUS V5 is 96 bytes and carries heartbeat, reliable-transfer diagnostics,
   `config_generation`, missed-DRDY, late-read, mutex-busy, bad-status and
   maximum-read-time counters. The current hardware has no battery measurement

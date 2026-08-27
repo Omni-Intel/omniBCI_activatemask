@@ -71,6 +71,7 @@
 */
 
 #include <Arduino.h>
+
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -800,7 +801,7 @@ void setup() {
                 BLE_DEVICE_NAME,
                 (unsigned)BLE_REQUESTED_MTU,
                 (unsigned)BLE_MIN_STREAM_MTU);
-  Serial.println("Commands over USB or BLE CONTROL: b/s/e/p/m/*/n/o/q/t/1/2/4/6/8/12/24/r/? plus binary A6/A7/A9");
+  Serial.println("Commands over USB or BLE CONTROL: b/s/e/p/m/*/n/o/q/t/1/2/4/6/8/12/24/r/? plus binary A6/A7/A9/AA");
 }
 
 void loop() {
@@ -1078,6 +1079,13 @@ void processSerialByte(char c) {
     return;
   }
 
+  if (binaryControlState == 50) {
+    setSampleRateCode(byteValue);
+    sendConfigAck(0xAA, byteValue);
+    binaryControlState = 0;
+    return;
+  }
+
   if (byteValue == 0xA5) {
     flushNumericCommand();
     binaryBulkConfigIndex = 0;
@@ -1100,6 +1108,12 @@ void processSerialByte(char c) {
   if (byteValue == 0xA9) {
     flushNumericCommand();
     binaryControlState = 30;
+    return;
+  }
+
+  if (byteValue == 0xAA) {
+    flushNumericCommand();
+    binaryControlState = 50;
     return;
   }
 
@@ -2581,7 +2595,12 @@ void sendConfigAck(uint8_t command, uint8_t argument) {
 
   if (runPhase != PHASE_STREAMING) {
     xSemaphoreTake(adsBusMutex, portMAX_DELAY);
-    if (command == 0xA9) {
+    if (command == 0xAA) {
+      reply[3] = readAdsRegister(0x01);
+      reply[4] = static_cast<uint8_t>(currentSampleRateHz & 0xFFu);
+      reply[5] = static_cast<uint8_t>((currentSampleRateHz >> 8) & 0xFFu);
+      reply[6] = currentSampleRateCode;
+    } else if (command == 0xA9) {
       reply[3] = currentLeadOffMask;
       reply[4] = readAdsRegister(0x0F);
       reply[5] = readAdsRegister(0x10);

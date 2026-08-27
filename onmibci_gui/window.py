@@ -46,6 +46,8 @@ class MainWindow(
         self.gain = 24  # legacy/global command value
         self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
         self.app_settings = QtCore.QSettings("OmniBCI", "ADS1299EEGWorkbench")
+        saved_mcu = str(self.app_settings.value("mcu_family", MCU_ESP32))
+        self.mcu_family = saved_mcu if saved_mcu in (MCU_ESP32, MCU_STM32) else MCU_ESP32
         try:
             saved_sample_rate = int(self.app_settings.value("sample_rate_hz", 250))
         except (TypeError, ValueError):
@@ -629,10 +631,19 @@ class MainWindow(
         toolbar.addAction(mne_action)
 
         # USB CDC and BLE share one acquisition/parser pipeline.
+        self.mcu_combo = QtWidgets.QComboBox()
+        for label, value in MCU_ITEMS:
+            self.mcu_combo.addItem(label, value)
+        mcu_index = self.mcu_combo.findData(self.mcu_family)
+        self.mcu_combo.setCurrentIndex(max(0, mcu_index))
+        self.mcu_combo.setMinimumWidth(145)
+        self.mcu_combo.setToolTip("明确选择主控，GUI 会使用对应的连接时序、控制链路和错误提示。")
+        self.mcu_combo.currentIndexChanged.connect(self.mcu_mode_changed)
         self.transport_combo = QtWidgets.QComboBox()
         self.transport_combo.addItem("USB 串口", "serial")
         self.transport_combo.addItem("BLE 无线", "ble")
         self.transport_combo.setMinimumWidth(105)
+        self.transport_combo.setEnabled(self.mcu_family == MCU_ESP32)
         self.transport_combo.currentIndexChanged.connect(self.transport_mode_changed)
         self.serial_label = QtWidgets.QLabel("串口")
         self.port_combo = QtWidgets.QComboBox()
@@ -694,6 +705,8 @@ class MainWindow(
         serial_box = QtWidgets.QGroupBox("设备连接与控制")
         serial_layout = QtWidgets.QHBoxLayout(serial_box)
         serial_layout.setContentsMargins(8, 4, 8, 4)
+        serial_layout.addWidget(QtWidgets.QLabel("主控"))
+        serial_layout.addWidget(self.mcu_combo)
         serial_layout.addWidget(self.transport_combo)
         serial_layout.addWidget(self.serial_label)
         serial_layout.addWidget(self.port_combo, 1)

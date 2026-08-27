@@ -44,6 +44,7 @@ class TransportControlMixin:
         if logger is None:
             return
         common = {
+            "mcu": str(self.selected_mcu()),
             "transport": str(self.active_transport or "none"),
             "streaming": bool(self.streaming),
             "packet_count": int(self.packet_count),
@@ -64,6 +65,27 @@ class TransportControlMixin:
             return str(self.transport_combo.currentData() or "serial")
         return "serial"
 
+    def selected_mcu(self) -> str:
+        if hasattr(self, "mcu_combo"):
+            return str(self.mcu_combo.currentData() or MCU_ESP32)
+        return str(getattr(self, "mcu_family", MCU_ESP32))
+
+    def mcu_mode_changed(self):
+        if self.transport_connected() or self.transport_connecting:
+            return
+        self.mcu_family = self.selected_mcu()
+        self.app_settings.setValue("mcu_family", self.mcu_family)
+        self.app_settings.sync()
+        if self.mcu_family == MCU_STM32:
+            serial_index = self.transport_combo.findData("serial")
+            self.transport_combo.blockSignals(True)
+            self.transport_combo.setCurrentIndex(max(0, serial_index))
+            self.transport_combo.blockSignals(False)
+            self.transport_combo.setEnabled(False)
+        else:
+            self.transport_combo.setEnabled(True)
+        self.transport_mode_changed()
+
     def transport_connected(self) -> bool:
         if self.active_transport == "serial":
             return bool(self.ser and self.ser.is_open)
@@ -72,16 +94,23 @@ class TransportControlMixin:
         return False
 
     def transport_description(self) -> str:
+        mcu_name = "ESP32-C3" if self.selected_mcu() == MCU_ESP32 else "STM32H563/E73"
         if self.active_transport == "serial" and self.ser and self.ser.is_open:
-            return f"USB {self.ser.port}"
+            return f"{mcu_name} USB {self.ser.port}"
         if self.active_transport == "ble" and self.ble_connected:
-            return f"BLE {self.ble_device_name or self.ble_device_address}"
+            return f"ESP32-C3 BLE {self.ble_device_name or self.ble_device_address}"
         return "未连接"
 
     def transport_mode_changed(self):
         if self.transport_connected() or self.transport_connecting:
             return
         kind = self.selected_transport()
+        if self.selected_mcu() == MCU_STM32 and kind != "serial":
+            serial_index = self.transport_combo.findData("serial")
+            self.transport_combo.blockSignals(True)
+            self.transport_combo.setCurrentIndex(max(0, serial_index))
+            self.transport_combo.blockSignals(False)
+            kind = "serial"
         self.port_combo.clear()
         if kind == "ble":
             self.serial_label.setText("蓝牙")
@@ -131,6 +160,7 @@ class TransportControlMixin:
         current_device = self.port_combo.currentData()
         self.port_combo.clear()
         self.port_device_map = {}
+        self.port_mcu_hints = {}
         ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
         if not ports:
             self.port_combo.addItem("未发现串口", userData=None)
@@ -140,9 +170,19 @@ class TransportControlMixin:
         else:
             for info in ports:
                 description = (info.description or info.manufacturer or "未知设备").strip()
-                label = f"{info.device} — {description}"
+                hint = None
+                if info.vid == 0x303A:
+                    hint = MCU_ESP32
+                elif info.vid in (0x0483, 0x2FE3):
+                    hint = MCU_STM32
+                hint_label = {
+                    MCU_ESP32: "ESP32",
+                    MCU_STM32: "STM32/E73",
+                }.get(hint, "未知 MCU")
+                label = f"{info.device} — [{hint_label}] {description}"
                 self.port_combo.addItem(label, userData=info.device)
                 self.port_device_map[label] = info.device
+                self.port_mcu_hints[info.device] = hint
             self.port_combo.setEnabled(True)
             self.connect_btn.setEnabled(True)
             if current_device:
@@ -203,6 +243,7 @@ class TransportControlMixin:
                 return
             self.transport_connecting = True
             self.transport_combo.setEnabled(False)
+            self.mcu_combo.setEnabled(False)
             self.port_combo.setEnabled(False)
             self.refresh_btn.setEnabled(False)
             self.connect_btn.setText("连接中…")
@@ -213,6 +254,18 @@ class TransportControlMixin:
         port = self.port_combo.currentData()
         if not port:
             QtWidgets.QMessageBox.warning(self, "串口", "请先点击“扫描串口”，并选择一个设备。")
+            return
+        selected_mcu = self.selected_mcu()
+        detected_mcu = getattr(self, "port_mcu_hints", {}).get(port)
+        if detected_mcu is not None and detected_mcu != selected_mcu:
+            selected_name = "ESP32-C3" if selected_mcu == MCU_ESP32 else "STM32H563 + E73"
+            detected_name = "ESP32-C3" if detected_mcu == MCU_ESP32 else "STM32/E73 dongle"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "主控选择不匹配",
+                f"当前选择的是 {selected_name}，但 {port} 看起来是 {detected_name}。"
+                "请修改主控下拉框或选择正确端口。",
+            )
             return
         self.transport_connecting = True
         self.connect_btn.setEnabled(False)
@@ -242,26 +295,46 @@ class TransportControlMixin:
             self.active_transport = "serial"
             self._apply_transport_timing("serial")
             QtWidgets.QApplication.processEvents()
-            time.sleep(0.7)
+            if selected_mcu == MCU_ESP32:
+                self.set_status("ESP32-C3 USB CDC 已打开，等待复位和固件初始化…")
+                QtWidgets.QApplication.processEvents()
+                time.sleep(3.0)
+            else:
+                time.sleep(0.7)
             self.transport_reset_input_buffer()
             self.transport_write(b"s")
             self.connect_btn.setText("关闭串口")
             self.transport_combo.setEnabled(False)
+            self.mcu_combo.setEnabled(False)
             self.port_combo.setEnabled(False)
             self.refresh_btn.setEnabled(False)
             self.apply_reference_mode()
             if not self.apply_sample_rate(silent=True):
-                raise RuntimeError("采样率配置未得到 STM32 寄存器回读确认")
+                device_name = "ESP32-C3" if selected_mcu == MCU_ESP32 else "STM32H563/E73"
+                raise RuntimeError(f"采样率配置未得到 {device_name} 的寄存器回读确认")
             self.set_status(
-                f"已打开 {port}，并同步 {self.reference_short_name()} 参考、通道参数和 "
+                f"已连接 {'ESP32-C3' if selected_mcu == MCU_ESP32 else 'STM32H563/E73'} "
+                f"{port}，并同步 {self.reference_short_name()} 参考、通道参数和 "
                 f"{self.sample_rate_hz} SPS。"
                 "现在可以点击“开始采集”。"
             )
             self.connect_btn.setEnabled(True)
         except Exception as exc:
+            if self.serial_worker is not None:
+                try:
+                    self.serial_worker.stop(timeout=2.0, close_port=False)
+                except Exception:
+                    pass
+                self.serial_worker = None
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
             self.ser = None
             self.active_transport = None
-            self.transport_combo.setEnabled(True)
+            self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
+            self.mcu_combo.setEnabled(True)
             self.port_combo.setEnabled(True)
             self.refresh_btn.setEnabled(True)
             self.connect_btn.setEnabled(True)
@@ -358,6 +431,7 @@ class TransportControlMixin:
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText("断开蓝牙")
         self.transport_combo.setEnabled(False)
+        self.mcu_combo.setEnabled(False)
         self.port_combo.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self.reference_combo.setEnabled(False)
@@ -431,7 +505,8 @@ class TransportControlMixin:
             self.ble_worker.clear_data()
         self.connect_btn.setText("连接蓝牙")
         self.connect_btn.setEnabled(True)
-        self.transport_combo.setEnabled(True)
+        self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
+        self.mcu_combo.setEnabled(True)
         self.port_combo.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         self.set_status(reason)
@@ -554,7 +629,8 @@ class TransportControlMixin:
         self.log_event("ble_error", level="error", message=str(text)[:500])
         self.transport_connecting = False
         if self.active_transport != "ble":
-            self.transport_combo.setEnabled(True)
+            self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
+            self.mcu_combo.setEnabled(True)
             self.port_combo.setEnabled(True)
             self.refresh_btn.setEnabled(True)
             self.connect_btn.setEnabled(True)
@@ -592,7 +668,8 @@ class TransportControlMixin:
             self.ser = None
             self.active_transport = None
             self.connect_btn.setText("打开串口")
-            self.transport_combo.setEnabled(True)
+            self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
+            self.mcu_combo.setEnabled(True)
             self.port_combo.setEnabled(True)
             self.refresh_btn.setEnabled(True)
             self.set_status("串口已关闭。")
@@ -609,7 +686,8 @@ class TransportControlMixin:
             self.active_transport = None
             self.connect_btn.setText("连接蓝牙")
             self.connect_btn.setEnabled(True)
-            self.transport_combo.setEnabled(True)
+            self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
+            self.mcu_combo.setEnabled(True)
             self.port_combo.setEnabled(True)
             self.refresh_btn.setEnabled(True)
             self.set_status("BLE 已断开。")

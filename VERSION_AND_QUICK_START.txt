@@ -5,6 +5,9 @@ Current version
 ---------------
 OmniBCI ADS1299 GUI for fixed-reference SRB1/SRB2 firmware V19 and protocol V1.
 
+Choose the MCU explicitly in the GUI: ESP32-C3 supports USB CDC or BLE;
+STM32H563 + E73 uses the USB serial/dongle path.
+
 BLE is considered ready only after the firmware handshake and ADS1299 register
 snapshot succeed. Configuration responses use an independent RESPONSE Notify
 characteristic and matching request IDs.
@@ -23,7 +26,8 @@ SRB1:
 SRB2 myEMGpcb:
   firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino
 
-Upload/diagnostic port on the current test PC: COM6
+For ESP32 direct COM control, build with USB CDC On Boot enabled. The actual COM
+number is assigned by Windows and must be selected in the GUI.
 
 SRB2 is not supported in this branch.
 

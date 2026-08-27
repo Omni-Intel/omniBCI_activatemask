@@ -2,6 +2,10 @@
 
 This is the fixed-SRB2 build for `bciband/myEMGpcb`.
 
+For direct COM control, build with `USB CDC On Boot = Enabled`. BLE-only builds
+may leave it disabled; COM upload can still work in that configuration, but the
+running sketch will not expose the same USB serial control channel.
+
 - `CHnSET.SRB2=1` for every enabled normal-input channel.
 - `MISC1.SRB1=0`.
 - Channel polarity is `SRB2 - INxN`; connect the shared reference electrode to
@@ -10,6 +14,8 @@ This is the fixed-SRB2 build for `bciband/myEMGpcb`.
 - CH1-CH8 are enabled by default.
 - Runtime sample rates are 250, 500 and 1000 SPS and use the same BLE V19
   transaction/readback mechanism as the SRB1 build.
+- USB CDC serial also accepts `AA <sample-rate-code>` and returns the same
+  12-byte CONFIG1/readback acknowledgement used by the STM32-compatible GUI.
 - The 48-byte sample format, UUIDs and GUI channel controls are unchanged.
 
 The `.ino` in this folder is a complete standalone source file. Open it directly
