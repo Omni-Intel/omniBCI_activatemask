@@ -12,6 +12,6 @@ This is the fixed-SRB2 build for `bciband/myEMGpcb`.
   transaction/readback mechanism as the SRB1 build.
 - The 48-byte sample format, UUIDs and GUI channel controls are unchanged.
 
-The wrapper intentionally reuses the tested V19 implementation instead of
-duplicating a 90+ KB sketch. Open this folder's `.ino` in Arduino IDE and build
-it as an ESP32-C3 target.
+The `.ino` in this folder is a complete standalone source file. Open it directly
+in Arduino IDE and build it as an ESP32-C3 target; it does not include or depend
+on the SRB1 sketch.

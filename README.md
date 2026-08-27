@@ -198,7 +198,7 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 - `firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino`
 - `firmware/STM32_E73_DONGLE_V19/`：STM32H563VGT6 + E73-2G4M08S1C + nRF52840 USB dongle
 
-两个 ESP32 sketch 共用同一份经过验证的 V19 核心，仅固定参考侧和默认通道数不同，不在 GUI 中切换 SRB。两者都支持 250/500/1000 SPS 事务命令和 CONFIG1 读回。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式。
+两个 ESP32 sketch 都是可独立打开和编译的完整源码，分别固定 SRB1 和 SRB2，不在 GUI 中切换 SRB。两者都支持 250/500/1000 SPS 事务命令和 CONFIG1 读回。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式。
 
 STM32 兼容固件默认启用 CH1～CH8，支持 250/500/1000 SPS、逐通道启用/PGA/BIAS、内部短接、内部测试和阻抗检测；PE5 输出 200 kHz、50% 占空比 PWM 驱动 NSC1002，PA1 用作流式工作指示灯。可直接烧录的 HEX、源代码、哈希和烧录顺序见 `firmware/STM32_E73_DONGLE_V19/README.md`。
 
