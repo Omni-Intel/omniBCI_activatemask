@@ -94,13 +94,14 @@ speed 4000
 connect
 r
 h
-loadfile release_dfu/bciband_stm32_v19_1_usb_dfu_factory.hex
+loadfile ../../release/04_stm32h563_v19_1_usb_dfu_factory.hex
 r
 g
 exit
 ```
 
-The same commands are provided in `jlink_flash_stm32_dfu_factory.jlink`.
+Run J-Link Commander from this `source/stm32` directory. The same commands are
+provided in `jlink_flash_stm32_dfu_factory.jlink`.
 After reset, Windows should enumerate both Data CDC and DFU CDC ports.
 
 ## Later updates through USB
@@ -111,7 +112,7 @@ and use the COM number belonging to `BCI-Band DFU CDC`:
 ```powershell
 $dfuConnection = 'dev=COM_NUMBER,baud=115200,mtu=512'
 mcumgr --conntype serial --connstring $dfuConnection image upload `
-  release_dfu\bciband_stm32_v19_1_usb_dfu_update.bin
+  ..\..\release\05_stm32h563_v19_1_usb_dfu_update.bin
 mcumgr --conntype serial --connstring $dfuConnection image list
 mcumgr --conntype serial --connstring $dfuConnection image test IMAGE_HASH_FROM_LIST
 mcumgr --conntype serial --connstring $dfuConnection reset
@@ -123,7 +124,7 @@ Do not upload the factory HEX over mcumgr. The USB update input is the signed
 ## Release SHA-256
 
 ```text
-6304F7EF717301F0CD83B0AF66BFF7458198729A94A484D11DD50B5666E0F7C7  bciband_stm32_v19_1_usb_dfu_factory.hex
-2F053E12351132749408D6A6BC8E2A2D0BE6577C444CB462C23750264F8CF4A5  bciband_stm32_v19_1_usb_dfu_update.bin
-76F53AB3C75B6E6671BCBAF82F72A1F275608DB2CD1D09C5F75B4C8D7F4BBAA4  bciband_stm32_v19_1_usb_dfu_update.zip
+6304F7EF717301F0CD83B0AF66BFF7458198729A94A484D11DD50B5666E0F7C7  04_stm32h563_v19_1_usb_dfu_factory.hex
+2F053E12351132749408D6A6BC8E2A2D0BE6577C444CB462C23750264F8CF4A5  05_stm32h563_v19_1_usb_dfu_update.bin
+76F53AB3C75B6E6671BCBAF82F72A1F275608DB2CD1D09C5F75B4C8D7F4BBAA4  06_stm32h563_v19_1_usb_dfu_update.zip
 ```
