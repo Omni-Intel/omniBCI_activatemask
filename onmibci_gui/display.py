@@ -197,6 +197,8 @@ class DisplayMixin:
         self.render_gap_last_ms = 0.0
         self.render_gap_max_ms = 0.0
         self.render_gap_over_100ms = 0
+        self.render_work_last_ms = 0.0
+        self.render_work_max_ms = 0.0
         self._last_render_monotonic = None
 
     def update_adaptive_display_target(self):
@@ -490,6 +492,8 @@ class DisplayMixin:
                 "gui_render_stall",
                 level="warning",
                 gap_ms=round(float(gap_ms), 3),
+                render_work_ms=round(float(self.render_work_last_ms), 3),
+                render_work_max_ms=round(float(self.render_work_max_ms), 3),
                 tab_index=int(self.view_tabs.currentIndex()),
                 transport_pending_bytes=int(self.last_serial_waiting_bytes),
                 filter_backlog_samples=int(self.filter_worker_backlog_samples()),
@@ -586,6 +590,7 @@ class DisplayMixin:
                 return
 
         self._plot_update_busy = True
+        render_started = time.perf_counter()
         try:
             self._render_fast_plots(display_end_sample=display_end)
             if is_live:
@@ -599,6 +604,10 @@ class DisplayMixin:
             self.log_event("plot_error", level="error", message=str(exc)[:500])
             self.set_status(f"绘图异常已隔离（采集和 BIN 保存继续）：{exc}")
         finally:
+            self.render_work_last_ms = (time.perf_counter() - render_started) * 1000.0
+            self.render_work_max_ms = max(
+                self.render_work_max_ms, self.render_work_last_ms
+            )
             self._plot_update_busy = False
 
     @staticmethod
@@ -1218,6 +1227,8 @@ class DisplayMixin:
                 notify_gap_last_ms=round(ble_notify_gap_last * 1000.0, 3),
                 notify_gap_max_ms=round(ble_notify_gap_max * 1000.0, 3),
                 render_gap_last_ms=round(float(self.render_gap_last_ms), 3),
+                render_work_last_ms=round(float(self.render_work_last_ms), 3),
+                render_work_max_ms=round(float(self.render_work_max_ms), 3),
                 display_delay_ms=round(float(self.display_delay_s) * 1000.0, 3),
                 transport_pending_bytes=int(self.last_serial_waiting_bytes),
                 reliable=dict(reliable),
@@ -1309,6 +1320,7 @@ class DisplayMixin:
             ),
             ("RX lag", f"{self.live_lag_s:.3f} s"),
             ("Render gap", f"{self.render_gap_last_ms:.1f}/{self.render_gap_max_ms:.1f} ms"),
+            ("Render work", f"{self.render_work_last_ms:.1f}/{self.render_work_max_ms:.1f} ms"),
             ("Notify gap", f"{1000 * ble_notify_gap_last:.1f}/{1000 * ble_notify_gap_max:.1f} ms"),
             (
                 "BLE adapt",

@@ -24,6 +24,10 @@ a = Analysis(
     noarchive=False,
     optimize=1,
 )
+# Some scientific wheels ship a generic ICU shim named ``icuuc.dll``.  It
+# shadows Qt's own versioned ICU dependency when placed beside the executable
+# and makes PySide6.QtCore fail before the application can start.
+a.binaries = [entry for entry in a.binaries if entry[0].lower() != 'icuuc.dll']
 pyz = PYZ(a.pure)
 
 exe = EXE(

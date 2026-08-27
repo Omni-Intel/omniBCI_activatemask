@@ -22,13 +22,19 @@ The dongle exposes a virtual COM port. Its 48-byte sample frames and bidirection
 
 For a new installation, flash these three images from `release/`:
 
-1. `04_stm32h563_v19_1_usb_dfu_factory.hex` to STM32H563VGT6
+1. `07_stm32h563_v19_2_hwspi_factory.hex` to STM32H563VGT6
 2. `02_e73_v19_full_control.hex` to E73-2G4M08S1C (nRF52840)
 3. `03_dongle_v19_full_control.hex` to the nRF52840 USB dongle
 
 `01_stm32h563_v19_full_control.hex` is the legacy STM32 image without MCUboot.
 Do not flash it after adopting USB DFU unless intentionally reverting to the
 old flash layout.
+
+V19.2 keeps the existing PCB nets unchanged: PA5/PA6/PA7 remain ADS1299
+SCK/MISO/MOSI and PB2 remains CS. The firmware selects the STM32 SPI1 alternate
+function on those same pins and replaces the former GPIO bit-bang loop. Its
+1 MHz Mode-1 transfer reads one 27-byte ADS frame in about 336 us and sustains
+1000 SPS.
 
 For each target, connect J-Link over SWD and use the matching device name:
 
@@ -51,8 +57,8 @@ After flashing, remove J-Link. Power the STM32 acquisition board from its batter
 The STM32 USB connector now enumerates two virtual COM ports. **BCI-Band Data
 CDC** is the local 48-byte sample stream; **BCI-Band DFU CDC** is reserved for
 signed MCUboot/mcumgr updates. Later STM32 updates use
-`05_stm32h563_v19_1_usb_dfu_update.bin`; the ZIP is also supplied as artifact
-`06_stm32h563_v19_1_usb_dfu_update.zip`. See `source/stm32/README.md` for the
+`08_stm32h563_v19_2_hwspi_update.bin`; the ZIP is also supplied as artifact
+`09_stm32h563_v19_2_hwspi_update.zip`. See `source/stm32/README.md` for the
 exact upload and rollback procedure.
 
 ## SHA-256
@@ -63,6 +69,16 @@ exact upload and rollback procedure.
 - STM32 USB-DFU factory HEX: `6304F7EF717301F0CD83B0AF66BFF7458198729A94A484D11DD50B5666E0F7C7`
 - STM32 USB-DFU update BIN: `2F053E12351132749408D6A6BC8E2A2D0BE6577C444CB462C23750264F8CF4A5`
 - STM32 USB-DFU update ZIP: `76F53AB3C75B6E6671BCBAF82F72A1F275608DB2CD1D09C5F75B4C8D7F4BBAA4`
+- STM32 V19.2 hardware-SPI factory HEX: `2FDD31E251C45A0413C43D3544211910FE2E9EA09CDC26B523FF0198F66A8756`
+- STM32 V19.2 hardware-SPI update BIN: `EAE6BD030D307A8748391E52A33E278DE000DBB2B4CF5725476BEC7193D7777E`
+- STM32 V19.2 hardware-SPI update ZIP: `AD042840551147E59250FEDFD729B368BE89E1448DB36F95E3E5CCFA4E8D2CED`
+
+## Long-run validation
+
+The V19.2 STM32 image and optimized GUI were validated over COM12 at 1000 SPS
+for 9,260,416 frames (about 2 h 34 min). A full scan of the 444,499,977-byte
+BIN found zero CRC errors, zero malformed frames, zero sequence resets, and 32
+single-frame gaps (0.000346%). The steady host receive rate was 999.20 fps.
 
 Zephyr source projects and J-Link scripts are under `source/stm32`, `source/e73`, and `source/dongle`. Generated build directories are intentionally excluded.
 

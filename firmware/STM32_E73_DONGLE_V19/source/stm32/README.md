@@ -45,6 +45,12 @@ BIAS_SENSN `0x00`. Runtime command `AA CODE` selects 250/500/1000 SPS for
 `CODE=0/1/2`; the firmware stops acquisition at the rate boundary and returns
 a 12-byte `BC` ACK containing the CONFIG1 readback and applied rate.
 
+PA5/PA6/PA7 use STM32 SPI1 at 1 MHz, CPOL=0/CPHA=1. These are the same PCB
+nets previously driven as GPIO by the software SPI loop; no netlist or pin
+change is required. PB2 remains software-controlled ADS CS. The 27-byte frame
+read is one hardware SPI transaction and measures about 336 us on the verified
+board, leaving enough time for the existing SPI3 radio exchange at 1000 SPS.
+
 PA1 工作灯采用数据链健康逻辑：只有 ADS1299 成功读帧且 SPI3 成功把该帧
 交给 E73 时点亮；停止采集或连续 100 ms 没有成功帧时熄灭。它不依赖
 STM32 USB 是否连接。
@@ -94,7 +100,7 @@ speed 4000
 connect
 r
 h
-loadfile ../../release/04_stm32h563_v19_1_usb_dfu_factory.hex
+loadfile ../../release/07_stm32h563_v19_2_hwspi_factory.hex
 r
 g
 exit
@@ -112,7 +118,7 @@ and use the COM number belonging to `BCI-Band DFU CDC`:
 ```powershell
 $dfuConnection = 'dev=COM_NUMBER,baud=115200,mtu=512'
 mcumgr --conntype serial --connstring $dfuConnection image upload `
-  ..\..\release\05_stm32h563_v19_1_usb_dfu_update.bin
+  ..\..\release\08_stm32h563_v19_2_hwspi_update.bin
 mcumgr --conntype serial --connstring $dfuConnection image list
 mcumgr --conntype serial --connstring $dfuConnection image test IMAGE_HASH_FROM_LIST
 mcumgr --conntype serial --connstring $dfuConnection reset
@@ -127,4 +133,7 @@ Do not upload the factory HEX over mcumgr. The USB update input is the signed
 6304F7EF717301F0CD83B0AF66BFF7458198729A94A484D11DD50B5666E0F7C7  04_stm32h563_v19_1_usb_dfu_factory.hex
 2F053E12351132749408D6A6BC8E2A2D0BE6577C444CB462C23750264F8CF4A5  05_stm32h563_v19_1_usb_dfu_update.bin
 76F53AB3C75B6E6671BCBAF82F72A1F275608DB2CD1D09C5F75B4C8D7F4BBAA4  06_stm32h563_v19_1_usb_dfu_update.zip
+2FDD31E251C45A0413C43D3544211910FE2E9EA09CDC26B523FF0198F66A8756  07_stm32h563_v19_2_hwspi_factory.hex
+EAE6BD030D307A8748391E52A33E278DE000DBB2B4CF5725476BEC7193D7777E  08_stm32h563_v19_2_hwspi_update.bin
+AD042840551147E59250FEDFD729B368BE89E1448DB36F95E3E5CCFA4E8D2CED  09_stm32h563_v19_2_hwspi_update.zip
 ```

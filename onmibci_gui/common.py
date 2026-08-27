@@ -156,11 +156,12 @@ BYTES_PER_SECOND = FRAME_BYTES * FS
 # drains aggressively before paint work, while BLE keeps V8's bounded batches
 # and jitter buffer.  Sharing one compromise scheduler was the main reason the
 # V8/V9 GUI could report serial sequence gaps even when BLE looked smooth.
-SERIAL_POLL_INTERVAL_MS = 4
+SERIAL_POLL_INTERVAL_MS = 8
 BLE_POLL_INTERVAL_MS = 4
-SERIAL_PLOT_INTERVAL_MS = 80
+SERIAL_PLOT_INTERVAL_MS = 50
 # Twenty visual updates per second keep the live cursor responsive while the
-# receive, filtering and BIN writer remain isolated from Qt. Receive, filtering and painting are isolated; live painting is never intentionally paused by backlog.
+# receive, filtering and BIN writer remain isolated from Qt. Receive, filtering
+# and painting are isolated; live painting is never intentionally paused by backlog.
 BLE_PLOT_INTERVAL_MS = 40
 # V16: the OS serial driver is drained by a dedicated reader thread.  Qt only
 # consumes a RAM queue, so Windows timer jitter, window dragging, PSD work or a
@@ -282,7 +283,7 @@ RECORD_METADATA_UPDATE_INTERVAL_S = 30.0
 # Live causal filtering runs in its own worker.  The Qt thread only updates
 # counters/ring buffers and paints already-computed arrays.  This mirrors the
 # acquisition-ring-buffer-consumer split used by BrainFlow/OpenBCI.
-FILTER_RESULT_POLL_MS = 3
+FILTER_RESULT_POLL_MS = 8
 FILTER_RESULT_BUDGET_S = 0.003
 FILTER_OUTPUT_MAX_BATCHES = 256
 FILTER_BACKLOG_PAUSE_PLOT_S = 2.0  # diagnostic only; live paint is never intentionally paused
@@ -291,7 +292,7 @@ PSD_LIVE_REFRESH_MS = 1500
 PSD_LIVE_WINDOW_S = 6.0
 # Bound only the number of points handed to Qt for each live curve.  The raw
 # ring, filtering worker and BIN writer always retain the full sample stream.
-LIVE_PLOT_MAX_POINTS = 2400
+LIVE_PLOT_MAX_POINTS = 1000
 # ADS rail samples are not useful EEG and can create a pathological Qt paint
 # path when a disconnected electrode toggles rapidly between positive and
 # negative full scale. Raw BIN bytes stay untouched; only the live filter and

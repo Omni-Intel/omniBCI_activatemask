@@ -187,6 +187,8 @@ class MainWindow(
         self.render_gap_last_ms = 0.0
         self.render_gap_max_ms = 0.0
         self.render_gap_over_100ms = 0
+        self.render_work_last_ms = 0.0
+        self.render_work_max_ms = 0.0
         self._last_render_monotonic: Optional[float] = None
         self.session_started_monotonic: Optional[float] = None
         self._last_single_y_range = None
@@ -282,8 +284,8 @@ class MainWindow(
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.update_fast_plots)
         self.plot_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        # Start with the proven USB cadence. _apply_transport_timing switches
-        # to V8's 20 FPS cadence when BLE is selected/connected.
+        # USB and BLE both target 20 FPS. Raw receive and recording run outside
+        # the paint path, so screen cadence never changes the saved data rate.
         self.plot_timer.start(SERIAL_PLOT_INTERVAL_MS)
 
         self.psd_timer = QtCore.QTimer(self)

@@ -82,9 +82,6 @@ struct control_reply {
 
 static const struct gpio_dt_spec ads_drdy =
 	GPIO_SPEC(gpioa, 4U, GPIO_ACTIVE_LOW | GPIO_PULL_UP);
-static const struct gpio_dt_spec ads_sck = GPIO_SPEC(gpioa, 5U, GPIO_ACTIVE_HIGH);
-static const struct gpio_dt_spec ads_miso = GPIO_SPEC(gpioa, 6U, GPIO_ACTIVE_HIGH);
-static const struct gpio_dt_spec ads_mosi = GPIO_SPEC(gpioa, 7U, GPIO_ACTIVE_HIGH);
 static const struct gpio_dt_spec ads_cs = GPIO_SPEC(gpiob, 2U, GPIO_ACTIVE_HIGH);
 static const struct gpio_dt_spec ads_start = GPIO_SPEC(gpioe, 8U, GPIO_ACTIVE_HIGH);
 static const struct gpio_dt_spec ads_reset = GPIO_SPEC(gpioe, 10U, GPIO_ACTIVE_HIGH);
@@ -97,6 +94,7 @@ static const struct gpio_dt_spec work_led = GPIO_SPEC(gpioa, 1U, GPIO_ACTIVE_HIG
 
 static const struct pwm_dt_spec nsc_pwm =
 	PWM_DT_SPEC_GET(DT_NODELABEL(nsc_pwm_output));
+static const struct device *const ads_spi = DEVICE_DT_GET(DT_NODELABEL(spi1));
 static const struct device *const rf_spi = DEVICE_DT_GET(DT_NODELABEL(spi3));
 static const struct device *const usb_cdc =
 	DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart0));
@@ -104,6 +102,14 @@ static const struct device *const usb_cdc =
 static const struct spi_config rf_spi_config = {
 	.frequency = 2000000U,
 	.operation = SPI_OP_MODE_MASTER | SPI_TRANSFER_MSB | SPI_WORD_SET(8),
+	.slave = 0U,
+};
+
+static const struct spi_config ads_spi_config = {
+	.frequency = 1000000U,
+	/* ADS1299 shifts DOUT on SCLK rising edges and latches DIN on falling edges. */
+	.operation = SPI_OP_MODE_MASTER | SPI_MODE_CPHA |
+		SPI_TRANSFER_MSB | SPI_WORD_SET(8),
 	.slave = 0U,
 };
 
@@ -176,17 +182,13 @@ static void put_u32_le(uint8_t *p, uint32_t value)
 static uint8_t ads_spi_transfer(uint8_t tx)
 {
 	uint8_t rx = 0U;
+	const struct spi_buf tx_buf = {.buf = &tx, .len = 1U};
+	struct spi_buf rx_buf = {.buf = &rx, .len = 1U};
+	const struct spi_buf_set tx_set = {.buffers = &tx_buf, .count = 1U};
+	const struct spi_buf_set rx_set = {.buffers = &rx_buf, .count = 1U};
 
-	for (int bit = 7; bit >= 0; --bit) {
-		gpio_pin_set_raw(ads_mosi.port, ads_mosi.pin, (tx >> bit) & 1U);
-		k_busy_wait(1U);
-		gpio_pin_set_raw(ads_sck.port, ads_sck.pin, 1);
-		k_busy_wait(1U);
-		if (gpio_pin_get_raw(ads_miso.port, ads_miso.pin) > 0) {
-			rx |= (uint8_t)(1U << bit);
-		}
-		gpio_pin_set_raw(ads_sck.port, ads_sck.pin, 0);
-		k_busy_wait(1U);
+	if (spi_transceive(ads_spi, &ads_spi_config, &tx_set, &rx_set) != 0) {
+		return 0U;
 	}
 	return rx;
 }
@@ -215,6 +217,7 @@ static void ads_write_register(uint8_t address, uint8_t value)
 {
 	ads_select();
 	(void)ads_spi_transfer((uint8_t)(ADS_WREG | (address & 0x1FU)));
+	k_busy_wait(2U);
 	(void)ads_spi_transfer(0U);
 	(void)ads_spi_transfer(value);
 	ads_deselect();
@@ -227,6 +230,7 @@ static uint8_t ads_read_register(uint8_t address)
 
 	ads_select();
 	(void)ads_spi_transfer((uint8_t)(ADS_RREG | (address & 0x1FU)));
+	k_busy_wait(2U);
 	(void)ads_spi_transfer(0U);
 	value = ads_spi_transfer(0U);
 	ads_deselect();
@@ -236,15 +240,20 @@ static uint8_t ads_read_register(uint8_t address)
 
 static bool ads_read_frame(uint8_t frame[ADS_FRAME_SIZE])
 {
+	uint8_t zeros[ADS_FRAME_SIZE] = {0};
+	const struct spi_buf tx_buf = {.buf = zeros, .len = sizeof(zeros)};
+	struct spi_buf rx_buf = {.buf = frame, .len = ADS_FRAME_SIZE};
+	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1U};
+	const struct spi_buf_set rx = {.buffers = &rx_buf, .count = 1U};
+	int err;
+
 	if (gpio_pin_get_raw(ads_drdy.port, ads_drdy.pin) != 0) {
 		return false;
 	}
 	ads_select();
-	for (size_t i = 0; i < ADS_FRAME_SIZE; ++i) {
-		frame[i] = ads_spi_transfer(0U);
-	}
+	err = spi_transceive(ads_spi, &ads_spi_config, &tx, &rx);
 	ads_deselect();
-	return true;
+	return err == 0;
 }
 
 static bool gain_to_code(uint8_t gain, uint8_t *code)
@@ -712,16 +721,13 @@ static void ads_drdy_handler(const struct device *port,
 static int configure_gpio(void)
 {
 	const struct gpio_dt_spec *all[] = {
-		&ads_drdy, &ads_sck, &ads_miso, &ads_mosi, &ads_cs,
+		&ads_drdy, &ads_cs,
 		&ads_start, &ads_reset, &rf_reset, &rf_irq, &rf_csn, &work_led,
 	};
 	for (size_t i = 0; i < ARRAY_SIZE(all); ++i) {
 		if (!gpio_is_ready_dt(all[i])) return -ENODEV;
 	}
 	int err = gpio_pin_configure_dt(&ads_drdy, GPIO_INPUT);
-	err |= gpio_pin_configure_dt(&ads_miso, GPIO_INPUT | GPIO_PULL_UP);
-	err |= gpio_pin_configure_dt(&ads_sck, GPIO_OUTPUT_INACTIVE);
-	err |= gpio_pin_configure_dt(&ads_mosi, GPIO_OUTPUT_INACTIVE);
 	err |= gpio_pin_configure_dt(&ads_cs, GPIO_OUTPUT_ACTIVE);
 	err |= gpio_pin_configure_dt(&ads_start, GPIO_OUTPUT_INACTIVE);
 	err |= gpio_pin_configure_dt(&ads_reset, GPIO_OUTPUT_ACTIVE);
@@ -742,9 +748,10 @@ int main(void)
 	uint8_t stream_frame[STREAM_FRAME_SIZE];
 	uint32_t next_report_ms;
 
-	if (!device_is_ready(nsc_pwm.dev) || !device_is_ready(rf_spi) ||
+	if (!device_is_ready(nsc_pwm.dev) || !device_is_ready(ads_spi) ||
+	    !device_is_ready(rf_spi) ||
 	    configure_gpio() != 0) {
-		LOG_ERR("PWM, SPI3, or GPIO initialization failed");
+		LOG_ERR("PWM, SPI1, SPI3, or GPIO initialization failed");
 		return -ENODEV;
 	}
 	int err = pwm_set_dt(&nsc_pwm, NSC_PWM_PERIOD_NS, NSC_PWM_PULSE_NS);

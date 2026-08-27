@@ -4,7 +4,7 @@ speed 4000
 connect
 r
 h
-loadfile ../../release/04_stm32h563_v19_1_usb_dfu_factory.hex
+loadfile ../../release/07_stm32h563_v19_2_hwspi_factory.hex
 r
 g
 exit
