@@ -641,7 +641,7 @@ class MainWindow(
         self.impedance_btn.clicked.connect(self.open_impedance_dialog)
         self.channel_names_btn = QtWidgets.QPushButton("通道命名…")
         self.channel_names_btn.setToolTip(
-            "一次设置 8 个通道名称；名称会同步到波形、PSD、导出文件并在下次启动时保留"
+            "一次设置 8 个通道名称；仅本次运行生效，同步到显示、API 和后续导出"
         )
         self.channel_names_btn.clicked.connect(self.open_channel_naming_dialog)
         self.internal_short_btn = QtWidgets.QPushButton("内部短接")

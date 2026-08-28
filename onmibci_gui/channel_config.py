@@ -153,18 +153,7 @@ class ChannelConfigMixin:
                 self.serial_control_read_active = False
 
     def _load_channel_names(self) -> List[str]:
-        defaults = [f"CH{index}" for index in range(1, CHANNELS + 1)]
-        saved = self.app_settings.value("channel_names", defaults)
-        if isinstance(saved, str):
-            saved = [part.strip() for part in saved.split(",")]
-        try:
-            return self.validate_channel_names(list(saved))
-        except (TypeError, ValueError):
-            return defaults
-
-    def _save_channel_names(self) -> None:
-        self.app_settings.setValue("channel_names", list(self.channel_names))
-        self.app_settings.sync()
+        return [f"CH{index}" for index in range(1, CHANNELS + 1)]
 
     @staticmethod
     def validate_channel_names(names) -> List[str]:
@@ -191,7 +180,7 @@ class ChannelConfigMixin:
         dialog.setModal(True)
         layout = QtWidgets.QVBoxLayout(dialog)
         hint = QtWidgets.QLabel(
-            "名称将用于波形、PSD、单通道视图和导出元数据，并自动保存。\n"
+            "名称仅在本次运行中生效，用于显示、API 数据流和后续导出。\n"
             "为兼容 BDF/FIF，建议使用 Fp1、Fp2、C3、C4、Cz、ECG 等短英文标签。"
         )
         hint.setWordWrap(True)
@@ -219,9 +208,8 @@ class ChannelConfigMixin:
                 QtWidgets.QMessageBox.warning(dialog, "通道名称无效", str(exc))
                 return
             self.channel_names = names
-            self._save_channel_names()
             self.refresh_channel_parameter_labels()
-            self.set_status("通道名称已保存，并同步到显示与后续导出文件。")
+            self.set_status("通道名称已更新，并同步到显示、API 与后续导出文件。")
             dialog.accept()
 
         buttons.accepted.connect(accept_names)
@@ -230,6 +218,8 @@ class ChannelConfigMixin:
 
     def refresh_channel_parameter_labels(self):
         """Keep the per-channel hardware state visible without opening a dialog."""
+        if getattr(self, "stream_server", None) is not None:
+            self.stream_server.channels = tuple(self.channel_names)
         if not hasattr(self, "channel_buttons"):
             return
         for ch, button in enumerate(self.channel_buttons):
@@ -340,6 +330,14 @@ class ChannelConfigMixin:
         if channel_name is None:
             channel_name = self.channel_names[ch]
         channel_name = self.validated_channel_name(ch, channel_name)
+        if (bool(enabled), int(gain), bool(bias and enabled), False) == (
+            bool(self.channel_enabled[ch]), int(self.channel_gains[ch]),
+            bool(self.channel_bias[ch]), bool(self.channel_srb2[ch]),
+        ):
+            self.channel_names[ch] = channel_name
+            self.refresh_channel_parameter_labels()
+            self.set_status(f"CH{ch + 1} 名称已更新为 {channel_name}。")
+            return
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
         effective_srb2 = False
@@ -390,7 +388,6 @@ class ChannelConfigMixin:
             self.channel_bias[ch] = bool(bias and enabled)
             self.channel_srb2[ch] = False
             self.channel_names[ch] = channel_name
-            self._save_channel_names()
             self.set_bias_checks(sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i]))
             self.refresh_channel_parameter_labels()
             # Start a fresh display/filter epoch for the new hardware channel

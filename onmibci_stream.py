@@ -403,6 +403,7 @@ def publish_gui_matrix(
     modes: np.ndarray,
     generation: int | None,
     session_id: str,
+    channels: tuple[str, ...] = DEFAULT_CHANNELS,
 ) -> StreamBatch:
     """Copy one GUI matrix, publish it, and return the immutable batch."""
 
@@ -414,6 +415,7 @@ def publish_gui_matrix(
         modes=modes,
         generation=generation,
         session_id=session_id,
+        channels=channels,
     )
     server.publish(batch)
     return batch
@@ -519,6 +521,8 @@ class LocalStreamServer:
         self.port = port
         self.queue_size = queue_size
         self.session_id = session_id or uuid.uuid4().hex
+        # ponytail: immutable snapshots avoid sharing a mutable GUI name list.
+        self.channels = DEFAULT_CHANNELS
         self.stop_handler = stop_handler
         self.export_handler = export_handler
         self._thread: threading.Thread | None = None
@@ -822,7 +826,7 @@ class LocalStreamServer:
             "stream": stream,
             "session_id": self.session_id,
             "sample_rate": SAMPLE_RATE,
-            "channels": list(DEFAULT_CHANNELS),
+            "channels": list(self.channels),
             "unit": UNIT_UV,
         }
 

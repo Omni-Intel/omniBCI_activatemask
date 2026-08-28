@@ -301,7 +301,14 @@ class LocalClient:
             hello.get("sample_rate"), int
         ) or isinstance(hello.get("sample_rate"), bool):
             raise ProtocolError("API hello has an unsupported sample rate")
-        if hello.get("channels") != list(DEFAULT_CHANNELS):
+        channels = hello.get("channels")
+        if (
+            not isinstance(channels, list) or len(channels) != len(DEFAULT_CHANNELS)
+            or any(not isinstance(name, str) or not name.strip() or len(name) > 16
+                   or any(ord(char) < 32 or ord(char) > 126 for char in name)
+                   for name in channels)
+            or len({name.strip().casefold() for name in channels}) != len(channels)
+        ):
             raise ProtocolError("API hello has unsupported channels")
         if hello.get("unit") != UNIT_UV:
             raise ProtocolError("API hello has an unsupported unit")

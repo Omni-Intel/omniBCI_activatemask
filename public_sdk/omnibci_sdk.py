@@ -341,10 +341,18 @@ class LocalClient:
                 or hello.get("schema_version") != SCHEMA_VERSION
                 or hello.get("stream") != stream
                 or hello.get("sample_rate") != SAMPLE_RATE
-                or hello.get("channels") != list(CHANNELS)
                 or hello.get("unit") != "uV"
             ):
                 raise ProtocolError("API hello is incompatible with this SDK")
+            channels = hello.get("channels")
+            if (
+                not isinstance(channels, list) or len(channels) != len(CHANNELS)
+                or any(not isinstance(name, str) or not name.strip() or len(name) > 16
+                       or any(ord(char) < 32 or ord(char) > 126 for char in name)
+                       for name in channels)
+                or len({name.strip().casefold() for name in channels}) != len(channels)
+            ):
+                raise ProtocolError("API hello has unsupported channels")
             self.hello = hello
             return _StreamIterator(stream, connection)
         except BaseException:

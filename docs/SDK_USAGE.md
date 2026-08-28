@@ -92,7 +92,7 @@ with connect_local().stream_filtered() as stream:
 
 | 字段 | 含义 |
 | --- | --- |
-| `values` | `(samples, 8)` 的 `float32` 数组，通道顺序为 CH1 到 CH8，单位为 µV |
+| `values` | `(samples, 8)` 的 `float32` 数组，始终按输入通道 1 到 8 排列，单位为 µV |
 | `sequence` | 每个样本的采集序号，`uint32` |
 | `valid` | 每个样本是否有效的布尔数组 |
 | `modes` | 每个样本的采集模式标记，`uint8` |
@@ -100,8 +100,14 @@ with connect_local().stream_filtered() as stream:
 | `session_id` | 当前 GUI API 会话 ID |
 | `generation` | raw 为 `None`；filtered 为当前滤波配置代数 |
 | `sample_rate` | 当前为 250 Hz |
-| `channels` | `("CH1", ..., "CH8")` |
+| `channels` | 当前批次的 8 个通道名称，默认 `("CH1", ..., "CH8")` |
 | `unit` | 当前为 `uV` |
+
+GUI 改名不更改数值或通道排列，也不暂停采集。新订阅的 `hello.channels`
+返回当前名称；已有订阅无需重连，以每批 `batch.channels` 为准，不要只缓存
+首次握手的名称。改名前已排队的数据仍携带旧标签。名称只在本次 GUI 运行中
+生效，支持 1–16 个可打印 ASCII 字符，不能为空或重复（忽略大小写）。
+使用自定义名称时，客户端需更新到配套 SDK；旧 SDK 会拒绝非默认名称的握手。
 
 `raw` 是已经解码成 µV、但还没有经过 GUI 滤波的数据，不是串口上的 48 字节
 原始帧。raw 保留输入端的饱和值；filtered 是 GUI

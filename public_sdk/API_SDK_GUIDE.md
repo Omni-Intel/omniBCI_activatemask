@@ -103,8 +103,16 @@ default. Pass `overwrite=True` only when replacement is intentional.
 | `stream` | `str` | `raw` or `filtered` |
 | `generation` | `int | None` | Filter configuration generation |
 | `sample_rate` | `int` | `250` |
-| `channels` | `tuple[str, ...]` | `CH1` through `CH8` |
+| `channels` | `tuple[str, ...]` | Current batch labels; defaults are `CH1` through `CH8` |
 | `unit` | `str` | `uV` |
+
+Renaming channels in the GUI does not change values or column order. Names are
+session-local, unique (case-insensitive), and contain 1-16 printable ASCII
+characters. New subscriptions receive current labels in `hello.channels`.
+Existing subscriptions receive updated labels in subsequent `batch.channels`
+without reconnecting; do not cache names only from the initial hello. Previously
+queued batches retain their original labels. Use this updated SDK with custom
+names; older SDKs reject hello messages with non-default labels.
 
 `GapEvent` means the client did not consume the real-time stream fast enough.
 Discard the current analysis window and begin with fresh continuous samples.

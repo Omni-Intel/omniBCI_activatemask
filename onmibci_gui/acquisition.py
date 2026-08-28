@@ -1527,6 +1527,7 @@ class AcquisitionMixin:
                 modes=modes,
                 generation=generation,
                 session_id=server.session_id,
+                channels=tuple(self.channel_names),
             )
         except Exception as exc:
             self.stream_api_errors += 1

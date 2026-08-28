@@ -1395,6 +1395,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_channel_parameter_labels(self):
         """Keep the per-channel hardware state visible without opening a dialog."""
+        if getattr(self, "stream_server", None) is not None:
+            self.stream_server.channels = tuple(self.channel_names)
         if not hasattr(self, "channel_buttons"):
             return
         for ch, button in enumerate(self.channel_buttons):
@@ -1511,6 +1513,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if channel_name is None:
             channel_name = self.channel_names[ch]
         channel_name = self.validated_channel_name(ch, channel_name)
+        if (bool(enabled), int(gain), bool(bias and enabled), False) == (
+            bool(self.channel_enabled[ch]), int(self.channel_gains[ch]),
+            bool(self.channel_bias[ch]), bool(self.channel_srb2[ch]),
+        ):
+            self.channel_names[ch] = channel_name
+            self.refresh_channel_parameter_labels()
+            self.set_status(f"CH{ch + 1} 名称已更新为 {channel_name}。")
+            return
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
         srb2 = False
@@ -4315,6 +4325,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 modes=modes,
                 generation=generation,
                 session_id=server.session_id,
+                channels=tuple(self.channel_names),
             )
         except Exception as exc:
             self.stream_api_errors += 1
