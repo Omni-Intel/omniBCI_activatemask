@@ -42,6 +42,13 @@ select = ["F"]
 # 常量并显式 re-export 类/函数，供 tests 与同事脚本继续从主模块导入。
 # F401/F403/F405 是该模式的固有噪音；F841 为 5 处存量死变量，另行清理。
 "ads1299_eeg_gui_native.py" = ["F401", "F403", "F405", "F841"]
+# V19 GUI was mechanically split from the legacy single-file application.
+# Its responsibility modules intentionally share the runtime namespace through
+# package-relative star imports.  Ignore only the two diagnostics inherent to
+# that compatibility boundary; all other Pyflakes checks remain active.
+"onmibci_gui/*.py" = ["F403", "F405"]
+# common.py is the deliberate export hub consumed by runtime.py and the mixins.
+"onmibci_gui/common.py" = ["F401"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
