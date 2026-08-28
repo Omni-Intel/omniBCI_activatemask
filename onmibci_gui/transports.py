@@ -449,9 +449,11 @@ class BleTransportWorker(QtCore.QThread):
                     raise RuntimeError("固件握手响应无效")
                 firmware_version = hello[1]
                 protocol_version = hello[4]
-                if firmware_version != BLE_FIRMWARE_VERSION:
+                if firmware_version not in BLE_FIRMWARE_VERSIONS:
                     raise RuntimeError(
-                        f"固件版本不兼容：需要 V{BLE_FIRMWARE_VERSION}，设备为 V{firmware_version}"
+                        "固件版本不兼容：需要 "
+                        f"{'/'.join(f'V{version}' for version in BLE_FIRMWARE_VERSIONS)}，"
+                        f"设备为 V{firmware_version}"
                     )
                 if protocol_version != BLE_DEVICE_PROTOCOL_VERSION:
                     raise RuntimeError(

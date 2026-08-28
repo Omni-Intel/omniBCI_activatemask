@@ -6,8 +6,13 @@ This branch supports two fixed-reference ESP32-C3 BLE V19 builds:
   firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino
   firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino
 
+It also supports one independent full-differential V20 build:
+
+  firmware/ESP32C3_ADS1299_FULL_DIFF_BLE_V20/ESP32C3_ADS1299_FULL_DIFF_BLE_V20.ino
+
 Required handshake:
-  firmware version V19.1.0 (GUI accepts V19.x)
+  fixed-reference firmware V19.1.0 or full-differential firmware V20.0.0
+  GUI accepts compatible V19.x and V20.x builds
   device-control protocol V1
 
 Reference selection is intentionally a firmware-build choice, not a GUI control.
@@ -19,6 +24,11 @@ its USB CDC port, both builds also accept the GUI's `AA <sample-rate-code>`
 serial command and return the shared 12-byte CONFIG1/readback acknowledgement.
 For ESP32C3 Dev Module builds, `USB CDC On Boot` must be Enabled only when direct
 COM control is needed. BLE operation does not require this build option.
+
+V20 keeps both SRB paths disabled (`CHnSET.SRB2=0`, `MISC1.SRB1=0`) and applies
+the logical BIAS/lead-off masks symmetrically to the P and N inputs. The GUI
+detects V19/V20 through BLE HELLO; V20 also supports the serial `0xAB` identity
+query.
 
 GATT characteristics:
   DATA      reliable EEG blocks

@@ -31,7 +31,7 @@ def main():
     runtime.APP_LOGGER, runtime.APP_LOG_PATH = configure_logging(LOG_DIR)
     APP_LOGGER, APP_LOG_PATH = runtime.APP_LOGGER, runtime.APP_LOG_PATH
     APP_LOGGER.info(
-        "OmniBCI GUI release=V%d firmware=V19 protocol=V1 source=%s frozen=%s",
+        "OmniBCI GUI release=V%d firmware=V19/V20 protocol=V1 source=%s frozen=%s",
         APP_RELEASE_VERSION,
         __file__,
         IS_FROZEN,

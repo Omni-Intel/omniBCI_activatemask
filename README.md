@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-OmniBCI 是面向 ADS1299 的原生 Python EEG/EMG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线支持固定 SRB1 EEG 和固定 SRB2 肌电两种 ESP32 V19 固件，参考拓扑由固件决定。
+OmniBCI 是面向 ADS1299 的原生 Python EEG/EMG 采集 GUI，支持 USB 串口与 BLE、实时滤波与绘图、PSD/质量分析，以及原始 BIN 数据保存。当前主线支持固定 SRB1/SRB2 的 ESP32 V19 固件和每路 `INxP-INxN` 的 V20 全差分固件；参考拓扑由固件决定，GUI 连接后自动识别版本与 profile。
 
 设备控制栏先明确选择 `ESP32-C3` 或 `STM32H563 + E73`，再选择该主控支持的
 USB/BLE 传输。两套固件都支持交互选择 250/500/1000 SPS：STM32/E73 和
@@ -26,8 +26,8 @@ GUI 同时使用固件完整的 32 位 `queue_drop` 计数器进行丢帧归因�
 
 ### 已完成功能
 
-- **采集与硬件控制**：USB 串口与 BLE 采集、V19/V1 版本握手、ADS1299 完整寄存器快照、通道开关/PGA/BIAS、内部短接、内部测试和电极阻抗检测。
-- **固定参考固件**：GUI 不做运行时 SRB 切换；SRB1 EEG 与 SRB2 肌电板分别烧录对应 `.ino`。
+- **采集与硬件控制**：USB 串口与 BLE 采集、V19/V20 固件识别、协议 V1 握手、ADS1299 完整寄存器快照、通道开关/PGA/BIAS、内部短接、内部测试和电极阻抗检测。
+- **固件固定模拟前端**：GUI 不做运行时 SRB 切换；SRB1/SRB2 V19 与全差分 V20 分别烧录对应 `.ino`。
 - **BLE 可靠传输**：六帧 compact block、384 块保留环、累计 ACK/NACK 修复、旧控制抑制、拥塞退避重试、512 帧采集队列和可分离 MCU/主机丢帧的 STATUS V5 诊断。
 - **实时显示**：8 通道波形、自定义通道名、单通道视图、`A - B` 派生差分波形与 PSD、实时滤波、陷波、Welch PSD、阿尔法峰和信号质量指标。差分仅影响显示/分析，不篡改原始记录。
 - **录制与导出**：每次采集写入一个连续 BIN，同时生成 manifest/sidecar 元数据；防止重复点击“开始”覆盖当前会话；支持 CSV、BDF+、FIF/MNE 导出和 BDF+ Annotation 事件标记。
@@ -198,6 +198,15 @@ result = client.export_bdf(r"D:\recordings\session_001.bdf")
 - `firmware/ESP32C3_ADS1299_SRB1_BLE_V19/ESP32C3_ADS1299_SRB1_BLE_V19.ino`
 - `firmware/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19/ESP32C3_ADS1299_SRB2_DIFF_BLE_V19.ino`
 - `firmware/STM32_E73_DONGLE_V19/`：STM32H563VGT6 + E73-2G4M08S1C + nRF52840 USB dongle
+
+另提供真正独立全差分的 V20 固件：
+
+- `firmware/ESP32C3_ADS1299_FULL_DIFF_BLE_V20/ESP32C3_ADS1299_FULL_DIFF_BLE_V20.ino`
+
+V20 每路固定采集 `INxP-INxN`，所有 `CHnSET.SRB2=0`、`MISC1.SRB1=0`；
+正常模式把同一 enabled/BIAS mask 写入 `BIAS_SENSP` 与 `BIAS_SENSN`，lead-off
+也同时检测 P/N 两侧。GUI 连接时通过 BLE HELLO 或串口 `0xAB` 自动显示固件版本，
+并对 V20 的 SRB 寄存器读回进行校验。
 
 两个 ESP32 sketch 都是可独立打开和编译的完整源码，分别固定 SRB1 和 SRB2，不在 GUI 中切换 SRB。两者都支持 250/500/1000 SPS 事务命令和 CONFIG1 读回。STM32 兼容链路保持 GUI 使用的 48 字节数据帧与双向控制格式。
 

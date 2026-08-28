@@ -20,15 +20,17 @@ Protocol expected from firmware:
   - 8 channels: bytes 16..39, signed 24-bit big endian per channel
   - read_us: bytes 40..41 little endian uint16
   - pending: byte 42
-  - mode: byte 43   0=P+N, 1=P-only, 2=BIAS-off, 3=shorted, 4=test
+  - mode: byte 43   0/1=firmware-defined normal BIAS modes, 2=BIAS-off,
+    3=shorted, 4=test
   - queue_depth: byte 44
   - queue_drop_low: byte 45
   - crc16-ccitt over bytes 0..45, little endian at 46..47
 
-BIAS_SENSP command sent by this app:
+Logical BIAS-mask command sent by this app:
   A6 0D XX
-where XX is the logical BIAS channel mask. Compatible firmware routes it
-to BIAS_SENSP for SRB1 or BIAS_SENSN for SRB2.
+where XX is the logical BIAS channel mask. V19 fixed-reference firmware routes
+it to its signal side; V20 full-differential firmware writes it to both
+BIAS_SENSP and BIAS_SENSN.
 
 Atomic eight-channel initialization command:
   A5 REFERENCE ENABLED_MASK BIAS_MASK SRB2_MASK GAIN1..GAIN8
@@ -202,10 +204,12 @@ TRANSPORT_REPOLL_DELAY_MS = 2
 TRANSPORT_CATCHUP_THRESHOLD_BYTES = FRAME_BYTES * 10
 BLE_DEVICE_NAME_SRB1 = "OmniBCI-C3-SRB1-V19"
 BLE_DEVICE_NAME_SRB2 = "OmniBCI-C3-SRB2-V19"
+BLE_DEVICE_NAME_FULL_DIFF_V20 = "OmniBCI-C3-FULLDIFF-V20"
 BLE_DEVICE_NAME_COMMON = "OmniBCI-C3-ADS1299"
 BLE_DEVICE_NAMES = (
     BLE_DEVICE_NAME_SRB1,
     BLE_DEVICE_NAME_SRB2,
+    BLE_DEVICE_NAME_FULL_DIFF_V20,
     BLE_DEVICE_NAME_COMMON,
 )
 # Fallback label only. Connection compatibility is verified from GATT UUIDs and
@@ -216,8 +220,11 @@ BLE_DATA_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0002"
 BLE_CONTROL_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0003"
 BLE_STATUS_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0004"
 BLE_RESPONSE_UUID = "79f60000-3a7d-4b11-9f4e-4c57a50d0005"
-BLE_FIRMWARE_VERSION = 19
+BLE_FIRMWARE_VERSIONS = (19, 20)
 BLE_CAP_SAMPLE_RATE = 1 << 5
+BLE_CAP_FULL_DIFF = 1 << 6
+SERIAL_FIRMWARE_QUERY = 0xAB
+FIRMWARE_PROFILE_FULL_DIFF = 0x03
 BLE_BLOCK_MAGIC = b"\xb1\x4b"
 BLE_BLOCK_VERSION_V1 = 1
 BLE_BLOCK_VERSION_V2 = 2

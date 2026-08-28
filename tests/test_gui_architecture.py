@@ -17,6 +17,14 @@ from onmibci_gui.transport_control import TransportControlMixin
 
 
 class GuiArchitectureTests(unittest.TestCase):
+    def test_serial_firmware_identity_packet_decodes_without_guessing(self):
+        packet = bytearray((0xBC, 0xAB, 0x03, 20, 0, 0, 1, 0x6F, 0x00, 1, 0xFF, 0))
+        for value in packet[:11]:
+            packet[11] ^= value
+        decoded = ChannelConfigMixin._decode_config_ack_packet(packet, 0xAB)
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded["packet"][2:9], bytes((0x03, 20, 0, 0, 1, 0x6F, 0x00)))
+
     def test_main_window_composes_responsibility_mixins(self):
         expected = {
             ChannelConfigMixin,
@@ -64,6 +72,11 @@ class GuiArchitectureTests(unittest.TestCase):
             window.mcu_combo.setCurrentIndex(esp32_index)
             self.assertEqual(window.selected_mcu(), window_module.MCU_ESP32)
             self.assertTrue(window.transport_combo.isEnabled())
+
+            window.set_firmware_identity((20, 0, 0), 1, window_module.BLE_CAP_FULL_DIFF)
+            self.assertEqual(window.firmware_profile, "full_diff")
+            self.assertIn("V20.0.0", window.firmware_label.text())
+            self.assertIn("SRB1/SRB2 OFF", window.reference_fixed_label.text())
         finally:
             if window is not None:
                 window.close()

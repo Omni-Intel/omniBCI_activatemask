@@ -70,12 +70,90 @@ class TransportControlMixin:
             return str(self.mcu_combo.currentData() or MCU_ESP32)
         return str(getattr(self, "mcu_family", MCU_ESP32))
 
+    def set_firmware_identity(
+        self,
+        version=None,
+        protocol: Optional[int] = None,
+        capabilities: int = 0,
+        profile_code: Optional[int] = None,
+    ):
+        if version is None:
+            self.firmware_info = None
+            self.firmware_profile = "unknown"
+            if hasattr(self, "firmware_label"):
+                self.firmware_label.setText("固件：未识别（旧版无查询）")
+            if hasattr(self, "reference_fixed_label"):
+                self.reference_fixed_label.setText("参考：由固件固定")
+                self.reference_fixed_label.setToolTip("连接后读取固件版本和寄存器配置")
+            if hasattr(self, "mode_combo"):
+                for index, (label, _command, _mode) in enumerate(MODE_ITEMS):
+                    self.mode_combo.setItemText(index, label)
+            if hasattr(self, "channel_buttons"):
+                self.refresh_channel_parameter_labels()
+            return
+
+        version = tuple(int(value) for value in version)
+        capabilities = int(capabilities)
+        full_diff = bool(capabilities & BLE_CAP_FULL_DIFF) or (
+            profile_code == FIRMWARE_PROFILE_FULL_DIFF
+        )
+        self.firmware_profile = "full_diff" if full_diff else "legacy_fixed"
+        self.firmware_info = {
+            "version": version,
+            "protocol": None if protocol is None else int(protocol),
+            "capabilities": capabilities,
+            "profile": self.firmware_profile,
+        }
+        version_text = ".".join(str(value) for value in version)
+        protocol_text = "?" if protocol is None else str(int(protocol))
+        profile_text = "全差分" if full_diff else "固定参考"
+        self.firmware_label.setText(f"固件：V{version_text} / P{protocol_text} / {profile_text}")
+        if full_diff:
+            self.reference_fixed_label.setText("参考：全差分（SRB1/SRB2 OFF）")
+            self.reference_fixed_label.setToolTip(
+                "V20 固件读回确认每路 INxP-INxN，CHnSET.SRB2=0 且 MISC1.SRB1=0。"
+            )
+            if hasattr(self, "mode_combo"):
+                self.mode_combo.setItemText(0, "全差分 + BIAS P+N（兼容）")
+                self.mode_combo.setItemText(1, "全差分 + BIAS P+N")
+                self.mode_combo.setItemText(2, "全差分 + BIAS off")
+        else:
+            self.reference_fixed_label.setText("参考：由 V19 固件固定")
+            self.reference_fixed_label.setToolTip("旧版参考拓扑由所烧录的固定参考固件决定。")
+            if hasattr(self, "mode_combo"):
+                for index, (label, _command, _mode) in enumerate(MODE_ITEMS):
+                    self.mode_combo.setItemText(index, label)
+        if hasattr(self, "channel_buttons"):
+            self.refresh_channel_parameter_labels()
+
+    def probe_serial_firmware(self):
+        self.transport_reset_input_buffer()
+        self.transport_write(bytes((SERIAL_FIRMWARE_QUERY,)))
+        ack = self.read_config_ack(SERIAL_FIRMWARE_QUERY, timeout=0.75)
+        if ack is None:
+            self.set_firmware_identity()
+            return None
+        packet = ack["packet"]
+        version = (packet[3], packet[4], packet[5])
+        protocol = packet[6]
+        capabilities = packet[7] | (packet[8] << 8)
+        self.set_firmware_identity(version, protocol, capabilities, packet[2])
+        self.log_event(
+            "firmware_detected",
+            version=".".join(str(value) for value in version),
+            protocol=int(protocol),
+            capabilities=int(capabilities),
+            profile=str(self.firmware_profile),
+        )
+        return self.firmware_info
+
     def mcu_mode_changed(self):
         if self.transport_connected() or self.transport_connecting:
             return
         self.mcu_family = self.selected_mcu()
         self.app_settings.setValue("mcu_family", self.mcu_family)
         self.app_settings.sync()
+        self.set_firmware_identity()
         if self.mcu_family == MCU_STM32:
             serial_index = self.transport_combo.findData("serial")
             self.transport_combo.blockSignals(True)
@@ -118,16 +196,14 @@ class TransportControlMixin:
             self.connect_btn.setText("连接蓝牙")
             self.reference_combo.setEnabled(False)
             self.apply_reference_btn.setEnabled(False)
-            self.reference_combo.setToolTip("V19 固定使用 SRB1。")
+            self.reference_combo.setToolTip("参考拓扑由已烧录固件固定，GUI 不执行 SRB 切换。")
         else:
             self.serial_label.setText("串口")
             self.refresh_btn.setText("扫描串口")
             self.connect_btn.setText("打开串口")
             self.reference_combo.setEnabled(False)
             self.apply_reference_btn.setEnabled(False)
-            self.reference_combo.setToolTip(
-                "新版本固定使用 SRB1：每通道信号接 INxP，公共参考接 SRB1。"
-            )
+            self.reference_combo.setToolTip("参考拓扑由已烧录固件固定，GUI 不执行 SRB 切换。")
         self._apply_transport_timing(kind)
         self.refresh_ports()
 
@@ -303,6 +379,8 @@ class TransportControlMixin:
                 time.sleep(0.7)
             self.transport_reset_input_buffer()
             self.transport_write(b"s")
+            time.sleep(0.05)
+            self.probe_serial_firmware()
             self.connect_btn.setText("关闭串口")
             self.transport_combo.setEnabled(False)
             self.mcu_combo.setEnabled(False)
@@ -314,7 +392,7 @@ class TransportControlMixin:
                 raise RuntimeError(f"采样率配置未得到 {device_name} 的寄存器回读确认")
             self.set_status(
                 f"已连接 {'ESP32-C3' if selected_mcu == MCU_ESP32 else 'STM32H563/E73'} "
-                f"{port}，并同步 {self.reference_short_name()} 参考、通道参数和 "
+                f"{port}，并同步 {self.reference_short_name()}、通道参数和 "
                 f"{self.sample_rate_hz} SPS。"
                 "现在可以点击“开始采集”。"
             )
@@ -333,6 +411,7 @@ class TransportControlMixin:
                     pass
             self.ser = None
             self.active_transport = None
+            self.set_firmware_identity()
             self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
             self.mcu_combo.setEnabled(True)
             self.port_combo.setEnabled(True)
@@ -356,7 +435,7 @@ class TransportControlMixin:
         return None
 
     def _ble_write_channel_config(self, ch: int, reference_mode: int):
-        """V19 applies one atomic SRB1-only snapshot for every channel edit."""
+        """Apply one atomic fixed-topology snapshot for every channel edit."""
         return self._ble_write_bulk_config(REFERENCE_SRB1)
 
     def _ble_write_bulk_config(self, reference_mode: int):
@@ -396,7 +475,7 @@ class TransportControlMixin:
         }
 
     def sync_ble_configuration(self, requested_reference=None, probe_capability: bool = True):
-        """V19 is fixed SRB1; connection handshake already read device state."""
+        """The firmware owns the fixed reference/full-differential topology."""
         self.set_reference_mode_local(REFERENCE_SRB1)
         return REFERENCE_SRB1, False
 
@@ -428,6 +507,11 @@ class TransportControlMixin:
         )
         self.ble_low_mtu_warned = False
         self.ble_protocol_warned = False
+        info = self.ble_worker.device_info if self.ble_worker is not None else None
+        firmware = info.get("firmware", (0, 0, 0)) if info else (0, 0, 0)
+        protocol = info.get("protocol", 0) if info else 0
+        capabilities = int(info.get("capabilities", 0)) if info else 0
+        self.set_firmware_identity(firmware, protocol, capabilities)
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText("断开蓝牙")
         self.transport_combo.setEnabled(False)
@@ -445,17 +529,24 @@ class TransportControlMixin:
             if self.ble_worker is not None:
                 self.ble_worker.set_streaming_hint(True)
             self.set_status(
-                f"BLE 已自动重连并完成 V19/V1 握手：{name}，MTU={mtu}；"
+                f"BLE 已自动重连并完成 V{firmware[0]}/P{protocol} 握手：{name}，MTU={mtu}；"
                 "正在继续原可靠会话并补传断线期间数据。"
             )
             return
 
         try:
             self.ble_supports_srb2 = False
-            self.ble_reference_profile = "srb1_fixed"
+            self.ble_reference_profile = self.firmware_profile
             snapshot = self.ble_worker.config_snapshot if self.ble_worker is not None else None
             if snapshot is None:
                 raise RuntimeError("未收到 ADS1299 寄存器快照")
+            if self.firmware_profile == "full_diff" and (
+                snapshot.misc1 & 0x20
+                or any(register & 0x08 for register in snapshot.channel_registers)
+                or snapshot.bias_p != snapshot.bias_n
+                or snapshot.lead_off_p != snapshot.lead_off_n
+            ):
+                raise RuntimeError("V20 全差分寄存器读回异常：SRB 或 P/N 对称配置不匹配")
             self.apply_ble_config_snapshot(snapshot)
             if snapshot.sample_rate_hz in SUPPORTED_SAMPLE_RATES:
                 self._apply_sample_rate_locally(snapshot.sample_rate_hz)
@@ -469,9 +560,6 @@ class TransportControlMixin:
             self.mode_combo.setCurrentIndex(self._mode_index_from_code(self.current_mode))
             self._sync_internal_short_button(self.current_mode == 3)
             action = "已自动重连" if reconnected else "已连接"
-            info = self.ble_worker.device_info if self.ble_worker is not None else None
-            firmware = info.get("firmware", (19, 0, 0)) if info else (19, 0, 0)
-            protocol = info.get("protocol", 1) if info else 1
             self.set_status(
                 f"BLE {action}并确认设备就绪：{name}，MTU={mtu}，"
                 f"固件 V{firmware[0]}.{firmware[1]}.{firmware[2]}，协议 V{protocol}，"
@@ -496,6 +584,7 @@ class TransportControlMixin:
             self.set_status(f"{reason}；后台正在自动重连。")
             return
         self.active_transport = None
+        self.set_firmware_identity()
         self.transport_connecting = False
         self.streaming = False
         self.close_raw_file()
@@ -611,7 +700,7 @@ class TransportControlMixin:
             )
         elif (len(data) < 76 or data[2] not in (0x04, 0x05)) and not self.ble_protocol_warned:
             self.ble_protocol_warned = True
-            self.set_status("BLE STATUS 格式不匹配：需要 SRB1-only STATUS V4/V5 固件 V19。")
+            self.set_status("BLE STATUS 格式不匹配：需要兼容的 STATUS V4/V5 固件 V19/V20。")
         if self.ble_peer_mtu >= BLE_MIN_STREAM_MTU:
             self.ble_low_mtu_warned = False
         if self.ble_peer_mtu < BLE_MIN_STREAM_MTU and not self.ble_low_mtu_warned:
@@ -667,6 +756,7 @@ class TransportControlMixin:
                     pass
             self.ser = None
             self.active_transport = None
+            self.set_firmware_identity()
             self.connect_btn.setText("打开串口")
             self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
             self.mcu_combo.setEnabled(True)
@@ -684,6 +774,7 @@ class TransportControlMixin:
                     self.set_status(f"BLE 断开异常：{exc}")
             self.ble_connected = False
             self.active_transport = None
+            self.set_firmware_identity()
             self.connect_btn.setText("连接蓝牙")
             self.connect_btn.setEnabled(True)
             self.transport_combo.setEnabled(self.selected_mcu() == MCU_ESP32)
@@ -828,7 +919,11 @@ class TransportControlMixin:
         return folder
 
     def _recording_configuration_snapshot(self) -> dict:
-        reference = "SRB2" if self.reference_is_srb2() else "SRB1"
+        reference = (
+            "FULL_DIFF"
+            if self.firmware_profile == "full_diff"
+            else ("SRB2" if self.reference_is_srb2() else "SRB1")
+        )
         transport = self.transport_description() if self.transport_connected() else "disconnected"
         return {
             "sample_rate_hz": FS,
@@ -839,7 +934,11 @@ class TransportControlMixin:
             "reference": reference,
             "reference_code": int(self.reference_mode),
             "mode_code": int(self.current_mode),
-            "mode_name": MODE_NAMES.get(int(self.current_mode), "UNKNOWN"),
+            "mode_name": (
+                "FULL_DIFF/BIAS P+N"
+                if self.firmware_profile == "full_diff" and self.current_mode in (0, 1)
+                else MODE_NAMES.get(int(self.current_mode), "UNKNOWN")
+            ),
             "global_gain": int(self.gain),
             "channel_gains": [int(value) for value in self.channel_gains.tolist()],
             "channel_enabled": [bool(value) for value in self.channel_enabled.tolist()],

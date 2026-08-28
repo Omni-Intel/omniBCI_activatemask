@@ -24,7 +24,7 @@ class MainWindow(
         super().__init__()
         self.setWindowTitle(
             f"全域智能 | OmniBCI V{APP_RELEASE_VERSION} | "
-            "ADS1299 EEG 工作站 | 固件 V19 / 通信协议 V1"
+            "ADS1299 EEG/EMG 工作站 | 固件 V19/V20 / 通信协议 V1"
         )
         self.resize(1500, 920)
         self.event_logger = AsyncEventLogger(LOG_DIR)
@@ -56,12 +56,12 @@ class MainWindow(
             saved_sample_rate = 250
         self.sample_rate_hz = set_runtime_sample_rate(saved_sample_rate)
         self.channel_names = self._load_channel_names()
-        # V19 defaults to the complete ADS1299 front end.  Users can still
+        # Current firmware defaults to the complete ADS1299 front end. Users can still
         # power down individual channels later from the channel dialog.
         self.channel_enabled = np.ones(CHANNELS, dtype=bool)
         self.channel_bias = np.ones(CHANNELS, dtype=bool)
-        # The GUI intentionally exposes only the fixed SRB1 wiring profile:
-        # measurement electrodes on INxP and the common reference on SRB1.
+        # Reference switching is not exposed. V19 fixed-reference and V20 full-
+        # differential builds own their ADS1299 SRB policy in firmware.
         self.reference_mode = REFERENCE_SRB1
         self.channel_srb2 = np.zeros(CHANNELS, dtype=bool)
         self.lsb_uv = self.calc_lsb_uv()
@@ -94,6 +94,8 @@ class MainWindow(
         self.ble_psd_skips = 0
         self.ble_device_name = ""
         self.ble_device_address = ""
+        self.firmware_info = None
+        self.firmware_profile = "unknown"
         self.ble_peer_mtu = 23
         self.ble_status = {}
         # Firmware counters are cumulative. Keep the delta from the most recent
@@ -688,7 +690,7 @@ class MainWindow(
             self.reference_combo.addItem(label, value)
         self.reference_combo.setCurrentIndex(0)
         self.reference_combo.setMinimumWidth(205)
-        self.reference_combo.setToolTip("V19 固定使用 SRB1：每通道信号接 INxP，公共参考接 SRB1。")
+        self.reference_combo.setToolTip("参考拓扑由已烧录固件固定，GUI 不执行 SRB 切换。")
         self.reference_combo.setEnabled(False)
         self.apply_reference_btn = QtWidgets.QPushButton("应用参考")
         self.apply_reference_btn.setEnabled(False)
@@ -719,9 +721,13 @@ class MainWindow(
         serial_layout.addWidget(self.internal_short_btn)
         serial_layout.addWidget(self.sample_rate_combo)
         serial_layout.addWidget(self.sample_rate_apply_btn)
-        self.reference_fixed_label = QtWidgets.QLabel("参考：SRB1 固定（INxP−SRB1）")
-        self.reference_fixed_label.setToolTip("GUI 已移除 SRB2 切换功能")
+        self.reference_fixed_label = QtWidgets.QLabel("参考：由固件固定")
+        self.reference_fixed_label.setToolTip("连接后读取固件版本和寄存器配置")
         serial_layout.addWidget(self.reference_fixed_label)
+        self.firmware_label = QtWidgets.QLabel("固件：未检测")
+        self.firmware_label.setMinimumWidth(155)
+        self.firmware_label.setToolTip("连接后通过 BLE HELLO 或串口 0xAB 查询自动识别")
+        serial_layout.addWidget(self.firmware_label)
         self.status_label = QtWidgets.QLabel("未扫描")
         self.status_label.setStyleSheet("color:#c94700; font-weight:600;")
         serial_layout.addWidget(self.status_label, 1)

@@ -35,9 +35,16 @@ class ChannelConfigMixin:
         self.refresh_channel_parameter_labels()
 
     def reference_short_name(self) -> str:
+        if getattr(self, "firmware_profile", "unknown") == "full_diff":
+            return "全差分"
         return "SRB2" if self.reference_is_srb2() else "SRB1"
 
     def bias_register_name(self) -> str:
+        if (
+            getattr(self, "firmware_profile", "unknown") == "full_diff"
+            and self.current_mode in (0, 1)
+        ):
+            return "BIAS_SENSP+BIAS_SENSN"
         if self.current_mode == 0:
             return "BIAS_SENSP+BIAS_SENSN"
         return "BIAS_SENSN" if self.reference_is_srb2() else "BIAS_SENSP"
@@ -61,6 +68,7 @@ class ChannelConfigMixin:
         if checksum != packet[11]:
             return None
         return {
+            "packet": packet,
             "command": packet[1],
             "argument": packet[2],
             "channel_register": packet[3],
@@ -240,7 +248,8 @@ class ChannelConfigMixin:
             enabled = bool(self.channel_enabled[ch])
             bias = "BIAS✓" if self.channel_bias[ch] else "BIAS—"
             power = "ON" if enabled else "OFF"
-            reference = "SRB1全局"
+            full_diff = getattr(self, "firmware_profile", "unknown") == "full_diff"
+            reference = "INP-INN" if full_diff else "固件固定参考"
             button.setText(f"{name}  {power}  ×{int(self.channel_gains[ch])}\n{bias}  {reference}")
             icon = QtGui.QPixmap(11, 11)
             icon.fill(QtGui.QColor("#56bd31" if enabled else "#8b969e"))
@@ -249,7 +258,11 @@ class ChannelConfigMixin:
                 f"{name} (INP{ch + 1}): {'启用' if enabled else '禁用'}, "
                 f"PGA ×{int(self.channel_gains[ch])}, "
                 f"{'参与' if self.channel_bias[ch] else '不参与'} {self.bias_register_name()}；"
-                + "EEG 模式使用全局 SRB1"
+                + (
+                    "V20 全差分模式保持 SRB1/SRB2 关闭"
+                    if full_diff
+                    else "参考拓扑由固件固定"
+                )
             )
             if hasattr(self, "channel_plots"):
                 self.channel_plots[ch].setLabel("left", name, units="uV")
@@ -291,9 +304,12 @@ class ChannelConfigMixin:
         bias = QtWidgets.QCheckBox(f"加入 {self.bias_register_name()} 共模反馈计算")
         bias.setChecked(bool(self.channel_bias[ch]))
         form.addRow("BIAS", bias)
+        full_diff = getattr(self, "firmware_profile", "unknown") == "full_diff"
         note_text = (
-            "V19 固定使用 SRB1：测量电极接 INxP，公共参考接 SRB1，"
-            "MISC1.SRB1 在 EEG 模式中全局开启。"
+            "V20 全差分：每路独立采集 INxP-INxN，SRB1/SRB2 始终关闭，"
+            "BIAS 选择同时作用于 BIAS_SENSP 和 BIAS_SENSN。"
+            if full_diff
+            else "参考拓扑由当前固定参考固件决定。"
         )
         note = QtWidgets.QLabel(note_text)
         note.setWordWrap(True)
@@ -308,7 +324,7 @@ class ChannelConfigMixin:
             summary.setText(
                 f"CH{ch + 1}  |  {'ON' if enabled.isChecked() else 'OFF'}  |  "
                 f"PGA ×{gain.currentText()}  |  BIAS {'YES' if bias.isChecked() else 'NO'}  |  "
-                "SRB1 GLOBAL"
+                + ("INxP-INxN" if full_diff else "FIXED REFERENCE")
             )
 
         enabled.toggled.connect(update_summary)
@@ -413,7 +429,7 @@ class ChannelConfigMixin:
             self.set_status(
                 f"已确认 CH{ch + 1}: {'ON' if enabled else 'OFF'}, PGA×{gain}, "
                 f"{self.bias_register_name()}={'YES' if bias and enabled else 'NO'}, "
-                + "SRB1=GLOBAL"
+                + ("SRB1=OFF, SRB2=OFF" if full_diff else "参考由固件固定")
                 + readback
             )
         except Exception as exc:
@@ -457,7 +473,7 @@ class ChannelConfigMixin:
                     time.sleep(0.08)
                 self.sync_ble_configuration()
                 self.ble_supports_srb2 = False
-                self.ble_reference_profile = "srb1_fixed"
+                self.ble_reference_profile = self.firmware_profile
                 self.set_reference_mode_local(REFERENCE_SRB1)
                 self.set_bias_checks(sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i]))
                 self.ring.clear()
@@ -467,7 +483,9 @@ class ChannelConfigMixin:
                     self.transport_write(b"b")
                     self.streaming = True
                 self.set_status(
-                    "BLE 已同步固定 SRB1：信号接 INxP，公共参考接 SRB1，BIAS 使用 SENSP。"
+                    "BLE 已同步 V20 全差分：INxP-INxN，SRB1/SRB2 OFF，BIAS 使用 P/N。"
+                    if self.firmware_profile == "full_diff"
+                    else "BLE 已同步当前固定参考固件。"
                 )
                 return
             if self.transport_connected() and self.offline_uv is None:
@@ -503,8 +521,9 @@ class ChannelConfigMixin:
             self.filtered_ring.clear()
             self.reset_processing_state()
             self.set_status(
-                "参考已固定为 SRB1：信号接 INxP，参考接 SRB1，"
-                "BIAS 使用 BIAS_SENSP；原始极性为 INxP-SRB1。"
+                "V20 全差分已同步：每路 INxP-INxN，SRB1/SRB2 OFF，BIAS 使用 P/N。"
+                if self.firmware_profile == "full_diff"
+                else "当前参考拓扑已由固件固定并同步通道参数。"
             )
         except Exception as exc:
             if was_streaming and self.transport_connected() and not self.streaming:
