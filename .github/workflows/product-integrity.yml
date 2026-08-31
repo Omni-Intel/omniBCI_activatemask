@@ -1,0 +1,49 @@
+name: Product integrity
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  frozen-sources:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python products/test_verify_sources.py
+      - run: python products/verify_sources.py
+
+  emg-regression:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: products/esp32_emg/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --all-extras
+      - run: uv run --no-sync ruff check .
+      - name: Isolated GUI and protocol tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --no-sync python -c "import tempfile; from PySide6.QtCore import QSettings; QSettings.setDefaultFormat(QSettings.IniFormat); QSettings.setPath(QSettings.IniFormat,QSettings.UserScope,tempfile.mkdtemp(prefix='omniemg-ci-')); import pytest; raise SystemExit(pytest.main(['tests']))"
+
+  stm32-reference-launcher:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: products/stm32_bci/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --all-extras
+      - run: uv run --no-sync python ../test_launcher.py
+      - name: Archived reference tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --no-sync python -c "import tempfile; from PySide6.QtCore import QSettings; QSettings.setDefaultFormat(QSettings.IniFormat); QSettings.setPath(QSettings.IniFormat,QSettings.UserScope,tempfile.mkdtemp(prefix='stm32-ci-')); import unittest; result=unittest.TextTestRunner().run(unittest.defaultTestLoader.discover('tests')); raise SystemExit(not result.wasSuccessful())"

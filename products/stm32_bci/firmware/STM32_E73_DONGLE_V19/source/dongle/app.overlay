@@ -1,0 +1,12 @@
+&reg1 {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+&uart0 {
+	status = "disabled";
+};
+
+&board_cdc_acm_uart {
+	tx-fifo-size = <4096>;
+	rx-fifo-size = <1024>;
+};

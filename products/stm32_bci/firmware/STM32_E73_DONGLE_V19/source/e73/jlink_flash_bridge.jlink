@@ -1,0 +1,10 @@
+device NRF52840_XXAA
+si SWD
+speed 1000
+connect
+r
+h
+loadfile build_bridge/e73_dongle/zephyr/zephyr.hex
+r
+g
+q

@@ -1,0 +1,6 @@
+board:
+  name: bciband_h563vg
+  full_name: BCI-Band STM32H563VG
+  vendor: custom
+  socs:
+    - name: stm32h563xx

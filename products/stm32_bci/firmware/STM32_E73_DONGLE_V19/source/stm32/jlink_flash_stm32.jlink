@@ -1,0 +1,10 @@
+device STM32H563VG
+si SWD
+speed 1000
+connect
+r
+h
+loadfile build/production/zephyr/zephyr.hex
+r
+g
+q

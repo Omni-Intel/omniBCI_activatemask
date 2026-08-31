@@ -1,0 +1,14 @@
+device NRF52840_XXAA
+si SWD
+speed 100
+connect
+r
+h
+mem32 0x00000000 8
+mem32 0x10001304 1
+g
+sleep 2000
+h
+mem32 0xE000ED24 6
+mem32 0x20005B80 16
+q
