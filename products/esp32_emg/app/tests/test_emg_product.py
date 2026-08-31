@@ -122,6 +122,83 @@ class EmgWindowTests(unittest.TestCase):
                                             np.arange(10, dtype=np.uint32), np.ones(10, np.uint8), 0)
                     self.assertEqual(publish.call_args.args[0].sample_rate, rate)
 
+    def test_live_psd_uses_a_valid_fft_window_at_all_rates(self):
+        w = self.window
+        for rate in (250, 500, 1000):
+            with self.subTest(rate=rate):
+                self.set_rate(rate)
+                t = np.arange(rate * 4) / rate
+                ok, _message, result = w.compute_live_psd_fast(
+                    10 * np.sin(2 * np.pi * 10 * t), np.ones(t.size, bool),
+                    np.arange(t.size, dtype=np.uint32), np.ones(t.size, np.uint8))
+                self.assertTrue(ok)
+                self.assertAlmostEqual(result["raw_f"][np.argmax(result["raw_p"])], 10, delta=0.3)
+
+    def test_imported_gains_do_not_leak_into_new_live_recordings(self):
+        from tests.test_bdf_export import make_frame
+        w = self.window
+        w.active_transport, w.ser = "serial", mock.Mock(is_open=True)
+        w.firmware_verified, w.hardware_sample_rate = True, 500
+        path = Path(self.temp.name) / "historical.bin"
+        for gain in (12, 8):
+            path.write_bytes(make_frame(0, 100) + make_frame(1, 101))
+            path.with_suffix(".meta.json").write_text(json.dumps({"configuration": {
+                "sample_rate_hz": 1000, "channel_gains": [gain] * 8}}), encoding="utf-8")
+            w._load_bin_path(str(path))
+            self.assertEqual(w.channel_gains.tolist(), [gain] * 8)
+        with mock.patch.object(w, "transport_write"), mock.patch.object(w, "transport_reset_input_buffer"), \
+             mock.patch.object(w, "_recording_folder", return_value=self.temp.name):
+            w.start_stream()
+            self.assertTrue(w.streaming)
+            self.assertEqual(w.sample_rate, 500)
+            self.assertEqual(w.channel_gains.tolist(), [24] * 8)
+            np.testing.assert_allclose(w.channel_lsb_uv(), gui.VREF / 24 / (2**23 - 1) * 1e6)
+            self.assertEqual(w._recording_configuration_snapshot()["channel_gains"], [24] * 8)
+            w.stop_stream()
+
+    def test_ble_snapshot_does_not_change_loaded_file_calibration(self):
+        w = self.window
+        w.offline_uv = np.zeros((8, 250))
+        w.channel_gains[:] = 12
+        w.apply_ble_config_snapshot(protocol.decode_config_snapshot(snapshot(500)))
+        self.assertEqual(w.channel_gains.tolist(), [12] * 8)
+        self.assertEqual(w.hardware_sample_rate, 500)
+
+    def test_impedance_rejects_unknown_rate_without_sending_commands(self):
+        w = self.window
+        w.active_transport, w.ser = "serial", mock.Mock(is_open=True)
+        w.firmware_verified = True
+        with mock.patch.object(w, "transport_write") as write, \
+             mock.patch.object(w, "selected_impedance_mask", return_value=1), \
+             mock.patch.object(gui.QtWidgets.QMessageBox, "warning") as warning, \
+             mock.patch.object(w, "read_config_ack", return_value={
+                 "verified": True, "loff_p": 1, "loff_n": 1, "loff_config": 2}):
+            w.start_impedance_detection()
+            write.assert_not_called()
+            self.assertFalse(w.impedance_active)
+            warning.assert_called_once()
+
+    def test_impedance_leaves_file_timing_before_starting_measurement(self):
+        from tests.test_bdf_export import make_frame
+        w = self.window
+        w.active_transport, w.ser = "serial", mock.Mock(is_open=True)
+        w.firmware_verified, w.hardware_sample_rate = True, 1000
+        path = Path(self.temp.name) / "historical.bin"
+        path.write_bytes(make_frame(0, 100))
+        path.with_suffix(".meta.json").write_text(json.dumps({"configuration": {
+            "sample_rate_hz": 250, "channel_gains": [12] * 8}}), encoding="utf-8")
+        w._load_bin_path(str(path))
+        with mock.patch.object(w, "transport_write"), mock.patch.object(w, "transport_reset_input_buffer"), \
+             mock.patch.object(w, "selected_impedance_mask", return_value=1), \
+             mock.patch.object(w, "read_config_ack", return_value={
+                 "verified": True, "loff_p": 1, "loff_n": 1, "loff_config": 2}):
+            w.start_impedance_detection()
+            self.assertTrue(w.impedance_active)
+            self.assertEqual(w.sample_rate, 1000)
+            self.assertEqual(w.channel_gains.tolist(), [24] * 8)
+            self.assertIsNone(w.offline_uv)
+        w.impedance_active = w.streaming = False
+
     def test_full_diff_mode_one_and_name_only_control(self):
         w = self.window
         w.current_mode = 1
@@ -212,6 +289,7 @@ class EmgWindowTests(unittest.TestCase):
 
     def test_full_diff_impedance_uses_both_lead_off_sides(self):
         w = self.window
+        w.firmware_verified, w.hardware_sample_rate = True, 250
         w.active_transport, w.ble_connected = "ble", True
         w.ble_worker = mock.Mock()
         payload = bytearray(snapshot())
@@ -274,6 +352,26 @@ class EmgWindowTests(unittest.TestCase):
             self.assertEqual(w.channel_gains.tolist(), [24] * 8)
             self.assertEqual(w.channel_names, [f"CH{i}" for i in range(1, 9)])
             self.assertIs(w.offline_uv, previous_data)
+
+    def test_bin_labels_validate_the_incoming_set_atomically(self):
+        from tests.test_bdf_export import make_frame
+        w = self.window
+        path = Path(self.temp.name) / "labels.bin"
+        path.write_bytes(make_frame(0, 100))
+        original = list(w.channel_names)
+        for names in (["EMG1", "emg1", *original[2:]], [42, *original[1:]]):
+            with self.subTest(names=names):
+                path.with_suffix(".meta.json").write_text(json.dumps({"configuration": {
+                    "sample_rate_hz": 1000, "channel_names": names}}), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    w._load_bin_path(str(path))
+                self.assertEqual(w.channel_names, original)
+                self.assertEqual(w.sample_rate, 250)
+        swapped = [original[1], original[0], *original[2:]]
+        path.with_suffix(".meta.json").write_text(json.dumps({"configuration": {
+            "sample_rate_hz": 1000, "channel_names": swapped}}), encoding="utf-8")
+        w._load_bin_path(str(path))
+        self.assertEqual(w.channel_names, swapped)
 
     def test_live_and_import_gap_limits_follow_sample_rate(self):
         from tests.test_bdf_export import make_frame

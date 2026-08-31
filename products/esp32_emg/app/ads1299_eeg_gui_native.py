@@ -116,6 +116,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.gain = 24  # legacy/global command value
         self.channel_gains = np.full(CHANNELS, 24, dtype=np.int16)
+        self.live_channel_gains = self.channel_gains.copy()
         self.channel_names = [f"CH{index}" for index in range(1, CHANNELS + 1)]
         self.channel_enabled = np.ones(CHANNELS, dtype=bool)
         self.channel_bias = np.ones(CHANNELS, dtype=bool)
@@ -1447,7 +1448,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "single_channel_combo"):
                 self.single_channel_combo.setItemText(ch, name)
 
-    def validated_channel_name(self, ch, name):
+    def validated_channel_name(self, ch, name, names=None):
         name = str(name).strip()
         if not name:
             raise ValueError("通道名称不能为空。")
@@ -1456,8 +1457,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if any(ord(char) < 32 or ord(char) > 126 for char in name):
             raise ValueError("通道名称只能使用英文、数字和 ASCII 符号。")
         duplicates = {
-            existing.casefold()
-            for index, existing in enumerate(self.channel_names)
+            existing.strip().casefold()
+            for index, existing in enumerate(self.channel_names if names is None else names)
             if index != ch
         }
         if name.casefold() in duplicates:
@@ -1596,6 +1597,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.channel_gains[ch] = int(gain)
             self.channel_bias[ch] = bool(bias and enabled)
             self.channel_srb2[ch] = False
+            if self.offline_uv is None:
+                self.live_channel_gains = self.channel_gains.copy()
             self.channel_names[ch] = channel_name
             self.set_bias_checks(sum((1 << i) for i in range(CHANNELS) if self.channel_bias[i]))
             self.refresh_channel_parameter_labels()
@@ -1742,6 +1745,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 or ack["misc1"] != 0 or ack["mode"] != self.current_mode):
             self.firmware_verified = False
             raise RuntimeError("V20 USB full-differential channel readback mismatch")
+        self.live_channel_gains = self.channel_gains.copy()
 
     def _main_range_changed(self, _viewbox, x_range):
         if getattr(self, "_syncing_plot", False) or self.offline_uv is None:
@@ -2458,6 +2462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             raise RuntimeError("ADS1299 配置读回不一致")
         self.ble_worker.config_snapshot = snapshot
+        self.live_channel_gains = self.channel_gains.copy()
         return {
             "verified": snapshot.verified,
             "enabled_mask": snapshot.enabled_mask,
@@ -2480,9 +2485,11 @@ class MainWindow(QtWidgets.QMainWindow):
         gain_by_code = {0: 1, 1: 2, 2: 4, 3: 6, 4: 8, 5: 12, 6: 24}
         for ch, register in enumerate(snapshot.channel_registers):
             self.channel_enabled[ch] = not bool(register & 0x80)
-            self.channel_gains[ch] = gain_by_code.get((register >> 4) & 0x07, 24)
+            self.live_channel_gains[ch] = gain_by_code.get((register >> 4) & 0x07, 24)
             self.channel_bias[ch] = bool(snapshot.bias_p & (1 << ch))
             self.channel_srb2[ch] = False
+        if self.offline_uv is None:
+            self.channel_gains = self.live_channel_gains.copy()
         self.current_mode = int(snapshot.mode)
         if len(set(int(value) for value in self.channel_gains)) == 1:
             self.gain = int(self.channel_gains[0])
@@ -3218,7 +3225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if cleaned.size < self.sample_rate * 4:
             return False, "不足 4 秒", metrics
         nperseg = min(cleaned.size, self.sample_rate * 4)
-        nfft = 1024
+        nfft = max(1024, 1 << (int(nperseg) - 1).bit_length())
         noverlap = min(nperseg // 2, nperseg - 1)
         raw_f, raw_p = signal.welch(
             cleaned, fs=self.sample_rate, window="hann", nperseg=nperseg,
@@ -3493,6 +3500,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_impedance_detection(self):
         if not self.require_transport():
             return
+        if not self.firmware_verified or self.hardware_sample_rate is None:
+            QtWidgets.QMessageBox.warning(self, "EMG V20", "请重新连接并确认 V20 全差分固件及采样率。")
+            return
         if self.current_mode not in (0, 1, 2):
             QtWidgets.QMessageBox.warning(
                 self, "阻抗检测", "请先切换到 EEG 模式；短路或内部测试模式不能测量电极阻抗。"
@@ -3510,6 +3520,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.streaming = False
                 self.close_raw_file()
                 time.sleep(0.08)
+            self.use_live_configuration()
             self.transport_reset_input_buffer()
             self.parser.reset()
             if self.active_transport == "ble":
@@ -3728,6 +3739,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ble_status[key] = 0
         self.ble_status_delta = {}
 
+    def use_live_configuration(self):
+        # File calibration must not be reused to decode the next hardware stream.
+        if self.offline_uv is not None:
+            self.channel_gains = self.live_channel_gains.copy()
+        self.offline_uv = None
+        self.set_sample_rate_local(self.hardware_sample_rate)
+        if len(set(map(int, self.channel_gains))) == 1:
+            self.gain = int(self.channel_gains[0])
+        self.lsb_uv = self.calc_lsb_uv()
+        self.refresh_channel_parameter_labels()
+        self.offline_slider.setEnabled(False)
+        self.offline_label.setText("实时")
+
     def start_stream(self):
         if not self.require_transport():
             return
@@ -3756,10 +3780,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.impedance_active:
             self.stop_impedance_detection(silent=True)
         try:
-            self.offline_uv = None
-            self.set_sample_rate_local(self.hardware_sample_rate)
-            self.offline_slider.setEnabled(False)
-            self.offline_label.setText("实时")
+            self.use_live_configuration()
             self.parser.reset()
             self.ring.clear()
             self.reset_processing_state()
@@ -4021,6 +4042,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.reset_processing_state()
                 self.last_seq = None
                 self.lsb_uv = self.calc_lsb_uv()
+                self.live_channel_gains = self.channel_gains.copy()
                 self.refresh_channel_parameter_labels()
                 self.set_status(f"已发送 PGA={new_gain}；显示 LSB 同步为 {self.lsb_uv:.6g} uV/code。")
             except Exception as exc:
@@ -4035,6 +4057,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.gain = new_gain
             self.channel_gains[:] = new_gain
             self.lsb_uv = self.calc_lsb_uv()
+            if self.offline_uv is None:
+                self.live_channel_gains = self.channel_gains.copy()
             self.refresh_channel_parameter_labels()
             self.set_status(f"仅修改本地解码 PGA={new_gain}，LSB={self.lsb_uv:.6g} uV/code。")
 
@@ -4501,9 +4525,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 gains = np.asarray(gains, dtype=np.int16)
             if "channel_names" in configuration:
                 names = configuration["channel_names"]
-                if not isinstance(names, list) or len(names) != CHANNELS:
+                if not isinstance(names, list) or len(names) != CHANNELS or any(
+                    not isinstance(name, str) for name in names
+                ):
                     raise ValueError("Recording must contain eight channel names")
-                names = [self.validated_channel_name(i, name) for i, name in enumerate(names)]
+                names = [self.validated_channel_name(i, name, names) for i, name in enumerate(names)]
         else:
             rate, accepted = QtWidgets.QInputDialog.getItem(
                 self, "BIN sample rate", "No metadata: select original SPS", [str(r) for r in SAMPLE_RATES],
@@ -4534,6 +4560,8 @@ class MainWindow(QtWidgets.QMainWindow):
             max_fill_samples=int(LIVE_TIMELINE_MAX_FILL_S * rate),
         )
         # Commit imported timing/calibration only after the whole input validates.
+        if self.offline_uv is None:
+            self.live_channel_gains = self.channel_gains.copy()
         self.set_sample_rate_local(rate)
         self.channel_gains = gains
         self.channel_names = names
