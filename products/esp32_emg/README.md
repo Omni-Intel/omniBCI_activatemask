@@ -2,8 +2,8 @@
 
 Dedicated ESP32-C3 / ADS1299 full-differential product. **Software revision:
 V20 integration.1**. The separately versioned firmware is the unchanged **V20.0**
-sketch, not a new firmware release. This is an integration candidate pending
-complete independent review and hardware acceptance.
+sketch, not a new firmware release. Independent software review is complete;
+hardware acceptance is still pending. Integration is not a hardware release.
 
 ## Provenance
 
@@ -64,7 +64,9 @@ recording sidecars, BDF/FIF and both SDKs. BIN import restores saved rate/gain/n
 metadata; BIN without metadata asks for the original rate. BDF import retains
 supported source rates. Completed-recording BDF export uses saved rate/gains even
 after the GUI rate changes. Device rate changes do not retime an already loaded
-offline file; live timing is applied when acquisition starts. Invalid BIN metadata
+offline file; device timing and cached device gains are restored when acquisition
+or impedance detection starts. Impedance detection also requires verified device
+timing. Invalid BIN metadata
 is rejected before replacing the currently loaded file's rate, gains or names.
 Native software trigger, name-only edits without
 hardware commands, current API labels, raw and filtered streams remain available.
@@ -91,8 +93,9 @@ python -B -m unittest discover -s tests -v
 
 Tests use fake transport responses, localhost sockets, temporary recordings and
 isolated QSettings. They do not scan/connect BLE or flash devices. For this
-integration, the existing worktree-root `.venv/Scripts/python.exe` was reused
-read-only in a separate process; no install/sync command was run against it.
+integration, final verification used the product's independent `app/.venv`.
+The complete suite passed 107 tests and 56 subtests; independent review also
+passed 27 targeted tests. The stable EEG environment was not synchronized.
 
 Copied tests are adapted to the native entry and V20 fixtures. Split-GUI-only
 architecture/V4-rescue tests and split-only bulk-naming/persistence checks are not
