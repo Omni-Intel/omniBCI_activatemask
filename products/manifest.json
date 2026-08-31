@@ -1,6 +1,13 @@
 {
   "schema_version": 1,
-  "integration_status": "software-review-candidate; hardware acceptance pending",
+  "packaging_overrides": {
+    ".gitignore": "6495b47ad1e8755465ad4b356c22dcb3ffa33078",
+    ".github/workflows/build-v16-windows-exe.yml": "52b9429f2ab2ab018f16f53baaa0adc68e02fc6d",
+    "build_exe.bat": "06b217d19179f43959ecabeaeaaa5faf925443ea",
+    "OmniBCI_V19.spec": "f37aec0158d02b985732dc8e0caaaaff12a3648e",
+    "EXE_BUILD_NOTES.txt": "f184a70b2b3f0016066f4cb49b7e2c906ac2a8d4"
+  },
+  "integration_status": "software-integrated; hardware acceptance pending",
   "products": {
     "esp32_eeg_srb1_ble": {
       "software_baseline": "1402ec8f9d059afad56e2bfa204743bd90f54ef3",

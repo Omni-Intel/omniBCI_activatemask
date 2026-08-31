@@ -8,6 +8,21 @@ from verify_sources import verify_sources
 
 
 class SourceIntegrityTests(unittest.TestCase):
+    def test_only_explicit_packaging_files_can_override_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "build_exe.bat").write_bytes(b"new build\n")
+            blob = subprocess.check_output(["git", "hash-object", "build_exe.bat"], cwd=root, text=True).strip()
+            manifest = {"snapshots": [{"files": {"build_exe.bat": "0" * 40}}],
+                        "packaging_overrides": {"build_exe.bat": blob}}
+            self.assertEqual(verify_sources(root, manifest), [])
+            (root / "build_exe.bat").write_bytes(b"changed again\n")
+            self.assertEqual(verify_sources(root, manifest), ["modified: build_exe.bat"])
+            manifest["packaging_overrides"] = {"firmware.ino": blob}
+            with self.assertRaises(ValueError):
+                verify_sources(root, manifest)
+
     def test_modified_missing_and_binary_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

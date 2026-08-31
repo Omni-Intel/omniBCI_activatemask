@@ -7,6 +7,19 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+# Desktop binaries and archives are local outputs, never source assets.
+*.[eE][xX][eE]
+*.[mM][sS][iI]
+*.[zZ][iI][pP]
+*.7[zZ]
+*.[rR][aA][rR]
+*.tar
+*.tar.gz
+*.tgz
+# Firmware update ZIPs are deliberately versioned with their hardware release.
+!**/firmware/**/*.[zZ][iI][pP]
+.buildvenv/
+.superpowers/
 .Python
 build/
 develop-eggs/

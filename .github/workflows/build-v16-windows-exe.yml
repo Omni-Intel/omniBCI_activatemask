@@ -8,11 +8,11 @@ on:
       - 'app_diagnostics.py'
       - 'onmibci_*.py'
       - 'omnibci/**'
-      - 'requirements.txt'
-      - 'requirements_optional_export.txt'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'build_exe.bat'
       - 'OmniBCI_V19.spec'
       - 'assets/**'
-      - 'firmware/**'
       - '.github/workflows/build-v16-windows-exe.yml'
 
 jobs:
@@ -22,37 +22,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          architecture: 'x64'
-          cache: 'pip'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -r requirements.txt
-          python -m pip install -r requirements_optional_export.txt
-          python -m pip install "pyinstaller>=6.10,<7"
-
-      - name: Build ONEDIR EXE
-        shell: pwsh
-        env:
-          OMNIBCI_BUNDLE_EXPORTS: '1'
-        run: |
-          python -m PyInstaller --noconfirm --clean OmniBCI_V19.spec
-          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings\bin | Out-Null
-          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings\bdf | Out-Null
-          New-Item -ItemType Directory -Force dist\OmniBCI_V19\recordings\fif | Out-Null
-          New-Item -ItemType Directory -Force dist\OmniBCI_V19\logs | Out-Null
-          # Release package intentionally contains only the executable runtime.
-          Compress-Archive -Path dist\OmniBCI_V19 -DestinationPath OmniBCI_V19_Windows.zip -Force
-
-      - name: Upload Windows build
-        uses: actions/upload-artifact@v4
-        with:
-          name: OmniBCI_V19_Windows
-          path: OmniBCI_V19_Windows.zip
-          if-no-files-found: error
+      - name: Validate ONEDIR build without uploading binaries
+        shell: cmd
+        run: build_exe.bat --non-interactive

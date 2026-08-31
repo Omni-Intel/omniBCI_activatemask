@@ -7,6 +7,13 @@ import sys
 from pathlib import Path
 
 
+# User-authorized packaging repair; runtime and firmware cannot opt out.
+PACKAGING_PATHS = {
+    ".gitignore", ".github/workflows/build-v16-windows-exe.yml",
+    "build_exe.bat", "OmniBCI_V19.spec", "EXE_BUILD_NOTES.txt",
+}
+
+
 def verify_sources(root: Path, manifest: dict) -> list[str]:
     root = root.resolve()
     expected = {}
@@ -27,6 +34,10 @@ def verify_sources(root: Path, manifest: dict) -> list[str]:
             if not (root / path).resolve().is_relative_to(root):
                 raise ValueError(f"Source path escapes repository: {path}")
             expected[path] = blob
+    for path, blob in manifest.get("packaging_overrides", {}).items():
+        if path not in PACKAGING_PATHS or path not in expected:
+            raise ValueError(f"Not an authorized packaging override: {path}")
+        expected[path] = blob
     present = []
     for path in expected:
         if (root / path).is_file():
@@ -66,7 +77,8 @@ def main() -> int:
         print(error)
     if not errors:
         count = sum(len(snapshot["files"]) for snapshot in manifest["snapshots"])
-        print(f"PASS: {count} frozen source files match their recorded Git blobs.")
+        overrides = len(manifest.get("packaging_overrides", {}))
+        print(f"PASS: {count} source files match recorded Git blobs ({overrides} authorized packaging updates).")
     return int(bool(errors))
 
 

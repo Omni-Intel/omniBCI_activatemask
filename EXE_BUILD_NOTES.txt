@@ -1,62 +1,42 @@
-OMNIBCI WINDOWS EXE BUILD AND DISTRIBUTION (V19)
-================================================
+OMNIBCI WINDOWS EXE BUILD (V19, STABLE ESP32 EEG SRB1 + BLE)
+==========================================================
 
-Recommended format: PyInstaller ONEDIR.
+This builder packages ads1299_eeg_gui_native.py, the same entry as run.bat.
+It is NOT the EMG or STM32 product. No firmware is built or modified.
 
-Build machine
--------------
-Windows 10/11 x64.
-Python 3.12 x64 (or the project .venv created by uv / install_and_run.bat).
+Build computer: Windows x64, uv available on PATH.
+Use the project's existing uv installation (as used by install_and_run.bat).
+uv installs the Python version and dependencies specified by the project lock.
+Network access is needed for uncached packages.
 
-Option A - local one-click build
---------------------------------
-1. Double-click build_exe.bat.
-2. Wait for BUILD SUCCESS.
-3. Open dist\OmniBCI_V19\.
-4. Send or zip the entire directory.
-5. On the target computer, run OmniBCI_V19.exe.
+Double-click build_exe.bat, or run from a terminal:
+  build_exe.bat                       Full: includes mne and pyedflib
+  build_exe.bat --slim                Excludes BDF/FIF export dependencies
+  build_exe.bat --non-interactive     Full, without a final pause (CI)
 
-Build modes:
-- build_exe.bat              full build, bundles mne + pyedflib
-                             (BDF+/FIF export and MNE browser work in the EXE)
-- build_exe.bat --slim       live acquisition only, smaller folder
-                             (no mne/pyedflib; BDF/FIF export disabled)
+The build uses a separate .buildvenv. The acquisition .venv and uv.lock are
+not modified. Slim builds use the same locked build environment but exclude
+the export packages from the final distribution.
+The PyInstaller subprocess uses only Windows system paths, preventing DLL
+collisions with unrelated programs (e.g. other Qt/ICU installations).
 
-How the build picks Python:
-- If the project .venv exists and has all dependencies (including mne/pyedflib
-  for full builds), it is reused and PyInstaller is added via uv.
-- Otherwise an isolated .buildvenv is created from requirements.txt
-  (+ requirements_optional_export.txt in full mode), using the SUSTech
-  PyPI mirror.
+Every successful build prints a NEW directory:
+  dist\<unique-build-id>\OmniBCI_V19\
+Run OmniBCI_V19.exe from that directory. Keep the adjacent _internal folder.
+The target computer does not need Python. Copy or ZIP the WHOLE directory,
+not just the EXE. Keep it in a writable directory for recordings and logs.
 
-Option B - GitHub Actions
--------------------------
-1. Commit the project, including .github/workflows/build-v16-windows-exe.yml.
-2. Open the repository Actions page.
-3. Run "Build OmniBCI V19 Windows EXE".
-4. Download the OmniBCI_V19_Windows artifact.
+Old build directories are never deleted by this script. They may contain
+recordings and logs; archive those before manually cleaning up old releases.
 
-Distribution rules
-------------------
-- Send the ENTIRE dist\OmniBCI_V19\ directory.
-- Do not copy OmniBCI_V19.exe alone. The adjacent _internal directory contains
-  the Python runtime, Qt libraries and scientific packages.
-- The target computer does not need Python, pip, pyserial, scipy, PySide6 or
-  bleak.
-- Recordings are written to OmniBCI_V19\recordings\{bin,bdf,fif}\ beside the
-  executable; logs go to OmniBCI_V19\logs\onmibci.log.
-- Full (default) builds include mne/pyedflib, so BDF/FIF export works.
-  Slim builds exclude them; live USB/BLE acquisition is unaffected either way.
+Git policy:
+- EXE, MSI and desktop release archives are ignored, including ZIP/7Z/RAR.
+- build/, dist/ and .buildvenv/ are local-only.
+- Firmware update ZIPs under firmware/ are intentional source exceptions.
+- Do not use git add -f for desktop outputs.
+- GitHub Actions validates the build only; it does not upload the EXE/ZIP.
 
-Why ONEDIR
-----------
-- Faster launch.
-- Less Windows Defender extraction overhead.
-- More reliable Qt/BLE DLL loading.
-- Easier diagnosis on different PCs.
-
-Naming note
------------
-Build artifacts were renamed from OmniBCI_V16 to OmniBCI_V19 to match the
-current GUI/firmware version (V19, SRB1-only, BLE device protocol V1).
-The old OmniBCI_V16.spec is kept for reference only and is no longer used.
+If a build fails, keep the FIRST error message and the build\<id> warnings.
+If the EXE fails, keep the error dialog and logs\onmibci.log beside the EXE.
+An old EXE is not updated by changing the spec; rebuild and use the new path.
+OmniBCI_V16.spec is historical and is not used by this builder.
