@@ -47,8 +47,8 @@
 
 ## Final Integration
 
-- [ ] Commit the authorized EEG-only packaging repair and updated integration records.
-- [ ] Preserve 8779008 and c2ecbd6 as history parents without changing the reviewed snapshot tree.
-- [ ] Integrate into master, preserving the existing packaging changes and all local recordings/environments.
-- [ ] Recheck all three product entries, test suites, frozen sources and absence of desktop build artifacts.
-- [ ] Push master without force and verify that the remote commit matches.
+- [x] Commit the authorized EEG-only packaging repair and updated integration records (d6157aa, 60d4708, 15edb8f).
+- [x] Preserve 8779008 and c2ecbd6 in master ancestry without changing the reviewed snapshot tree (7c6e245; c2ecbd6 is already an ancestor of 8779008).
+- [x] Integrate into master, preserving the existing packaging changes and all local recordings/environments. The six local packaging files match their pre-merge backup exactly.
+- [x] Recheck all three product entries, test suites, frozen sources and absence of desktop build artifacts. Post-merge: EEG 99, EMG 107, STM32 50 tests; source verifier 164 files and 5 verifier tests; Ruff and STM32 launcher pass. A full master-only clone also passes source verification.
+- [x] Push master without force and verify that the remote commit matches (7c6e2457d12af17d16964a4461bf33c5993ac357). Subsequent documentation-only commits do not change the tested runtime tree.
