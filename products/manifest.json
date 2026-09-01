@@ -1,5 +1,8 @@
 {
   "schema_version": 1,
+  "stm32_development_overrides": {
+    "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/README.md": "8dfbb80b53739f620cd47021edc3777509a62361"
+  },
   "packaging_overrides": {
     ".gitignore": "6495b47ad1e8755465ad4b356c22dcb3ffa33078",
     ".github/workflows/build-v16-windows-exe.yml": "52b9429f2ab2ab018f16f53baaa0adc68e02fc6d",

@@ -80,6 +80,24 @@ The command locates the pinned NCS tooling and SEGGER J-Link without requiring
 permanent PATH changes. It returns a nonzero exit code when a required tool is
 missing.
 
+Verified Windows environment:
+
+| Component | Version / path |
+| --- | --- |
+| nrfutil | 8.2.1, `D:\nrfutil\nrfutil.exe` |
+| NCS | v3.4.0, `D:\ncs\v3.4.0` |
+| NCS toolchain | `D:\ncs\toolchains\dcbdc366a1` |
+| West / CMake / Ninja | 1.5.0 / 4.2.1 / 1.13.2 |
+| Zephyr GCC / GDB | 14.3.0 / 16.2 |
+| Python / imgtool | 3.12.4 / 2.2.0 |
+| hal_stm32 | Zephyr revision `39130f29ae37c1db34095478ca02b6419b70dcdc`, `D:\ncs\extra\hal_stm32` |
+| mcumgr | `D:\mcutools\bin\mcumgr.exe` |
+| J-Link | 9.64, `C:\Program Files\SEGGER\JLink_V964\JLink.exe` |
+
+The NCS installer can warn about optional symlinks when Windows Developer Mode
+is disabled. This firmware does not use the affected Matter, Memfault, or
+Nanopb modules; a clean STM32 build remains the acceptance check.
+
 Set `$halStm32` to a compatible Zephyr `hal_stm32` module checkout.
 The build uses an ECDSA-P256 signing key at
 `keys/stm32-mcuboot-ecdsa-p256.pem`. The key is intentionally ignored by Git;
@@ -89,7 +107,8 @@ back it up securely because every future update must be signed by this key.
 $project = (Resolve-Path .).Path
 $halStm32 = (Resolve-Path $env:HAL_STM32_PATH).Path
 
-nrfutil toolchain-manager launch --ncs-version v3.4.0 `
+& 'D:\nrfutil\nrfutil.exe' sdk-manager toolchain launch `
+  --ncs-version v3.4.0 --install-dir D:\ncs --chdir D:\ncs\v3.4.0 `
   -- west build -p always --sysbuild `
   -b bciband_h563vg `
   -d build_dfu $project `

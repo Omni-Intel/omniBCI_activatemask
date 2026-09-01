@@ -8,6 +8,43 @@ from verify_sources import verify_sources
 
 
 class SourceIntegrityTests(unittest.TestCase):
+    def test_only_explicit_stm32_development_files_can_override_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            source = Path(
+                "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/"
+                "source/stm32/README.md"
+            )
+            target = root / source
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"active development\n")
+            blob = subprocess.check_output(
+                ["git", "hash-object", str(source)], cwd=root, text=True
+            ).strip()
+            manifest = {
+                "snapshots": [{"files": {str(source).replace("\\", "/"): "0" * 40}}],
+                "stm32_development_overrides": {
+                    str(source).replace("\\", "/"): blob
+                },
+            }
+
+            self.assertEqual(verify_sources(root, manifest), [])
+            target.write_bytes(b"unregistered edit\n")
+            self.assertEqual(
+                verify_sources(root, manifest),
+                [f"modified: {str(source).replace('\\', '/')}"],
+            )
+
+            for forbidden in (
+                "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/release/x.hex",
+                "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/keys/x.pem",
+                "firmware/ESP32C3_ADS1299_SRB1_BLE_V19/firmware.ino",
+            ):
+                manifest["stm32_development_overrides"] = {forbidden: blob}
+                with self.assertRaises(ValueError):
+                    verify_sources(root, manifest)
+
     def test_only_explicit_packaging_files_can_override_baseline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -12,6 +12,9 @@ PACKAGING_PATHS = {
     ".gitignore", ".github/workflows/build-v16-windows-exe.yml",
     "build_exe.bat", "OmniBCI_V19.spec", "EXE_BUILD_NOTES.txt",
 }
+STM32_DEVELOPMENT_PREFIX = (
+    "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/"
+)
 
 
 def verify_sources(root: Path, manifest: dict) -> list[str]:
@@ -37,6 +40,15 @@ def verify_sources(root: Path, manifest: dict) -> list[str]:
     for path, blob in manifest.get("packaging_overrides", {}).items():
         if path not in PACKAGING_PATHS or path not in expected:
             raise ValueError(f"Not an authorized packaging override: {path}")
+        expected[path] = blob
+    for path, blob in manifest.get("stm32_development_overrides", {}).items():
+        if (
+            not path.startswith(STM32_DEVELOPMENT_PREFIX)
+            or path not in expected
+            or path.endswith(".pem")
+            or "/keys/" in path
+        ):
+            raise ValueError(f"Not an authorized STM32 development override: {path}")
         expected[path] = blob
     present = []
     for path in expected:
@@ -77,8 +89,11 @@ def main() -> int:
         print(error)
     if not errors:
         count = sum(len(snapshot["files"]) for snapshot in manifest["snapshots"])
-        overrides = len(manifest.get("packaging_overrides", {}))
-        print(f"PASS: {count} source files match recorded Git blobs ({overrides} authorized packaging updates).")
+        overrides = sum(
+            len(manifest.get(name, {}))
+            for name in ("packaging_overrides", "stm32_development_overrides")
+        )
+        print(f"PASS: {count} source files match recorded Git blobs ({overrides} authorized updates).")
     return int(bool(errors))
 
 

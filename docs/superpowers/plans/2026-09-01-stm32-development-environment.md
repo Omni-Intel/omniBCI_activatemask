@@ -44,10 +44,10 @@
 - Consumes: official `nrfutil sdk-manager` installed under `D:\ncs`.
 - Produces: a real `doctor` report with SDK, west, CMake, Ninja, Python/imgtool, J-Link, and GDB paths.
 
-- [ ] Install official nrfutil and the `sdk-manager` command without changing repository files.
-- [ ] Install NCS v3.4.0 to `D:\ncs` and list the resolved installation.
-- [ ] Add the real sdk-manager launch adapter to `fw.ps1`, preserving the fake-tool test interface.
-- [ ] Run `fw.ps1 doctor -Json`; verify every required tool executes and reports the pinned SDK.
+- [x] Install official nrfutil and the `sdk-manager` command without changing repository files.
+- [x] Install NCS v3.4.0 to `D:\ncs` and list the resolved installation.
+- [x] Add the real sdk-manager launch adapter to `fw.ps1`, preserving the fake-tool test interface.
+- [x] Run `fw.ps1 doctor -Json`; verify every required tool executes and reports the pinned SDK.
 - [ ] Commit `docs: pin the STM32 NCS development environment`.
 
 ### Task 3: Reproduce the MCUboot Build
