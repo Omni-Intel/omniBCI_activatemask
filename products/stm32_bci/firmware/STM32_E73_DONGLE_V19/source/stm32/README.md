@@ -70,6 +70,16 @@ roll back on the following reset.
 
 ## Build
 
+Run the repository-local environment check before building:
+
+```powershell
+pwsh -File tools/fw.ps1 doctor
+```
+
+The command locates the pinned NCS tooling and SEGGER J-Link without requiring
+permanent PATH changes. It returns a nonzero exit code when a required tool is
+missing.
+
 Set `$halStm32` to a compatible Zephyr `hal_stm32` module checkout.
 The build uses an ECDSA-P256 signing key at
 `keys/stm32-mcuboot-ecdsa-p256.pem`. The key is intentionally ignored by Git;

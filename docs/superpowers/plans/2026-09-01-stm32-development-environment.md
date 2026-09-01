@@ -28,11 +28,11 @@
 **Interfaces:**
 - Produces: `fw.ps1 doctor`, returning zero only when the pinned tools can be launched.
 
-- [ ] Write a stdlib test that invokes `fw.ps1 doctor -Json` with temporary fake tools and asserts exact version/path checks plus nonzero failure on a missing tool.
-- [ ] Run the test and verify it fails because `fw.ps1` does not exist.
-- [ ] Implement only tool discovery, JSON output, exit codes, and `doctor` help.
-- [ ] Run the focused test and existing source-verifier tests.
-- [ ] Commit `feat: add STM32 firmware environment doctor`.
+- [x] Write a stdlib test that invokes `fw.ps1 doctor -Json` with temporary fake tools and asserts exact version/path checks plus nonzero failure on a missing tool.
+- [x] Run the test and verify it fails because `fw.ps1` does not exist.
+- [x] Implement only tool discovery, JSON output, exit codes, and `doctor` help.
+- [x] Run the focused test and existing source-verifier tests.
+- [x] Commit `feat: add STM32 firmware environment doctor`.
 
 ### Task 2: Install and Verify NCS v3.4.0
 
