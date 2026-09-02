@@ -36,7 +36,9 @@ is therefore inferred only by successful SD initialization and FAT mount.
 Each successfully built 48-byte V19 stream frame is offered to a fixed-capacity
 SD queue without waiting. The existing ADS and E73 path never performs a file
 operation. A dedicated Zephyr SD writer thread consumes queued frames, combines
-them into 4 KiB writes, and writes them through FatFs over four-bit SDMMC1.
+128 frames into 6144-byte writes, and writes them through FatFs over four-bit
+SDMMC1. A 6144-byte batch is both a whole number of 48-byte frames and 512-byte
+SD sectors, so the file needs no padding.
 
 The queue stores 64 KiB, which buffers about 1.3 seconds at 1000 samples per
 second. Queue insertion uses a no-wait operation. If the queue is full, the
@@ -52,7 +54,7 @@ real-time frame still goes to E73 and the firmware increments
   `/SD:/BCI00001.BIN` through `/SD:/BCI99999.BIN`.
 - A recording file contains consecutive, unchanged 48-byte V19 frames and no
   additional header. Existing BIN readers can consume it directly.
-- The writer uses 4 KiB writes and calls `fs_sync()` about once per second.
+- The writer uses 6144-byte writes and calls `fs_sync()` about once per second.
 - Acquisition stop drains already queued frames, synchronizes, and closes the
   file.
 - Write failure, full media, or I/O error closes and disables only the current
