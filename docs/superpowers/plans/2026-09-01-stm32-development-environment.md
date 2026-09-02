@@ -61,12 +61,12 @@
 **Interfaces:**
 - Produces: `fw.ps1 build -Version 19.3.0` and artifact metadata from the clean sysbuild directory.
 
-- [ ] Add failing tests for semantic version rejection (`19.1.0` and malformed input) and build command construction with literal paths.
-- [ ] Run tests and verify the new cases fail.
-- [ ] Implement `build`, passing the requested version as a clean CMake/Kconfig override without editing tracked files per build.
-- [ ] Generate a temporary development signing key, run a pristine sysbuild, and capture the first real compiler/configuration error if any.
-- [ ] Fix only reproducibility blockers found by the build; rerun until the build exits zero.
-- [ ] Validate factory/update image headers, addresses, sizes, and hashes.
+- [x] Add failing tests for semantic version rejection (`19.1.0` and malformed input) and build command construction with literal paths.
+- [x] Run tests and verify the new cases fail.
+- [x] Implement `build`, passing the requested version through an isolated staging copy without editing tracked files per build.
+- [x] Generate a temporary development signing key, run a pristine sysbuild, and capture the first real compiler/configuration error if any.
+- [x] Fix only reproducibility blockers found by the build; rerun until the build exits zero.
+- [x] Validate factory/update image headers, addresses, sizes, and hashes.
 - [ ] Commit `build: reproduce STM32 MCUboot firmware with NCS 3.4.0`.
 
 ### Task 4: Key Generation and Release Metadata

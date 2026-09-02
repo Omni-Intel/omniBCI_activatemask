@@ -98,24 +98,26 @@ The NCS installer can warn about optional symlinks when Windows Developer Mode
 is disabled. This firmware does not use the affected Matter, Memfault, or
 Nanopb modules; a clean STM32 build remains the acceptance check.
 
-Set `$halStm32` to a compatible Zephyr `hal_stm32` module checkout.
-The build uses an ECDSA-P256 signing key at
-`keys/stm32-mcuboot-ecdsa-p256.pem`. The key is intentionally ignored by Git;
-back it up securely because every future update must be signed by this key.
+The build requires an ECDSA-P256 signing key. The key is intentionally ignored
+by Git; back it up securely because every future update must be signed by this
+key. Build version `19.3.0` with:
 
 ```powershell
-$project = (Resolve-Path .).Path
-$halStm32 = (Resolve-Path $env:HAL_STM32_PATH).Path
-
-& 'D:\nrfutil\nrfutil.exe' sdk-manager toolchain launch `
-  --ncs-version v3.4.0 --install-dir D:\ncs --chdir D:\ncs\v3.4.0 `
-  -- west build -p always --sysbuild `
-  -b bciband_h563vg `
-  -d build_dfu $project `
-  -- `
-  -DBOARD_ROOT=$project `
-  -DZEPHYR_EXTRA_MODULES=$halStm32
+pwsh -File tools/fw.ps1 build -Version 19.3.0 `
+  -KeyPath keys\stm32-mcuboot-ecdsa-p256.pem
 ```
+
+NCS CMake 4.2.1 crashes when a custom `BOARD_ROOT` resolves through a
+non-ASCII Windows path. The wrapper mirrors only `stm32` and the sibling
+`protocol` directory to a unique ASCII staging directory outside Git, changes
+the image version in that staging copy, and removes the staged private key in
+a `finally` block. It writes artifact paths, sizes, and SHA-256 values to
+`build-metadata.json` in the external build directory.
+
+The verified `19.3.0` image uses a `0x400` byte MCUboot header. MCUboot occupies
+`0x08000000..0x0800FFFF`; the signed application starts at `0x08010000` and
+fits within the 448 KiB slot0 region. Deprecation warnings from Zephyr's legacy
+USB stack remain expected for the imported V19 source and are not build errors.
 
 ## First installation with J-Link
 

@@ -1,7 +1,9 @@
 {
   "schema_version": 1,
   "stm32_development_overrides": {
-    "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/README.md": "8dfbb80b53739f620cd47021edc3777509a62361"
+    "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/README.md": "e857fbbef4966fa1a3b595a48f97476285bb45a4",
+    "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/boards/bciband_h563vg/CMakeLists.txt": "7f71752886cdf1e21fa7ddda185f1898ea65efea",
+    "products/stm32_bci/firmware/STM32_E73_DONGLE_V19/source/stm32/sysbuild/mcuboot.conf": "200c478de8b5fca0c186d23d27abb3b11c5c74d1"
   },
   "packaging_overrides": {
     ".gitignore": "6495b47ad1e8755465ad4b356c22dcb3ffa33078",

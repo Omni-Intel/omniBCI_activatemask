@@ -11,6 +11,56 @@ SCRIPT = TOOLS_DIR / "fw.ps1"
 
 
 class FirmwareToolTests(unittest.TestCase):
+    def run_build(self, version: str, root: Path):
+        return subprocess.run(
+            [
+                "pwsh", "-NoProfile", "-File", str(SCRIPT), "build",
+                "-Version", version,
+                "-BuildDir", str(root / "构建 output"),
+                "-KeyPath", str(root / "密钥 signing.pem"),
+                "-DryRun", "-Json",
+            ],
+            cwd=TOOLS_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+
+    def test_build_rejects_old_and_malformed_versions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for version in ("19.1.0", "19.1", "v19.3.0", "19.3.0-beta"):
+                result = self.run_build(version, root)
+                self.assertNotEqual(result.returncode, 0, version)
+
+    def test_build_dry_run_preserves_literal_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            result = self.run_build("19.3.0", root)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["version"], "19.3.0")
+            self.assertEqual(Path(report["buildDir"]), (root / "构建 output").resolve())
+            self.assertEqual(Path(report["keyPath"]), (root / "密钥 signing.pem").resolve())
+            self.assertIn(f"-d", report["westArguments"])
+            self.assertIn(str((root / "构建 output").resolve()), report["westArguments"])
+            self.assertTrue(report["stagedProject"].endswith("source-stage-dryrun\\stm32"))
+            self.assertIn(report["stagedProject"], report["westArguments"])
+
+    def test_mcuboot_compatibility_is_scoped_to_mcuboot(self):
+        project = TOOLS_DIR.parent
+        board_cmake = (
+            project / "boards" / "bciband_h563vg" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+        mcuboot_conf = (project / "sysbuild" / "mcuboot.conf").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("zephyr_compile_options", board_cmake)
+        self.assertIn("nrf_crypto_keys_housekeeping", mcuboot_conf)
+
     def run_doctor(
         self,
         nrfutil: Path,
