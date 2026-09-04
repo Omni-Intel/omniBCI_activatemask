@@ -1344,6 +1344,20 @@ class MainWindow(
         self.update_info_text()
 
     def closeEvent(self, event):  # noqa: N802
+        if getattr(self, "_close_in_progress", False):
+            event.ignore()
+            return
+        self._close_in_progress = True
+        if self.transport_connected() and self.selected_mcu() == MCU_STM32:
+            try:
+                if self.impedance_active:
+                    self.stop_impedance_detection(silent=True)
+                self.stop_stm32_recording()
+            except Exception as exc:
+                self._close_in_progress = False
+                QtWidgets.QMessageBox.warning(self, "设备未确认停止", str(exc))
+                event.ignore()
+                return
         APP_LOGGER.info("application close requested")
         try:
             self.log_event("app_close")

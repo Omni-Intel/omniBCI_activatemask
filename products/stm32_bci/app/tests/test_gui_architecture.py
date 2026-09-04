@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -17,6 +18,22 @@ from onmibci_gui.transport_control import TransportControlMixin
 
 
 class GuiArchitectureTests(unittest.TestCase):
+    def test_close_wait_failure_keeps_window_open(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = window_module.MainWindow()
+        try:
+            window.mcu_combo.setCurrentIndex(window.mcu_combo.findData(window_module.MCU_STM32))
+            with patch.object(window, "transport_connected", return_value=True), \
+                 patch.object(window, "stop_stm32_recording", side_effect=RuntimeError("timeout")), \
+                 patch.object(QtWidgets.QMessageBox, "warning"):
+                event = window_module.QtGui.QCloseEvent()
+                window.closeEvent(event)
+                self.assertFalse(event.isAccepted())
+                self.assertFalse(window._close_in_progress)
+        finally:
+            window.close()
+            app.processEvents()
+
     def test_main_window_composes_responsibility_mixins(self):
         expected = {
             ChannelConfigMixin,

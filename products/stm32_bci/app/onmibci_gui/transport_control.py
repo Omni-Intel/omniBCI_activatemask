@@ -6,6 +6,29 @@ from .runtime import *  # noqa: F403 - shared Qt runtime namespace
 
 
 class TransportControlMixin:
+    def stop_stm32_recording(self, timeout=6.0):
+        """Wait for acquisition stop and SD close, not merely UART transmission."""
+        if getattr(self, "_stm32_stop_pending", False):
+            raise RuntimeError("正在等待 STM32 停止确认。")
+        self._stm32_stop_pending = True
+        try:
+            self.transport_write(b"s")
+            deadline = time.perf_counter() + timeout
+            while time.perf_counter() < deadline:
+                token = (getattr(self, "_stm32_stop_token", 0) + 1) & 0xFF
+                self._stm32_stop_token = token
+                self.transport_write(bytes((0xAB, token)))
+                ack = self.read_config_ack(
+                    0xAB, expected_argument=token,
+                    timeout=min(0.7, max(0.05, deadline - time.perf_counter())))
+                if ack and ack["verified"] and ack["channel_register"] == 0:
+                    if ack.get("bias_n", 0):
+                        raise RuntimeError("采集已停止，但 SD 同步或关闭失败；文件可能不完整，请检查卡。")
+                    return ack
+            raise RuntimeError("STM32 未确认停止及 SD 文件关闭。请保持连接后重试；不要拔卡。")
+        finally:
+            self._stm32_stop_pending = False
+
     def calc_lsb_uv(self, gain: Optional[float] = None) -> float:
         actual_gain = float(self.gain if gain is None else gain)
         return VREF / (actual_gain * (2**23 - 1)) * 1e6

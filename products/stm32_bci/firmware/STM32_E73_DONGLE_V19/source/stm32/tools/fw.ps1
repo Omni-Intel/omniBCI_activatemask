@@ -305,7 +305,23 @@ function Invoke-Build {
     }
     if ($buildExitCode -ne 0) { exit $buildExitCode }
 
+	$factoryHex = Join-Path $resolvedBuildDir "stm32h563_v$($Version.Replace('.', '_'))_factory.hex"
+	$mergeScript = Join-Path $ncsRoot 'zephyr\scripts\build\mergehex.py'
+	$mergeArguments = @(
+		'sdk-manager', 'toolchain', 'launch',
+		'--ncs-version', $RequiredNcsVersion,
+		'--install-dir', $installRoot,
+		'--chdir', $ncsRoot,
+		'--', 'python', $mergeScript,
+		'-o', $factoryHex,
+		(Join-Path $resolvedBuildDir 'mcuboot\zephyr\zephyr.hex'),
+		(Join-Path $resolvedBuildDir 'stm32\zephyr\zephyr.signed.hex')
+	)
+	& $nrfutilPath @mergeArguments
+	if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     $artifactPaths = [ordered]@{
+		factoryHex = $factoryHex
         bootloaderHex = Join-Path $resolvedBuildDir 'mcuboot\zephyr\zephyr.hex'
         signedUpdateBin = Join-Path $resolvedBuildDir 'stm32\zephyr\zephyr.signed.bin'
         signedApplicationHex = Join-Path $resolvedBuildDir 'stm32\zephyr\zephyr.signed.hex'

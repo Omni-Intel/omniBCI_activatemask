@@ -859,6 +859,8 @@ class AcquisitionMixin:
         self.ble_status_delta = {}
 
     def start_stream(self):
+        if getattr(self, "_close_in_progress", False) or getattr(self, "_stm32_stop_pending", False):
+            return
         if self.streaming:
             self.log_event(
                 "recording_start_ignored",
@@ -962,9 +964,13 @@ class AcquisitionMixin:
         first_path = self.raw_writer.first_path or self.raw_path
         if self.transport_connected():
             try:
-                self.transport_write(b"s")
-            except Exception:
-                pass
+                if self.selected_mcu() == MCU_STM32:
+                    self.stop_stm32_recording()
+                else:
+                    self.transport_write(b"s")
+            except Exception as exc:
+                self.set_status(str(exc))
+                return False
         self.streaming = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)

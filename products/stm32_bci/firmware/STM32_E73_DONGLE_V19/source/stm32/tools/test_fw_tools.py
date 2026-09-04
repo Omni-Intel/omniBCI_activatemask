@@ -11,6 +11,14 @@ SCRIPT = TOOLS_DIR / "fw.ps1"
 
 
 class FirmwareToolTests(unittest.TestCase):
+    def test_failed_mount_forces_disk_cleanup_before_retry(self):
+        source = (TOOLS_DIR.parent / "src" / "sd_recorder.c").read_text()
+        failure = source.split("int err = fs_mount(&mount_point);", 1)[1].split(
+            "if (mounted && state.running", 1
+        )[0]
+        self.assertIn("bool force = true;", failure)
+        self.assertIn('disk_access_ioctl("SD", DISK_IOCTL_CTRL_DEINIT, &force)', failure)
+
     def run_build(self, version: str, root: Path):
         return subprocess.run(
             [
@@ -60,6 +68,35 @@ class FirmwareToolTests(unittest.TestCase):
 
         self.assertNotIn("zephyr_compile_options", board_cmake)
         self.assertIn("nrf_crypto_keys_housekeeping", mcuboot_conf)
+
+    def test_build_emits_external_factory_image(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("mergehex.py", script)
+        self.assertIn("factoryHex = $factoryHex", script)
+        self.assertIn("stm32\\zephyr\\zephyr.signed.hex", script)
+
+    def test_board_pin_map_matches_final_netlist(self):
+        dts = (
+            TOOLS_DIR.parent
+            / "boards"
+            / "bciband_h563vg"
+            / "bciband_h563vg.dts"
+        ).read_text(encoding="utf-8")
+
+        for token in (
+            "work-led-gpios = <&gpioa 1 GPIO_ACTIVE_HIGH>",
+            "ext-trigger-gpios = <&gpiob 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>",
+            "&sdmmc1_d0_pc8",
+            "&sdmmc1_d1_pc9",
+            "&sdmmc1_d2_pc10",
+            "&sdmmc1_d3_pc11",
+            "&sdmmc1_ck_pc12",
+            "&sdmmc1_cmd_pd2",
+            'disk-name = "SD"',
+            "bus-width = <4>",
+        ):
+            self.assertIn(token, dts)
 
     def run_doctor(
         self,

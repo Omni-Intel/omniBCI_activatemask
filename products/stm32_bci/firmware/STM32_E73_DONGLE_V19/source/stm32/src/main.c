@@ -16,11 +16,14 @@
 #include <zephyr/usb/usb_device.h>
 
 #include "control_tunnel.h"
+#include "feature_logic.h"
+#include "sd_recorder.h"
+#include "status_io.h"
 
 LOG_MODULE_REGISTER(bciband_stm32, LOG_LEVEL_INF);
 
 #define ADS_FRAME_SIZE       27U
-#define STREAM_FRAME_SIZE    48U
+#define STREAM_FRAME_SIZE    BCI_STREAM_FRAME_SIZE
 #define ADS_WAKEUP           0x02U
 #define ADS_RESET_CMD        0x06U
 #define ADS_START_CMD        0x08U
@@ -60,7 +63,6 @@ LOG_MODULE_REGISTER(bciband_stm32, LOG_LEVEL_INF);
 
 #define NSC_PWM_PERIOD_NS    5000U
 #define NSC_PWM_PULSE_NS     2500U
-#define WORK_LED_TIMEOUT_MS  100U
 #define CONTROL_REPLY_DEPTH  24U
 
 #define GPIO_SPEC(controller, pin_number, flags_value) \
@@ -89,8 +91,6 @@ static const struct gpio_dt_spec rf_reset = GPIO_SPEC(gpiod, 5U, GPIO_ACTIVE_HIG
 static const struct gpio_dt_spec rf_irq =
 	GPIO_SPEC(gpiod, 6U, GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN);
 static const struct gpio_dt_spec rf_csn = GPIO_SPEC(gpiob, 9U, GPIO_ACTIVE_HIGH);
-/* Board wiring: PA1 -> resistor/LED -> GND (active high). */
-static const struct gpio_dt_spec work_led = GPIO_SPEC(gpioa, 1U, GPIO_ACTIVE_HIGH);
 
 static const struct pwm_dt_spec nsc_pwm =
 	PWM_DT_SPEC_GET(DT_NODELABEL(nsc_pwm_output));
@@ -125,7 +125,6 @@ static uint32_t rf_errors;
 static uint32_t usb_frames;
 static uint32_t control_commands;
 static uint32_t control_replies;
-static uint32_t last_successful_frame_ms;
 static uint16_t reply_sequence;
 static uint16_t current_sample_rate_hz = 250U;
 static uint8_t current_config1 = ADS_CONFIG1_250SPS;
@@ -151,19 +150,6 @@ static uint8_t numeric_length;
 static uint32_t numeric_last_ms;
 
 static void process_control_bytes(const uint8_t *data, size_t length);
-
-static void work_led_set(bool on)
-{
-	(void)gpio_pin_set_dt(&work_led, on ? 1 : 0);
-}
-
-static void work_led_update(uint32_t now)
-{
-	if (!streaming_enabled || last_successful_frame_ms == 0U ||
-	    (uint32_t)(now - last_successful_frame_ms) >= WORK_LED_TIMEOUT_MS) {
-		work_led_set(false);
-	}
-}
 
 static void put_u16_le(uint8_t *p, uint16_t value)
 {
@@ -277,7 +263,8 @@ static uint8_t channel_setting(uint8_t gain_code, uint8_t mux)
 
 static void ads_stop_streaming(void)
 {
-	work_led_set(false);
+	status_led_set_state(BCI_LED_STOPPED);
+	status_discard_record_events();
 	if (!streaming_enabled) {
 		return;
 	}
@@ -286,6 +273,10 @@ static void ads_stop_streaming(void)
 	ads_command(ADS_SDATAC);
 	streaming_enabled = false;
 	k_sem_reset(&ads_drdy_sem);
+	int err = sd_recorder_stop();
+	if (err != 0) {
+		LOG_WRN("SD stop request failed: %d", err);
+	}
 }
 
 static void ads_start_streaming(void)
@@ -293,12 +284,24 @@ static void ads_start_streaming(void)
 	if (streaming_enabled || !configuration_verified) {
 		return;
 	}
+	struct sd_record_config config = {
+		.sample_rate = current_sample_rate_hz,
+		.enabled_mask = current_enabled_mask,
+		.bias_mask = current_bias_mask,
+		.mode = current_mode,
+	};
+	memcpy(config.gains, channel_gain, sizeof(config.gains));
+	int err = sd_recorder_start(&config);
+	if (err != 0) {
+		LOG_WRN("SD start request failed: %d", err);
+	}
 	k_sem_reset(&ads_drdy_sem);
 	gpio_pin_set_raw(ads_start.port, ads_start.pin, 1);
 	k_msleep(2U);
 	ads_command(ADS_RDATAC);
 	ads_command(ADS_START_CMD);
 	streaming_enabled = true;
+	status_led_set_state(BCI_LED_ACQUIRING);
 }
 
 static bool verify_frontend(enum frontend_mode mode)
@@ -521,8 +524,14 @@ static bool set_sample_rate(uint8_t rate_code)
 static void handle_ascii_command(uint8_t command)
 {
 	switch (command) {
-	case 'b': case 'B': ads_start_streaming(); break;
-	case 's': case 'S': ads_stop_streaming(); break;
+	case 'b': case 'B':
+		sd_recorder_take_control();
+		ads_start_streaming();
+		break;
+	case 's': case 'S':
+		sd_recorder_take_control();
+		ads_stop_streaming();
+		break;
 	case 'e': case 'E': case 'p': case 'P': case 'm': case 'M': case '*':
 		(void)configure_frontend(MODE_EEG_BIAS_P_ONLY); break;
 	case 'n': case 'N': (void)configure_frontend(MODE_EEG_BIAS_PN); break;
@@ -537,6 +546,24 @@ static void handle_ascii_command(uint8_t command)
 
 static void process_control_byte(uint8_t value)
 {
+	if (binary_state == 0U && value == 0xABU) {
+		binary_state = 60U;
+		return;
+	}
+	if (binary_state == 60U) {
+		binary_state = 0U;
+		struct sd_recorder_stats sd;
+		sd_recorder_get_stats(&sd);
+		uint8_t reply[12] = {0xBC, 0xAB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+		reply[2] = value;
+		reply[3] = streaming_enabled ? 1U : (sd.stopped ? 0U : 2U);
+		reply[4] = sd.recording;
+		reply[5] = sd.close_error != 0;
+		reply[9] = !streaming_enabled && sd.stopped;
+		for (int i = 0; i < 11; i++) reply[11] ^= reply[i];
+		queue_control_reply(reply, sizeof(reply));
+		return;
+	}
 	if (binary_state == 40U) {
 		bulk_config[bulk_index++] = value;
 		if (bulk_index == sizeof(bulk_config)) {
@@ -722,7 +749,7 @@ static int configure_gpio(void)
 {
 	const struct gpio_dt_spec *all[] = {
 		&ads_drdy, &ads_cs,
-		&ads_start, &ads_reset, &rf_reset, &rf_irq, &rf_csn, &work_led,
+		&ads_start, &ads_reset, &rf_reset, &rf_irq, &rf_csn,
 	};
 	for (size_t i = 0; i < ARRAY_SIZE(all); ++i) {
 		if (!gpio_is_ready_dt(all[i])) return -ENODEV;
@@ -734,7 +761,6 @@ static int configure_gpio(void)
 	err |= gpio_pin_configure_dt(&rf_reset, GPIO_OUTPUT_ACTIVE);
 	err |= gpio_pin_configure_dt(&rf_irq, GPIO_INPUT | GPIO_PULL_DOWN);
 	err |= gpio_pin_configure_dt(&rf_csn, GPIO_OUTPUT_ACTIVE);
-	err |= gpio_pin_configure_dt(&work_led, GPIO_OUTPUT_INACTIVE);
 	if (err != 0) return -EIO;
 	gpio_init_callback(&ads_drdy_callback, ads_drdy_handler, BIT(ads_drdy.pin));
 	err = gpio_add_callback(ads_drdy.port, &ads_drdy_callback);
@@ -748,14 +774,29 @@ int main(void)
 	uint8_t stream_frame[STREAM_FRAME_SIZE];
 	uint32_t next_report_ms;
 
+	int err = status_io_init();
+	if (err != 0) {
+		LOG_ERR("Status LED or external trigger initialization failed: %d", err);
+		status_led_set_state(BCI_LED_FATAL);
+		while (true) k_sleep(K_FOREVER);
+	}
+	err = sd_recorder_init();
+	if (err != 0) {
+		LOG_WRN("SD recorder initialization failed; RF remains enabled: %d", err);
+	}
 	if (!device_is_ready(nsc_pwm.dev) || !device_is_ready(ads_spi) ||
 	    !device_is_ready(rf_spi) ||
 	    configure_gpio() != 0) {
 		LOG_ERR("PWM, SPI1, SPI3, or GPIO initialization failed");
-		return -ENODEV;
+		status_led_set_state(BCI_LED_FATAL);
+		while (true) k_sleep(K_FOREVER);
 	}
-	int err = pwm_set_dt(&nsc_pwm, NSC_PWM_PERIOD_NS, NSC_PWM_PULSE_NS);
-	if (err != 0) return err;
+	err = pwm_set_dt(&nsc_pwm, NSC_PWM_PERIOD_NS, NSC_PWM_PULSE_NS);
+	if (err != 0) {
+		LOG_ERR("NSC1002 PWM initialization failed: %d", err);
+		status_led_set_state(BCI_LED_FATAL);
+		while (true) k_sleep(K_FOREVER);
+	}
 	LOG_INF("NSC1002 PE5 PWM: 200 kHz, 50%%");
 	k_msleep(1500U);
 	gpio_pin_set_raw(rf_reset.port, rf_reset.pin, 0);
@@ -799,13 +840,17 @@ int main(void)
 				uint32_t read_us = k_cyc_to_us_floor32(k_cycle_get_32() - start_cycles);
 				if (read_us > UINT16_MAX) read_us = UINT16_MAX;
 				ads_frames++;
+				struct status_record_event event;
+				while (status_take_record_event(&event)) {
+					sd_recorder_event(event.number, sample_sequence, event.uptime_ms);
+				}
 				build_stream_frame(stream_frame, ads_frame, drdy_was_low,
 						   (uint16_t)read_us);
+				sd_recorder_submit(stream_frame);
 				err = rf_exchange(stream_frame);
 				if (err == 0) {
 					rf_frames++;
-					last_successful_frame_ms = k_uptime_get_32();
-					work_led_set(true);
+					status_led_note_frame_success();
 				} else {
 					rf_errors++;
 				}
@@ -824,11 +869,18 @@ int main(void)
 		}
 
 		uint32_t now = k_uptime_get_32();
-		work_led_update(now);
 		if ((int32_t)(now - next_report_ms) >= 0) {
-			LOG_INF("frames=%u rf=%u err=%u usb=%u ctrl=%u reply=%u run=%d rate=%u mode=%u mask=%02x bias=%02x",
+			struct sd_recorder_stats sd_stats;
+			sd_recorder_get_stats(&sd_stats);
+			LOG_INF("frames=%u rf=%u err=%u usb=%u ctrl=%u reply=%u trig=%u trig_drop=%u sd_mount=%d sd_rec=%d sd_bytes=%llu sd_drop=%u sd_err=%d run=%d rate=%u mode=%u mask=%02x bias=%02x",
 				ads_frames, rf_frames, rf_errors, usb_frames,
-				control_commands, control_replies, streaming_enabled,
+				control_commands, control_replies,
+				status_trigger_count(), status_trigger_drop_count(),
+				sd_stats.mounted, sd_stats.recording,
+				(unsigned long long)sd_stats.bytes_written,
+				sd_stats.frames_dropped,
+				sd_stats.last_error,
+				streaming_enabled,
 				current_sample_rate_hz, current_mode,
 				current_enabled_mask, current_bias_mask);
 			next_report_ms += 5000U;

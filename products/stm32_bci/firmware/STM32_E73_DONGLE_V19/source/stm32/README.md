@@ -34,6 +34,9 @@ wakeup instead of using an intermediate acquisition queue.
 | ADS RESET | PE10 | 41 |
 | USB D- / D+ | PA11 / PA12 | 70 / 71 |
 | 工作指示灯 | PA1 | 24，高电平点亮 |
+| 外部触发输入 | PB7 | 93，低有效、下降沿中断 |
+| SDMMC1 D0/D1/D2/D3 | PC8/PC9/PC10/PC11 | 65/66/78/79 |
+| SDMMC1 CK/CMD | PC12/PD2 | 80/83 |
 | E73 RESET / IRQ | PD5 / PD6 | 86 / 87 |
 | E73 SCK / MISO / MOSI | PB3 / PB4 / PB5 (SPI3) | 89 / 90 / 91 |
 | E73 CSN | PB9 | 96 |
@@ -54,6 +57,37 @@ board, leaving enough time for the existing SPI3 radio exchange at 1000 SPS.
 PA1 工作灯采用数据链健康逻辑：只有 ADS1299 成功读帧且 SPI3 成功把该帧
 交给 E73 时点亮；停止采集或连续 100 ms 没有成功帧时熄灭。它不依赖
 STM32 USB 是否连接。
+
+PB7 外部触发输入由光耦输出拉低。固件使用内部上拉和下降沿中断，进行
+5 ms 消抖，并通过 RTT 输出 `EXT_TRIG event=N level=0`。录制期间事件
+写入同名 MET 文件，关联后续软件生成帧的序号及 ISR 的64位单调毫秒时间。
+该关联不是经过校准的 ADC 边沿时间；无线帧和 GUI 事件协议不变。
+
+## SD recording
+
+开机自动采集；未收到 GUI 控制时每秒尝试检测可用卡，晚插卡可开始记录。
+收到 s/b 命令后由 GUI 接管。GUI 停止时只挂载待命；GUI 开始时无卡，
+本轮不再挂载晚插卡。无线断开不改变采集状态。写入失败后本轮停止离线记录，
+RF 继续；显式停止才重新开放插卡检测。支持 MBR/FAT32，不自动格式化。
+
+BIN 保留无文件头48B V19帧。每份配同名 MET（JSON Lines），记录
+start/config、progress、trigger、end。只有 BIN 与 MET 均不存在的编号
+才会使用，避免覆盖不完整的旧记录。META 不存在 end 表示未正常结束。
+配置包括采样率、8通道增益、启用/BIAS掩码、SRB1参考、模式、固件版本。
+UTC 未同步时明确为 null；64位单调采样时间用于避免71分钟的帧时间戳回绕。
+不存在真实时钟时不能生成准确日历日期。
+
+队列包含1260个带录制轮次的帧，占65520B。满队列不阻塞采集；
+128帧批量写入，约每秒刷新不足一批的尾部并同步 BIN，再同步 MET 进度。
+断电仍可能损坏 FAT 或丢卡内缓存，不能承诺最大丢失时长；无 end 时
+以已读回、CRC有效的 BIN 和最后进度为准。采集中拔卡不受支持。
+
+GUI 正常退出发送 s，再查询 `AB TOKEN`，回复仍为12B BC/XOR包。
+byte2 回显 TOKEN；byte3 为0=已停止关闭、1=采集中、2=关闭处理中；
+byte4=SD记录状态，byte5=SD错误标志，byte9 bit0=停止关闭完成。
+仅在停止和文件关闭完成后确认退出；超时保留窗口并提示。
+该 GUI 必须配合19.5.0或更新的本系列固件，旧固件没有此确认命令。
+PC端 MET 自动导入/BDF转换和真实时钟同步尚未实现；两套 ESP32 不变。
 
 ## Flash layout
 

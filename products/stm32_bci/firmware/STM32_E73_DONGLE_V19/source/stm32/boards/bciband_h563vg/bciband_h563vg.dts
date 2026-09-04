@@ -20,6 +20,7 @@
 	};
 
 	bci_control: bci-control {
+		compatible = "zephyr,bci-control";
 		ads-drdy-gpios = <&gpioa 4 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		ads-sck-gpios = <&gpioa 5 GPIO_ACTIVE_HIGH>;
 		ads-miso-gpios = <&gpioa 6 GPIO_ACTIVE_HIGH>;
@@ -31,6 +32,9 @@
 		rf-reset-gpios = <&gpiod 5 GPIO_ACTIVE_HIGH>;
 		rf-irq-gpios = <&gpiod 6 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 		rf-csn-gpios = <&gpiob 9 GPIO_ACTIVE_HIGH>;
+
+		work-led-gpios = <&gpioa 1 GPIO_ACTIVE_HIGH>;
+		ext-trigger-gpios = <&gpiob 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 
 	nsc_pwm_leds: pwm-leds {
@@ -120,6 +124,17 @@
 &spi3 {
 	pinctrl-0 = <&spi3_sck_pb3 &spi3_miso_pb4 &spi3_mosi_pb5>;
 	pinctrl-names = "default";
+	status = "okay";
+};
+
+&sdmmc1 {
+	pinctrl-0 = <&sdmmc1_d0_pc8 &sdmmc1_d1_pc9
+		     &sdmmc1_d2_pc10 &sdmmc1_d3_pc11
+		     &sdmmc1_ck_pc12 &sdmmc1_cmd_pd2>;
+	pinctrl-names = "default";
+	disk-name = "SD";
+	bus-width = <4>;
+	clk-div = <8>;
 	status = "okay";
 };
 

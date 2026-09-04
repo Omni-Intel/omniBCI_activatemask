@@ -1,0 +1,43 @@
+description: OmniBCI STM32 board control GPIOs
+
+compatible: "zephyr,bci-control"
+
+include: base.yaml
+
+properties:
+  ads-drdy-gpios:
+    type: phandle-array
+    required: true
+  ads-sck-gpios:
+    type: phandle-array
+    required: true
+  ads-miso-gpios:
+    type: phandle-array
+    required: true
+  ads-mosi-gpios:
+    type: phandle-array
+    required: true
+  ads-cs-gpios:
+    type: phandle-array
+    required: true
+  ads-start-gpios:
+    type: phandle-array
+    required: true
+  ads-reset-gpios:
+    type: phandle-array
+    required: true
+  rf-reset-gpios:
+    type: phandle-array
+    required: true
+  rf-irq-gpios:
+    type: phandle-array
+    required: true
+  rf-csn-gpios:
+    type: phandle-array
+    required: true
+  work-led-gpios:
+    type: phandle-array
+    required: true
+  ext-trigger-gpios:
+    type: phandle-array
+    required: true
