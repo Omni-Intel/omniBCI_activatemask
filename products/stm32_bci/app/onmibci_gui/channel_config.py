@@ -479,20 +479,22 @@ class ChannelConfigMixin:
                 self.transport_write(bytes([0xA8, REFERENCE_SRB1]))
                 time.sleep(0.12)
 
-                # Re-send all channels with the SRB2 flag permanently clear.
-                payload = bytearray()
+                # Re-send channels one at a time.  The STM32 radio control
+                # tunnel shares its polling path with data; a burst of eight
+                # A7 commands can leave the later ACKs behind the next
+                # connection-stage command (AA).  Waiting for each matching
+                # ACK keeps the legacy wire protocol unchanged.
                 for ch in range(CHANNELS):
                     enabled = bool(self.channel_enabled[ch])
                     flags = (0x01 if enabled else 0) | (
                         0x02 if self.channel_bias[ch] and enabled else 0
                     )
-                    payload.extend((0xA7, ch, int(self.channel_gains[ch]), flags))
-                self.transport_write(payload)
-                time.sleep(0.25)
-                # A7-capable firmware returns one readback ACK per channel.
-                # This bulk synchronization does not need to expose all eight
-                # replies, so discard them before normal polling/streaming.
-                self.transport_reset_input_buffer()
+                    self.transport_write(
+                        bytes((0xA7, ch, int(self.channel_gains[ch]), flags))
+                    )
+                    ack = self.read_config_ack(0xA7, expected_argument=ch)
+                    if ack is None or not ack["verified"]:
+                        raise RuntimeError(f"ADS1299 配置校验失败：CH{ch + 1}")
                 if was_streaming:
                     self.transport_write(b"b")
                     self.streaming = True
