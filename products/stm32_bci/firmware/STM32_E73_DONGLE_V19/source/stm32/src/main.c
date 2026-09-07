@@ -659,7 +659,8 @@ static void process_control_bytes(const uint8_t *data, size_t length)
 
 static void build_stream_frame(uint8_t destination[STREAM_FRAME_SIZE],
 			       const uint8_t ads[ADS_FRAME_SIZE],
-			       bool drdy_was_low, uint16_t read_time_us)
+			       bool drdy_was_low, uint16_t read_time_us,
+			       bool trigger_marker)
 {
 	uint8_t flags = 0U;
 	memset(destination, 0, STREAM_FRAME_SIZE);
@@ -681,7 +682,9 @@ static void build_stream_frame(uint8_t destination[STREAM_FRAME_SIZE],
 	memcpy(destination + 16, ads + 3, 24U);
 	put_u16_le(destination + 40, read_time_us);
 	destination[42] = 1U;
-	destination[43] = (uint8_t)current_mode;
+	/* Bit 7 is reserved for the STM32 real-time external-trigger marker.
+	 * The lower seven bits retain the legacy acquisition mode values. */
+	destination[43] = (uint8_t)current_mode | (trigger_marker ? BIT(7) : 0U);
 	destination[44] = 0U;
 	destination[45] = 0U;
 	put_u16_le(destination + 46,
@@ -840,12 +843,14 @@ int main(void)
 				uint32_t read_us = k_cyc_to_us_floor32(k_cycle_get_32() - start_cycles);
 				if (read_us > UINT16_MAX) read_us = UINT16_MAX;
 				ads_frames++;
+				bool trigger_marker = false;
 				struct status_record_event event;
 				while (status_take_record_event(&event)) {
+					trigger_marker = true;
 					sd_recorder_event(event.number, sample_sequence, event.uptime_ms);
 				}
 				build_stream_frame(stream_frame, ads_frame, drdy_was_low,
-						   (uint16_t)read_us);
+						   (uint16_t)read_us, trigger_marker);
 				sd_recorder_submit(stream_frame);
 				err = rf_exchange(stream_frame);
 				if (err == 0) {

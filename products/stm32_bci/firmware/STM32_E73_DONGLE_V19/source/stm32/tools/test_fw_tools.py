@@ -11,6 +11,12 @@ SCRIPT = TOOLS_DIR / "fw.ps1"
 
 
 class FirmwareToolTests(unittest.TestCase):
+    def test_stm32_trigger_marker_preserves_legacy_frame_fields(self):
+        source = (TOOLS_DIR.parent / "src" / "main.c").read_text()
+        self.assertIn("current_mode | (trigger_marker ? BIT(7) : 0U)", source)
+        self.assertIn("status_take_record_event(&event)", source)
+        self.assertIn("sd_recorder_event(event.number, sample_sequence", source)
+
     def test_failed_mount_forces_disk_cleanup_before_retry(self):
         source = (TOOLS_DIR.parent / "src" / "sd_recorder.c").read_text()
         failure = source.split("int err = fs_mount(&mount_point);", 1)[1].split(

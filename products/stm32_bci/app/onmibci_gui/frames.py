@@ -8,8 +8,10 @@ from .common import *  # noqa: F403
 @dataclass
 class Frame:
     sequence: int
+    timestamp_us: int
     uv: np.ndarray
     valid: bool
+    triggered: bool
     mode: int
     status: bytes
     flags: int
@@ -167,9 +169,11 @@ class AdsFrameParser:
 
     def _decode(self, frame: bytes) -> Frame:
         seq = struct.unpack_from("<I", frame, 4)[0]
+        timestamp_us = struct.unpack_from("<I", frame, 8)[0]
         status = frame[12:15]
         flags = frame[15]
         valid = bool(flags & 0x01) and bool(flags & 0x02)
+        raw_mode = frame[43]
         counts = np.zeros(CHANNELS, dtype=np.int32)
         for ch in range(CHANNELS):
             i = 16 + ch * 3
@@ -181,9 +185,11 @@ class AdsFrameParser:
         read_us = struct.unpack_from("<H", frame, 40)[0]
         return Frame(
             sequence=seq,
+            timestamp_us=timestamp_us,
             uv=uv,
             valid=valid,
-            mode=frame[43],
+            triggered=bool(raw_mode & 0x80),
+            mode=raw_mode & 0x7F,
             status=status,
             flags=flags,
             read_us=read_us,

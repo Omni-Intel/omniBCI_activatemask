@@ -799,6 +799,8 @@ class AcquisitionMixin:
         self.timeline_large_discontinuities = 0
         self.live_timeline_sample_count = 0
         self.backlog_events = 0
+        self.hardware_trigger_count = 0
+        self.last_hardware_trigger_sequence = None
         self.queue_drop_hints = 0
         self.saturation_samples = 0
         self.saturation_channel_samples = np.zeros(CHANNELS, dtype=np.int64)
@@ -1548,6 +1550,15 @@ class AcquisitionMixin:
             self.saturation_samples += int(np.sum(enabled_saturated))
             self.saturation_channel_samples += enabled_saturated.astype(np.int64)
             self.current_mode = fr.mode
+            if fr.triggered:
+                self.hardware_trigger_count += 1
+                self.last_hardware_trigger_sequence = int(fr.sequence)
+                self.log_event(
+                    "hardware_trigger",
+                    sequence=int(fr.sequence),
+                    timestamp_us=int(fr.timestamp_us),
+                    count=int(self.hardware_trigger_count),
+                )
             if fr.mode in (0, 1, 2):
                 detected_reference = REFERENCE_SRB1 if (fr.flags & 0x80) else REFERENCE_SRB2
             self.last_read_us = fr.read_us

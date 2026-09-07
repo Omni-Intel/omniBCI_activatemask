@@ -21,6 +21,8 @@ Protocol expected from firmware:
   - read_us: bytes 40..41 little endian uint16
   - pending: byte 42
   - mode: byte 43   0=P+N, 1=P-only, 2=BIAS-off, 3=shorted, 4=test
+    STM32 bit7 marks that this frame follows an external hardware trigger;
+    the GUI masks bit7 before exposing the legacy mode value.
   - queue_depth: byte 44
   - queue_drop_low: byte 45
   - crc16-ccitt over bytes 0..45, little endian at 46..47
