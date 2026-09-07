@@ -11,6 +11,7 @@
 #include <zephyr/sys/atomic.h>
 
 #include "control_tunnel.h"
+#include "event_packet.h"
 
 LOG_MODULE_REGISTER(bciband_dongle, LOG_LEVEL_INF);
 
@@ -87,7 +88,9 @@ static void radio_event_handler(const struct esb_evt *event)
 
 	while (esb_read_rx_payload(&payload) == 0) {
 		atomic_inc(&radio_count);
-		if (payload.length == FRAME_SIZE && frame_valid(payload.data)) {
+		if (payload.length == FRAME_SIZE &&
+		    (frame_valid(payload.data) ||
+		     bci_event_packet_is_valid(payload.data, payload.length))) {
 			atomic_inc(&valid_count);
 			queue_usb_bytes(payload.data, FRAME_SIZE);
 		} else if (bci_tunnel_decode(payload.data, payload.length, &tunnel) &&

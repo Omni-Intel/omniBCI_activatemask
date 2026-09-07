@@ -1352,8 +1352,9 @@ class AcquisitionMixin:
                     )
                     data = self.serial_worker.drain_data(SERIAL_MAX_PROCESS_BYTES)
                 if data:
-                    self.enqueue_raw_bytes(data)
                     frames = self.parser.feed(data)
+                    self.process_hardware_events(self.parser.drain_events())
+                    self.enqueue_raw_bytes(b"".join(self.parser.drain_data_packets()))
                     if frames:
                         self.process_frames(frames, live=True)
                 remaining = (
@@ -1373,7 +1374,6 @@ class AcquisitionMixin:
                     if not self.ble_rx_buffer:
                         self.ble_batch_started_monotonic = time.monotonic()
                     self.ble_rx_buffer.extend(drained)
-                    self.enqueue_raw_bytes(drained)
 
                 staged = len(self.ble_rx_buffer)
                 worker_pending = 0
@@ -1402,6 +1402,8 @@ class AcquisitionMixin:
                     else:
                         self.ble_batch_started_monotonic = None
                     frames = self.parser.feed(data)
+                    self.process_hardware_events(self.parser.drain_events())
+                    self.enqueue_raw_bytes(b"".join(self.parser.drain_data_packets()))
                     if frames:
                         self.ble_coalesced_batches += 1
                         self.process_frames(frames, live=True)
@@ -1455,6 +1457,20 @@ class AcquisitionMixin:
     def poll_serial(self):
         """Backward-compatible alias used by older scripts/tests."""
         self.poll_transport()
+
+    def process_hardware_events(self, events):
+        for event in events:
+            self.hardware_trigger_count += 1
+            self.last_hardware_trigger_sequence = int(event.anchor_frame_sequence)
+            self.log_event(
+                "hardware_trigger",
+                event_sequence=int(event.sequence),
+                event_id=int(event.event_id),
+                start_time_us=int(event.start_time_us),
+                anchor_sequence=int(event.anchor_frame_sequence),
+                anchor_timestamp_us=int(event.anchor_frame_timestamp_us),
+                count=int(self.hardware_trigger_count),
+            )
 
     def process_frames(self, frames: List[Frame], live: bool):
         if not frames:
@@ -1550,15 +1566,6 @@ class AcquisitionMixin:
             self.saturation_samples += int(np.sum(enabled_saturated))
             self.saturation_channel_samples += enabled_saturated.astype(np.int64)
             self.current_mode = fr.mode
-            if fr.triggered:
-                self.hardware_trigger_count += 1
-                self.last_hardware_trigger_sequence = int(fr.sequence)
-                self.log_event(
-                    "hardware_trigger",
-                    sequence=int(fr.sequence),
-                    timestamp_us=int(fr.timestamp_us),
-                    count=int(self.hardware_trigger_count),
-                )
             if fr.mode in (0, 1, 2):
                 detected_reference = REFERENCE_SRB1 if (fr.flags & 0x80) else REFERENCE_SRB2
             self.last_read_us = fr.read_us

@@ -23,6 +23,8 @@ struct queued_frame {
 };
 struct queued_event {
 	uint32_t generation, number, sequence;
+	uint8_t code;
+	uint64_t start_us;
 	int64_t uptime_ms;
 };
 struct desired_state {
@@ -182,8 +184,9 @@ static int drain_events(uint32_t generation)
 			continue;
 		}
 		(void)k_msgq_get(&events, &e, K_NO_WAIT);
-		int err = meta_line("{\"type\":\"trigger\",\"event\":%u,\"sequence\":%u,\"uptime_ms\":%lld,\"association\":\"first_software_frame_after_event\"}\n",
-			e.number, e.sequence, (long long)e.uptime_ms);
+		int err = meta_line("{\"type\":\"trigger\",\"event\":%u,\"code\":%u,\"sequence\":%u,\"start_us\":%llu,\"uptime_ms\":%lld,\"association\":\"first_software_frame_after_event\"}\n",
+			e.number, e.code, e.sequence,
+			(unsigned long long)e.start_us, (long long)e.uptime_ms);
 		if (err) return err;
 	}
 	return 0;
@@ -348,9 +351,13 @@ void sd_recorder_submit(const uint8_t frame[BCI_STREAM_FRAME_SIZE])
 	if (k_msgq_put(&frames, &f, K_NO_WAIT)) drop();
 }
 
-void sd_recorder_event(uint32_t number, uint32_t sequence, int64_t uptime_ms)
+void sd_recorder_event(uint32_t number, uint8_t code, uint32_t sequence,
+			       uint64_t start_us, int64_t uptime_ms)
 {
-	struct queued_event e = {.number = number, .sequence = sequence, .uptime_ms = uptime_ms};
+	struct queued_event e = {
+		.number = number, .code = code, .sequence = sequence,
+		.start_us = start_us, .uptime_ms = uptime_ms,
+	};
 	k_spinlock_key_t key = k_spin_lock(&lock);
 	bool accept = desired.running && stats.recording;
 	e.generation = desired.generation;

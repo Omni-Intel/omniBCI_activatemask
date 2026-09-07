@@ -13,9 +13,11 @@
 #include <zephyr/dfu/mcuboot.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/usb/usb_device.h>
 
 #include "control_tunnel.h"
+#include "event_packet.h"
 #include "feature_logic.h"
 #include "sd_recorder.h"
 #include "status_io.h"
@@ -121,6 +123,7 @@ static struct gpio_callback ads_drdy_callback;
 static uint32_t sample_sequence;
 static uint32_t ads_frames;
 static uint32_t rf_frames;
+static uint32_t rf_event_frames;
 static uint32_t rf_errors;
 static uint32_t usb_frames;
 static uint32_t control_commands;
@@ -539,7 +542,7 @@ static void handle_ascii_command(uint8_t command)
 	case 'q': case 'Q': (void)configure_frontend(MODE_INPUT_SHORTED); break;
 	case 't': case 'T': (void)configure_frontend(MODE_INTERNAL_TEST); break;
 	case 'r': case 'R':
-		ads_frames = rf_frames = rf_errors = usb_frames = 0U; break;
+		ads_frames = rf_frames = rf_event_frames = rf_errors = usb_frames = 0U; break;
 	default: break;
 	}
 }
@@ -659,8 +662,7 @@ static void process_control_bytes(const uint8_t *data, size_t length)
 
 static void build_stream_frame(uint8_t destination[STREAM_FRAME_SIZE],
 			       const uint8_t ads[ADS_FRAME_SIZE],
-			       bool drdy_was_low, uint16_t read_time_us,
-			       bool trigger_marker)
+			       bool drdy_was_low, uint16_t read_time_us)
 {
 	uint8_t flags = 0U;
 	memset(destination, 0, STREAM_FRAME_SIZE);
@@ -682,13 +684,19 @@ static void build_stream_frame(uint8_t destination[STREAM_FRAME_SIZE],
 	memcpy(destination + 16, ads + 3, 24U);
 	put_u16_le(destination + 40, read_time_us);
 	destination[42] = 1U;
-	/* Bit 7 is reserved for the STM32 real-time external-trigger marker.
-	 * The lower seven bits retain the legacy acquisition mode values. */
-	destination[43] = (uint8_t)current_mode | (trigger_marker ? BIT(7) : 0U);
+	destination[43] = (uint8_t)current_mode;
 	destination[44] = 0U;
 	destination[45] = 0U;
 	put_u16_le(destination + 46,
 		   bci_crc16_ccitt_false(destination, STREAM_FRAME_SIZE - 2U));
+}
+
+static void build_event_packet(uint8_t destination[STREAM_FRAME_SIZE],
+			       const struct status_record_event *event,
+			       uint32_t anchor_sequence, uint32_t anchor_timestamp)
+{
+	bci_event_packet_build(destination, event->number, event->start_us,
+			       event->code, anchor_sequence, anchor_timestamp);
 }
 
 static int rf_exchange(const uint8_t tx_data[STREAM_FRAME_SIZE])
@@ -843,14 +851,16 @@ int main(void)
 				uint32_t read_us = k_cyc_to_us_floor32(k_cycle_get_32() - start_cycles);
 				if (read_us > UINT16_MAX) read_us = UINT16_MAX;
 				ads_frames++;
-				bool trigger_marker = false;
+				struct status_record_event event_batch[32];
+				size_t event_count = 0U;
 				struct status_record_event event;
 				while (status_take_record_event(&event)) {
-					trigger_marker = true;
-					sd_recorder_event(event.number, sample_sequence, event.uptime_ms);
+					if (event_count < ARRAY_SIZE(event_batch)) {
+						event_batch[event_count++] = event;
+					}
 				}
 				build_stream_frame(stream_frame, ads_frame, drdy_was_low,
-						   (uint16_t)read_us, trigger_marker);
+						   (uint16_t)read_us);
 				sd_recorder_submit(stream_frame);
 				err = rf_exchange(stream_frame);
 				if (err == 0) {
@@ -858,6 +868,21 @@ int main(void)
 					status_led_note_frame_success();
 				} else {
 					rf_errors++;
+				}
+				uint32_t anchor_sequence = sys_get_le32(stream_frame + 4);
+				uint32_t anchor_timestamp = sys_get_le32(stream_frame + 8);
+				for (size_t i = 0U; i < event_count; ++i) {
+					sd_recorder_event(event_batch[i].number, event_batch[i].code,
+							  anchor_sequence, event_batch[i].start_us,
+							  event_batch[i].uptime_ms);
+					uint8_t event_packet[STREAM_FRAME_SIZE];
+					build_event_packet(event_packet, &event_batch[i],
+							   anchor_sequence, anchor_timestamp);
+					if (rf_exchange(event_packet) == 0) {
+						rf_event_frames++;
+					} else {
+						rf_errors++;
+					}
 				}
 				if (usb_host_ready()) {
 					usb_send_frame(stream_frame);
@@ -877,8 +902,8 @@ int main(void)
 		if ((int32_t)(now - next_report_ms) >= 0) {
 			struct sd_recorder_stats sd_stats;
 			sd_recorder_get_stats(&sd_stats);
-			LOG_INF("frames=%u rf=%u err=%u usb=%u ctrl=%u reply=%u trig=%u trig_drop=%u sd_mount=%d sd_rec=%d sd_bytes=%llu sd_drop=%u sd_err=%d run=%d rate=%u mode=%u mask=%02x bias=%02x",
-				ads_frames, rf_frames, rf_errors, usb_frames,
+			LOG_INF("frames=%u rf=%u rf_event=%u err=%u usb=%u ctrl=%u reply=%u trig=%u trig_drop=%u sd_mount=%d sd_rec=%d sd_bytes=%llu sd_drop=%u sd_err=%d run=%d rate=%u mode=%u mask=%02x bias=%02x",
+				ads_frames, rf_frames, rf_event_frames, rf_errors, usb_frames,
 				control_commands, control_replies,
 				status_trigger_count(), status_trigger_drop_count(),
 				sd_stats.mounted, sd_stats.recording,

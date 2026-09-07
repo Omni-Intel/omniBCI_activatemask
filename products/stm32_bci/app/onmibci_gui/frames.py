@@ -11,7 +11,6 @@ class Frame:
     timestamp_us: int
     uv: np.ndarray
     valid: bool
-    triggered: bool
     mode: int
     status: bytes
     flags: int
@@ -20,6 +19,15 @@ class Frame:
     queue_depth: int
     queue_drop_low: int
     raw_counts: np.ndarray
+
+
+@dataclass
+class HardwareEvent:
+    sequence: int
+    start_time_us: int
+    event_id: int
+    anchor_frame_sequence: int
+    anchor_frame_timestamp_us: int
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -46,9 +54,9 @@ def expand_frames_to_timeline(
     """Expand sequence gaps into invalid samples without inventing EEG values.
 
     Returned NaN columns exist only in the in-memory display/analysis timeline.
-    The on-disk raw BIN remains the exact received 48-byte stream. This keeps
-    the live clock honest when Windows/BLE loses notifications: the graph shows
-    a visible data gap instead of compressing time or exhausting its buffer.
+    The on-disk raw BIN contains only validated EEG type-1 packets. Parallel
+    hardware-event packets are retained in the event log instead of shifting
+    the legacy 48-byte EEG record alignment.
     """
     if not frames:
         return (
@@ -121,11 +129,25 @@ class AdsFrameParser:
         self.get_lsb_uv = get_lsb_uv
         self.crc_bad = 0
         self.sync_drop = 0
+        self.events: List[HardwareEvent] = []
+        self.data_packets: List[bytes] = []
 
     def reset(self):
         self.buf.clear()
         self.crc_bad = 0
         self.sync_drop = 0
+        self.events.clear()
+        self.data_packets.clear()
+
+    def drain_events(self) -> List[HardwareEvent]:
+        events = self.events
+        self.events = []
+        return events
+
+    def drain_data_packets(self) -> List[bytes]:
+        packets = self.data_packets
+        self.data_packets = []
+        return packets
 
     def feed(self, data: bytes) -> List[Frame]:
         if data:
@@ -147,7 +169,7 @@ class AdsFrameParser:
                 return out
 
             frame = bytes(self.buf[:FRAME_BYTES])
-            if frame[2] != 1 or frame[3] != 1:
+            if frame[2] != 1 or frame[3] not in (1, 2):
                 del self.buf[0]
                 self.sync_drop += 1
                 continue
@@ -161,11 +183,25 @@ class AdsFrameParser:
                 continue
 
             del self.buf[:FRAME_BYTES]
-            out.append(self._decode(frame))
+            if frame[3] == 2:
+                self.events.append(self._decode_event(frame))
+            else:
+                self.data_packets.append(frame)
+                out.append(self._decode(frame))
 
         if len(self.buf) > 500_000:
             del self.buf[:-1000]
         return out
+
+    @staticmethod
+    def _decode_event(frame: bytes) -> HardwareEvent:
+        return HardwareEvent(
+            sequence=struct.unpack_from("<I", frame, 4)[0],
+            start_time_us=struct.unpack_from("<Q", frame, 8)[0],
+            event_id=frame[16],
+            anchor_frame_sequence=struct.unpack_from("<I", frame, 18)[0],
+            anchor_frame_timestamp_us=struct.unpack_from("<I", frame, 22)[0],
+        )
 
     def _decode(self, frame: bytes) -> Frame:
         seq = struct.unpack_from("<I", frame, 4)[0]
@@ -173,7 +209,6 @@ class AdsFrameParser:
         status = frame[12:15]
         flags = frame[15]
         valid = bool(flags & 0x01) and bool(flags & 0x02)
-        raw_mode = frame[43]
         counts = np.zeros(CHANNELS, dtype=np.int32)
         for ch in range(CHANNELS):
             i = 16 + ch * 3
@@ -188,8 +223,7 @@ class AdsFrameParser:
             timestamp_us=timestamp_us,
             uv=uv,
             valid=valid,
-            triggered=bool(raw_mode & 0x80),
-            mode=raw_mode & 0x7F,
+            mode=frame[43],
             status=status,
             flags=flags,
             read_us=read_us,

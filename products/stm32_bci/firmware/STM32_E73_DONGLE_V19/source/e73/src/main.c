@@ -20,6 +20,7 @@
 #include <zephyr/sys/atomic.h>
 
 #include "control_tunnel.h"
+#include "event_packet.h"
 
 LOG_MODULE_REGISTER(e73_dongle, LOG_LEVEL_INF);
 
@@ -189,7 +190,8 @@ static void spis_handler(const nrfx_spis_event_t *event, void *context)
 	}
 	atomic_set(&spi_last_rx_amount, event->rx_amount);
 
-	if (frame_is_valid(event->p_rx_buf, event->rx_amount)) {
+	if (frame_is_valid(event->p_rx_buf, event->rx_amount) ||
+	    bci_event_packet_is_valid(event->p_rx_buf, event->rx_amount)) {
 		packet.length = FRAME_SIZE;
 		memcpy(packet.data, event->p_rx_buf, FRAME_SIZE);
 		if (k_msgq_put(&frame_queue, &packet, K_NO_WAIT) == 0) {

@@ -27,7 +27,8 @@ struct sd_record_config {
 int sd_recorder_init(void);
 int sd_recorder_start(const struct sd_record_config *config);
 void sd_recorder_take_control(void);
-void sd_recorder_event(uint32_t number, uint32_t next_sequence, int64_t uptime_ms);
+void sd_recorder_event(uint32_t number, uint8_t code, uint32_t next_sequence,
+			       uint64_t start_us, int64_t uptime_ms);
 void sd_recorder_submit(const uint8_t frame[BCI_STREAM_FRAME_SIZE]);
 int sd_recorder_stop(void);
 void sd_recorder_get_stats(struct sd_recorder_stats *stats);

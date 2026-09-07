@@ -127,6 +127,14 @@
 	status = "okay";
 };
 
+/* PB7 is the single-wire external event input: idle high, 10 kbit/s 8N1. */
+&usart1 {
+	pinctrl-0 = <&usart1_rx_pb7>;
+	pinctrl-names = "default";
+	current-speed = <10000>;
+	status = "okay";
+};
+
 &sdmmc1 {
 	pinctrl-0 = <&sdmmc1_d0_pc8 &sdmmc1_d1_pc9
 		     &sdmmc1_d2_pc10 &sdmmc1_d3_pc11

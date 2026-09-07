@@ -34,7 +34,7 @@ wakeup instead of using an intermediate acquisition queue.
 | ADS RESET | PE10 | 41 |
 | USB D- / D+ | PA11 / PA12 | 70 / 71 |
 | 工作指示灯 | PA1 | 24，高电平点亮 |
-| 外部触发输入 | PB7 | 93，低有效、下降沿中断 |
+| 外部事件输入 | PB7 | 93，USART1_RX，10 kbit/s 8N1 |
 | SDMMC1 D0/D1/D2/D3 | PC8/PC9/PC10/PC11 | 65/66/78/79 |
 | SDMMC1 CK/CMD | PC12/PD2 | 80/83 |
 | E73 RESET / IRQ | PD5 / PD6 | 86 / 87 |
@@ -58,9 +58,10 @@ PA1 工作灯采用数据链健康逻辑：只有 ADS1299 成功读帧且 SPI3 �
 交给 E73 时点亮；停止采集或连续 100 ms 没有成功帧时熄灭。它不依赖
 STM32 USB 是否连接。
 
-PB7 外部触发输入由光耦输出拉低。固件使用内部上拉和下降沿中断，进行
-5 ms 消抖，并通过 RTT 输出 `EXT_TRIG event=N level=0`。录制期间事件
-写入同名 MET 文件，关联后续软件生成帧的序号及 ISR 的64位单调毫秒时间。
+PB7 是单线 UART 事件输入，由光耦输出驱动，空闲高电平、10 kbit/s、8N1。
+每收到一个字节即产生一个事件，字节值为 `event_id`（0~255）；没有收到字节
+表示没有事件。UART 起始位的下降沿作为事件开始时间，事件包关联到事件开始
+后的第一个 ADS1299 数据帧。PB7 不再使用 GPIO 下降沿和 5 ms 消抖。
 该关联不是经过校准的 ADC 边沿时间；无线帧和 GUI 事件协议不变。
 
 ## SD recording

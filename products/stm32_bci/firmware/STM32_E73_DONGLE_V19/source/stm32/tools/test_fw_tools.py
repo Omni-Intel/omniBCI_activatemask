@@ -11,11 +11,20 @@ SCRIPT = TOOLS_DIR / "fw.ps1"
 
 
 class FirmwareToolTests(unittest.TestCase):
-    def test_stm32_trigger_marker_preserves_legacy_frame_fields(self):
+    def test_parallel_event_packet_keeps_ads_frame_type(self):
+        packet = TOOLS_DIR.parent.parent / "protocol" / "event_packet.h"
+        source = packet.read_text()
+        self.assertIn("BCI_PACKET_TYPE_EEG", source)
+        self.assertIn("BCI_PACKET_TYPE_EVENT", source)
+        self.assertIn("event_start_us", source)
+        self.assertIn("anchor_frame_sequence", source)
+
+    def test_stm32_event_packets_leave_ads_frame_unchanged(self):
         source = (TOOLS_DIR.parent / "src" / "main.c").read_text()
-        self.assertIn("current_mode | (trigger_marker ? BIT(7) : 0U)", source)
+        self.assertIn("destination[43] = (uint8_t)current_mode", source)
+        self.assertIn("build_event_packet", source)
         self.assertIn("status_take_record_event(&event)", source)
-        self.assertIn("sd_recorder_event(event.number, sample_sequence", source)
+        self.assertIn("sd_recorder_event(event_batch[i].number, event_batch[i].code", source)
 
     def test_failed_mount_forces_disk_cleanup_before_retry(self):
         source = (TOOLS_DIR.parent / "src" / "sd_recorder.c").read_text()

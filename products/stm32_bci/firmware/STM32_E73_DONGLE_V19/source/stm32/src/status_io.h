@@ -12,6 +12,8 @@ uint32_t status_trigger_count(void);
 uint32_t status_trigger_drop_count(void);
 struct status_record_event {
 	uint32_t number;
+	uint8_t code;
+	uint64_t start_us;
 	int64_t uptime_ms;
 };
 bool status_take_record_event(struct status_record_event *event);

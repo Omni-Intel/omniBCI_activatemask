@@ -11,7 +11,7 @@ amplitude, filtering options, and recording behavior remain unchanged.
 Protocol expected from firmware:
   - BLE DATA accepts Reliable Block V1 and compact V2 (session id + block sequence + CRC16)
   - the BLE worker restores the original ordered 48-byte binary frame stream
-  - 48-byte binary frames
+  - 48-byte binary frames (packet type 1 is EEG; packet type 2 is a hardware event)
   - sync: A5 5A
   - frame[2] == 1, frame[3] == 1
   - seq: bytes 4..7 little endian uint32
@@ -26,6 +26,10 @@ Protocol expected from firmware:
   - queue_depth: byte 44
   - queue_drop_low: byte 45
   - crc16-ccitt over bytes 0..45, little endian at 46..47
+
+Event packets use the same 48-byte envelope and CRC. They carry an event id,
+the UART START timestamp, and the first ADS frame sequence after the event;
+they are parsed separately from EEG frames.
 
 BIAS_SENSP command sent by this app:
   A6 0D XX
