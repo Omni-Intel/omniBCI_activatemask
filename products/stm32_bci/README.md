@@ -1,10 +1,9 @@
-# STM32 BCI: Isolated Reference Snapshot
+# STM32 BCI: STM32-MAIN
 
-**REFERENCE ONLY, not a final feature-parity release.** This product archives
-the STM32 GUI and firmware from
-`c2ecbd6423083ae5a196f86d24ce82119ed27752`. SD recording, hard-trigger support,
-and the later STM32 GUI update are pending and are not developed here.
-The separate stable ESP32 EEG and ESP32 EMG products are not selected by this GUI.
+This is the active STM32 product line: STM32H563 + E73 + nRF52840 Dongle,
+including SD recording, status LED, external-trigger event packets, and the
+STM32-specific GUI wrapper. The separate ESP32 EEG and ESP32 EMG products are
+not selected by this GUI.
 
 ## Hardware and Versions
 
@@ -17,21 +16,18 @@ Dongle/native-USB distinction. No new port auto-detection or identity command is
 
 The imported package is `firmware/STM32_E73_DONGLE_V19/`:
 
-| Component | Archived version/artifact |
+| Component | Version/artifact |
 | --- | --- |
-| GUI | Source commit above; inherited V19 release label |
+| GUI | `app/ads1299_eeg_gui_v19.py` through the STM32 product wrapper |
 | STM32 | V19.2 hardware-SPI MCUboot factory: `07_stm32h563_v19_2_hwspi_factory.hex` |
 | STM32 update | `08_stm32h563_v19_2_hwspi_update.bin` and `09_stm32h563_v19_2_hwspi_update.zip` |
 | E73 | V19: `02_e73_v19_full_control.hex` |
 | Dongle | V19: `03_dongle_v19_full_control.hex` |
 | Online data | Existing V1 48-byte frames; 250/500/1000 SPS controls |
 
-These are imported versions, not newly built releases. Consult the integration
-manifest for exact provenance/hashes and the archived firmware READMEs for image
-layout and update procedures. The archived legacy `01_...hex` is not the
-MCUboot factory image. **No imported HEX was rebuilt or flashed, and no hardware
-test was performed for this integration.** Historical validation claims in the
-archived firmware README are upstream claims, not new acceptance results.
+The release directory contains factory/update artifacts; the source under
+`firmware/STM32_E73_DONGLE_V19/source/` is the active development source. Use
+the matching STM32, E73, and Dongle artifacts together.
 
 ## Setup and Launch
 
@@ -54,8 +50,7 @@ No new dependencies are introduced.
 
 ## Isolation
 
-`app/` and `firmware/` source files remain unchanged. The wrapper makes only
-process-local startup adaptations:
+The wrapper makes process-local STM32 startup adaptations:
 
 - QSettings uses `app/stm32_bci.ini` with no settings fallbacks. It does not read,
   migrate, or write the stable `OmniBCI/ADS1299EEGWorkbench` registry settings.
@@ -70,9 +65,9 @@ process-local startup adaptations:
 - The local API listens on `127.0.0.1:8767`, not the stable default `8765`.
   The wrapper does not discover ports or fall back to another product's API.
 
-This is a narrow adaptation for the exact archived revision, not a shared GUI
-framework. Inherited UI text may still say USB, EEG, or V19; those labels do not
-authorize connecting native STM32 USB for acquisition.
+The STM32 wrapper fixes the product family to STM32 and serial acquisition over
+the Dongle; inherited UI text may still say USB, EEG, or V19, but native STM32
+USB remains diagnostics/update only.
 
 ## SDK and Known API Limits
 
